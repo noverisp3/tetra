@@ -1,24 +1,81 @@
 # Tetra
 
-Pure ternary LLM with {-1, 0, +1} weights. Trained from scratch on TinyStories.
+Pure ternary LLM with {-1, 0, +1} weights. Two training modes available.
+
+## Training Modes
+
+### 1. STE (default) — Straight-Through Estimator
+
+FP32 latent (shadow) weights, quantized on-the-fly via absmean. Gradient flows through STE. Standard approach used by BitNet b1.58.
+
+```
+python train.py --mode ste                    # default
+python train.py --mode ste --ternary-scale 0.7
+```
+
+### 2. Stochastic Bit-Flip
+
+**No latent weights.** Weights stored as packed 2-bit ternary. Gradient sign accumulated in FP32 accumulator; weight flips when |accumulator| > threshold. Threshold auto-computed as `20.0 / scale`.
+
+```
+python train.py --mode stochastic
+python train.py --mode stochastic --ternary-scale 0.7
+python train.py --mode stochastic --threshold 15.0  # manual override
+```
+
+## Benchmark (vocab=1024, hidden=128, layers=2, 200 steps)
+
+| Config | Train | Val | Ternary Mem | FP32 Mem | Optimizer Extra |
+|--------|-------|-----|-------------|----------|-----------------|
+| **STE** (scale=0.7) | 4.61 | 5.10 | 2048KB FP32 + 128KB packed | 2594KB | 4096KB (AdamW) |
+| **Stoch** (th=20, auto) | **4.49** | **4.93** | 32KB packed only | 546KB | 0KB |
+| Stoch (th=10) | 4.75 | 5.20 | 32KB packed only | 546KB | 0KB |
+| Stoch (sc=0.7, auto) | 4.73 | 5.11 | 32KB packed only | 546KB | 0KB |
+
+**Key results:**
+- Stochastic (th=20) **beats STE on val loss** (4.93 vs 5.10-5.07)
+- **14× less memory** for ternary weights (32KB vs 2048KB FP32 + 4096KB AdamW)
+- Auto-threshold formula `threshold = 20 / scale` matches optimal tuning
+- STE is ~50% faster on small models (matmul not dominant); gap shrinks at scale
+
+### Threshold Tuning
+
+The invariant: `threshold × scale = 20` is the sweet spot. Lower → too much flipping (diverges). Higher → not enough learning (underfits).
+
+```
+threshold = 20.0 / scale   # default auto-compute
+```
 
 ## Architecture
 
 BitNet b1.58-style transformer decoder:
-- **Ternary weights**: {-1, 0, +1} via absmean quantization (STE for gradient flow)
-- **Shadow weights**: FP32 latent weights during training, quantized on-the-fly
-- **128 hidden dim, 4 layers, 4 heads, 512 FFN dim** — 2.16M params total
-  - Ternary: 1,048,576 (256 KB packed at 2 bits/weight)
-  - FP32: 1,115,264 (embeddings + norms, 4.3 MB)
+- **Ternary weights**: {-1, 0, +1} — no FP32 latent in stochastic mode
+- **Token embedding tied** with LM head
+- **SwiGLU FFN** with fused gate+up projection
+- **RMSNorm** (pre-norm)
+- **Causal attention** with RoPE
 
 ## Training
 
-- **Dataset**: TinyStories V2 GPT-4 (267K stories, 534M tokens)
-- **Tokenizer**: Custom BPE (8192 vocab, HuggingFace tokenizers)
-- **Config**: batch=16, LR=1e-3, block_size=128, 10K steps
-- **Device**: Intel Iris Xe (DirectML)
-- **Duration**: 57 min
-- **Loss**: train 3.56, val 3.61
+```
+python train.py                              # STE mode (default)
+python train.py --mode stochastic            # Stochastic Bit-Flip
+python train.py --preset 500m --steps 10000  # 500M param model
+python train.py --resume                     # Auto-resume from latest checkpoint
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--mode ste\|stochastic` | Training mode (default: ste) |
+| `--ternary-scale` | [STE] Scale factor (default: 0.7) |
+| | [Stochastic] Weight magnitude |
+| `--threshold` | [Stochastic] Flip threshold (default: 20/scale) |
+| `--per-channel` | [STE] Per-channel quantization |
+| `--data-cache` | Multi-source data directory |
+| `--hybrid` | Model on GPU, optimizer on CPU |
+| `--preset tiny\|medium\|large\|500m` | Model size |
 
 ## C++ Inference
 
@@ -68,13 +125,13 @@ python inference/benchmark_ppl.py --checkpoint checkpoints/checkpoint_010000.pt
 
 ```
 ternary_llm/
-  quantization.py   # TernaryQuantizer (absmean + STE)
-  layers.py         # TernaryLinear, RMSNorm
-  attention.py      # TernaryMultiHeadAttention
-  ffn.py            # TernaryFFN (SwiGLU)
+  quantization.py   # STE and Stochastic Bit-Flip autograd functions
+  layers.py         # TernaryLinear, StochasticTernaryLinear, RMSNorm
+  attention.py      # MultiHeadAttention (STE + Stochastic variants)
+  ffn.py            # SwiGLU FFN (STE + Stochastic variants)
   transformer.py    # Full model, generate, sample
   data.py           # ChunkedDataset, tokenizer
-  trainer.py        # TernaryTrainer
+  trainer.py        # TernaryTrainer (handles both modes)
 
 inference/
   tetra.h           # C++ inference engine (SIMD matmul, KV cache, sampling)

@@ -57,3 +57,22 @@ class TernaryFFN(nn.Module):
         output = self.dropout(output)
 
         return output
+
+
+class StochasticFFN(nn.Module):
+    """FFN với Stochastic Bit-Flip (không latent weights, packed 2-bit)."""
+
+    def __init__(self, hidden_dim, ffn_dim, dropout=0.0, scale=1.0, threshold=None):
+        super().__init__()
+        from .layers import StochasticTernaryLinear
+        self.gate_proj = StochasticTernaryLinear(hidden_dim, ffn_dim, scale=scale, threshold=threshold)
+        self.up_proj = StochasticTernaryLinear(hidden_dim, ffn_dim, scale=scale, threshold=threshold)
+        self.down_proj = StochasticTernaryLinear(ffn_dim, hidden_dim, scale=scale, threshold=threshold)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        hidden = F.silu(gate) * up
+        output = self.down_proj(hidden)
+        return self.dropout(output)

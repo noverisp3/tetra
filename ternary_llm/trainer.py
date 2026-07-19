@@ -64,7 +64,10 @@ class TrainingConfig:
     dtype: str = "float32"
     hybrid_optimizer: bool = False  # Model on GPU, optimizer on CPU (avoids DML fallbacks)
 
-    # Quantization
+    # Mode
+    mode: str = "ste"  # "ste" or "stochastic"
+
+    # Quantization (STE)
     ternary_scale: float = 0.7  # Δ = scale × mean(|W|), lower → more {-1,+1}, higher → more 0
     per_channel: bool = False    # Per-channel vs per-tensor threshold
 
@@ -346,21 +349,35 @@ class TernaryTrainer:
     def save_checkpoint(self, step: int):
         """Save model checkpoint and keep only the 3 most recent.
 
-        Latent weights → FP16 (preserves precision for AdamW resume).
-        Optimizer states → FP16 (50% smaller).
-        Packed ternary (2-bit) saved separately for inference export only.
+        STE mode: latent weights → FP16, optimizer states → FP16.
+        Stochastic mode: packed ternary + accumulators saved directly.
+        Packed ternary (2-bit) always included for inference export.
         """
         from .quantization import pack_ternary, ternary_quantize
 
-        # Save latent weights as FP16 (preserves precision for training resume)
+        is_stochastic = self.config.mode == "stochastic"
         state_dict = {}
         inference_data = {}
-        for k, v in self.model.state_dict().items():
-            if "latent_weights" in k:
-                state_dict[k] = v.half()  # FP16: full precision preserved
-                inference_data[k] = {"packed": pack_ternary(ternary_quantize(v.data)), "shape": list(v.shape)}
-            else:
-                state_dict[k] = v
+
+        if is_stochastic:
+            # Stochastic: packed weights + accumulators are already compact
+            state_dict = self.model.state_dict()
+            inference_data = {
+                k: {"packed": v.cpu(), "shape": list(v.shape) if "packed" in k else None}
+                for k, v in state_dict.items() if "packed_weights" in k
+            }
+            # Downcast accumulators to FP16 for storage
+            for k, v in state_dict.items():
+                if "accumulator" in k and v.is_floating_point():
+                    state_dict[k] = v.half()
+        else:
+            # STE: latent weights → FP16 (preserves precision for training resume)
+            for k, v in self.model.state_dict().items():
+                if "latent_weights" in k:
+                    state_dict[k] = v.half()
+                    inference_data[k] = {"packed": pack_ternary(ternary_quantize(v.data)), "shape": list(v.shape)}
+                else:
+                    state_dict[k] = v
 
         # Quantize optimizer states to FP16
         opt_state = self.optimizer.state_dict()
@@ -369,15 +386,17 @@ class TernaryTrainer:
         checkpoint = {
             "step": step,
             "model_state_dict": state_dict,
-            "inference_ternary": inference_data,  # packed ternary for inference only
+            "inference_ternary": inference_data,
             "optimizer_state_dict": opt_state,
             "config": self.config.__dict__,
             "train_losses": self.train_losses,
             "val_losses": self.val_losses,
             "learning_rates": self.learning_rates,
-            "latent_fp16": True,
             "optimizer_fp16": True,
+            "mode": self.config.mode,
         }
+        if not is_stochastic:
+            checkpoint["latent_fp16"] = True
 
         path = Path(self.config.save_dir) / f"checkpoint_{step:06d}.pt"
         torch.save(checkpoint, path)
@@ -404,15 +423,25 @@ class TernaryTrainer:
     def load_checkpoint(self, path: str):
         """Load model checkpoint.
 
-        Handles FP16 latent weights, packed ternary (old), FP16 optimizer, and old FP32 formats.
+        Handles FP16 latent weights (STE), FP16 accumulators (stochastic),
+        packed ternary (old), FP16 optimizer, and old FP32 formats.
         """
         from .quantization import unpack_ternary
 
         checkpoint = torch.load(path, map_location="cpu")
         raw_state = checkpoint["model_state_dict"]
+        ckpt_mode = checkpoint.get("mode", "ste")
 
-        # New format: FP16 latent weights → FP32
-        if checkpoint.get("latent_fp16", False):
+        if ckpt_mode == "stochastic":
+            # Stochastic: FP16 accumulators → FP32, packed weights stay uint8
+            state_dict = {}
+            for k, v in raw_state.items():
+                if isinstance(v, torch.Tensor) and v.dtype == torch.float16:
+                    state_dict[k] = v.float()
+                else:
+                    state_dict[k] = v
+        elif checkpoint.get("latent_fp16", False):
+            # STE new format: FP16 latent weights → FP32
             state_dict = {}
             for k, v in raw_state.items():
                 if isinstance(v, torch.Tensor) and v.dtype == torch.float16:

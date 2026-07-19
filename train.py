@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from ternary_llm.transformer import TernaryTransformerModel
+from ternary_llm.transformer import TernaryTransformerModel, StochasticTransformerModel
 from ternary_llm.data import (
     download_and_tokenize, create_dataloaders,
     create_multi_source_dataloaders, get_tokenizer_compat,
@@ -53,10 +53,14 @@ def main():
                         help="Hybrid mode: model on GPU, optimizer on CPU (avoids DML fallbacks)")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader workers for async prefetch (default: 4)")
+    parser.add_argument("--mode", type=str, default="ste", choices=["ste", "stochastic"],
+                        help="Training mode: STE (latent weights) or Stochastic Bit-Flip (default: ste)")
     parser.add_argument("--ternary-scale", type=float, default=0.7,
-                        help="Dynamic threshold scale: Δ = scale × mean(|W|), lower = more {-1,+1}, higher = more 0 (default: 0.7)")
+                        help="[STE] Dynamic threshold scale: delta = scale x mean(|W|) (default: 0.7)")
     parser.add_argument("--per-channel", action="store_true",
-                        help="Per-channel quantization threshold (instead of per-tensor)")
+                        help="[STE] Per-channel quantization threshold (instead of per-tensor)")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="[Stochastic] Bit-flip threshold (default: 20.0 / scale, auto-computed)")
     args = parser.parse_args()
 
     config = TrainingConfig()
@@ -93,6 +97,7 @@ def main():
         config.device = args.device
     if args.hybrid:
         config.hybrid_optimizer = True
+    config.mode = args.mode
     config.ternary_scale = args.ternary_scale
     config.per_channel = args.per_channel
 
@@ -141,25 +146,50 @@ def main():
 
     # Step 3: Create model
     print("\n[3/4] Creating model...")
-    model = TernaryTransformerModel(
-        vocab_size=config.vocab_size,
-        hidden_dim=config.hidden_dim,
-        num_layers=config.num_layers,
-        num_heads=config.num_heads,
-        ffn_dim=config.ffn_dim,
-        max_seq_len=config.max_seq_len,
-        ternary_scale=config.ternary_scale,
-        per_channel=config.per_channel,
-    )
+    is_stochastic = args.mode == "stochastic"
+
+    if is_stochastic:
+        model = StochasticTransformerModel(
+            vocab_size=config.vocab_size,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            ffn_dim=config.ffn_dim,
+            max_seq_len=config.max_seq_len,
+            scale=config.ternary_scale,
+            threshold=args.threshold,
+        )
+    else:
+        model = TernaryTransformerModel(
+            vocab_size=config.vocab_size,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            ffn_dim=config.ffn_dim,
+            max_seq_len=config.max_seq_len,
+            ternary_scale=config.ternary_scale,
+            per_channel=config.per_channel,
+        )
 
     total_params = sum(p.numel() for p in model.parameters())
-    ternary_params = sum(
-        p.numel() for name, p in model.named_parameters()
-        if "latent_weights" in name
-    )
-    print(f"  Total params: {total_params:,}")
-    print(f"  Ternary params: {ternary_params:,} ({ternary_params * 2 / 8 / 1024:.0f} KB packed)")
-    print(f"  FP32 params: {total_params - ternary_params:,} ({(total_params - ternary_params) * 4 / 1024:.0f} KB)")
+    if is_stochastic:
+        ternary_params = sum(
+            p.numel() for n, p in model.named_buffers()
+            if "packed_weights" in n
+        ) * 2  # 2 bits per weight
+        print(f"  Mode: Stochastic Bit-Flip (no latent weights)")
+        print(f"  Total params: {total_params:,}")
+        print(f"  Ternary params: {ternary_params:,} ({ternary_params / 8 / 1024:.0f} KB packed)")
+        print(f"  FP32 params: {total_params:,} ({(total_params) * 4 / 1024:.0f} KB)")
+    else:
+        ternary_params = sum(
+            p.numel() for name, p in model.named_parameters()
+            if "latent_weights" in name
+        )
+        print(f"  Mode: STE (latent weights)")
+        print(f"  Total params: {total_params:,}")
+        print(f"  Ternary params: {ternary_params:,} ({ternary_params * 2 / 8 / 1024:.0f} KB packed)")
+        print(f"  FP32 params: {total_params - ternary_params:,} ({(total_params - ternary_params) * 4 / 1024:.0f} KB)")
 
     # Step 4: Train
     print("\n[4/4] Starting training...")

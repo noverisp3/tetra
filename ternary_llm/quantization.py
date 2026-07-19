@@ -249,7 +249,8 @@ class StochasticBitFlipLinear(torch.autograd.Function):
         )
 
         with torch.no_grad():
-            ctx.accumulator.add_(grad_w / scale)
+            # Gradient sign: chi direction, bo magnitude → on dinh, khong phu thuoc batch size
+            ctx.accumulator.add_(torch.sign(-grad_w) / scale)
             flip_up = ctx.accumulator > ctx.threshold
             flip_down = ctx.accumulator < -ctx.threshold
 

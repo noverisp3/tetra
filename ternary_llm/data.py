@@ -160,10 +160,16 @@ def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stori
 class ChunkedDataset(Dataset):
     """Non-overlapping chunks of tokens. Much faster to shuffle than sliding window."""
     def __init__(self, tokens, block_size):
-        n = len(tokens) - (len(tokens) % block_size)
-        self.tokens = torch.from_numpy(tokens[:n].astype(np.int64))
+        n = len(tokens)
+        # Reserve 1 for y offset: max valid start_idx = n - block_size - 1
+        valid_starts = n - block_size - 1  # extra -1 so y[start+block_size] is valid
+        if valid_starts < 0:
+            raise ValueError(f"Too few tokens ({n}) for block_size={block_size}")
+        n_samples = valid_starts // block_size  # non-overlapping blocks
+        n_usable = n_samples * block_size + 1  # +1 for y offset
+        self.tokens = torch.from_numpy(tokens[:n_usable].astype(np.int64))
         self.block_size = block_size
-        self.n_samples = n // block_size
+        self.n_samples = n_samples
 
     def __len__(self):
         return self.n_samples

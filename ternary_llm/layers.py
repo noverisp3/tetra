@@ -94,7 +94,7 @@ class StochasticTernaryLinear(nn.Module):
         out_features: output dimension
         bias: whether to use bias
         scale: ternary weight scale factor (default: 1.0)
-        threshold: flip threshold (default: 0.5)
+        threshold: flip threshold (default: 20.0 / scale, auto-computed)
     """
 
     def __init__(
@@ -103,13 +103,14 @@ class StochasticTernaryLinear(nn.Module):
         out_features: int,
         bias: bool = False,
         scale: float = 1.0,
-        threshold: float = 0.5,
+        threshold: float | None = None,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.scale = scale
-        self.threshold = threshold
+        # Auto-threshold: threshold * scale = 20 (invariant)
+        self.threshold = 20.0 / scale if threshold is None else threshold
 
         # Packed 2-bit ternary weights (4 weights/byte)
         packed = init_ternary_weight(out_features, in_features, sparsity=0.5)
