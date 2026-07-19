@@ -62,17 +62,12 @@ class FusedTernaryLinear(torch.autograd.Function):
         else:
             delta = latent_weights.abs().mean().clamp(min=1e-6) * scale
         w_ternary = (latent_weights / delta).clamp(-1, 1).round()
-        ctx.save_for_backward(x, latent_weights)
+        ctx.save_for_backward(x, w_ternary)
         return F.linear(x, w_ternary)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x, latent_weights = ctx.saved_tensors
-        if ctx.per_channel:
-            delta = latent_weights.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * ctx.scale
-        else:
-            delta = latent_weights.abs().mean().clamp(min=1e-6) * ctx.scale
-        w_ternary = (latent_weights / delta).clamp(-1, 1).round()
+        x, w_ternary = ctx.saved_tensors
         grad_x = F.linear(grad_output, w_ternary.T)
         grad_w = torch.mm(
             grad_output.reshape(-1, grad_output.size(-1)).T,
