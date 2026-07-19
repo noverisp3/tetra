@@ -1,0 +1,51 @@
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === Pytest ===
+.pytest_cache/
+
+# === Training data (too large for git) ===
+data/*.txt
+data/*.bin
+data/*.json
+data_local/
+
+# === Checkpoints (large, regenerate) ===
+checkpoints/
+checkpoints_local/
+
+# === Build artifacts ===
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.o
+*.so
+*.dylib
+
+# === Exported models (large) ===
+*.bin
+!tokenizer/tetra_tokenizer.json
+!tokenizer/vocab_info.json
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Temporary ===
+temp_*.py
+debug.txt

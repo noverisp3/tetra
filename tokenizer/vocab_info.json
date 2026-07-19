@@ -1,0 +1,11 @@
+{
+  "vocab_size": 8192,
+  "special_tokens": {
+    "<PAD>": 0,
+    "<BOS>": 1,
+    "<EOS>": 2,
+    "<UNK>": 3
+  },
+  "backend": "huggingface_tokenizers",
+  "type": "BPE"
+}
