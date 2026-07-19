@@ -26,6 +26,8 @@ class TernaryTransformerBlock(nn.Module):
         num_heads: int,
         ffn_dim: int,
         dropout: float = 0.0,
+        ternary_scale: float = 0.7,
+        per_channel: bool = False,
     ):
         super().__init__()
 
@@ -35,6 +37,8 @@ class TernaryTransformerBlock(nn.Module):
             hidden_dim=hidden_dim,
             num_heads=num_heads,
             dropout=dropout,
+            ternary_scale=ternary_scale,
+            per_channel=per_channel,
         )
 
         # FFN block with pre-norm
@@ -43,6 +47,8 @@ class TernaryTransformerBlock(nn.Module):
             hidden_dim=hidden_dim,
             ffn_dim=ffn_dim,
             dropout=dropout,
+            ternary_scale=ternary_scale,
+            per_channel=per_channel,
         )
 
     def forward(
@@ -90,6 +96,8 @@ class TernaryTransformerModel(nn.Module):
         ffn_dim: int,
         max_seq_len: int = 2048,
         dropout: float = 0.0,
+        ternary_scale: float = 0.7,
+        per_channel: bool = False,
     ):
         super().__init__()
 
@@ -109,6 +117,8 @@ class TernaryTransformerModel(nn.Module):
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
                 dropout=dropout,
+                ternary_scale=ternary_scale,
+                per_channel=per_channel,
             )
             for _ in range(num_layers)
         ])

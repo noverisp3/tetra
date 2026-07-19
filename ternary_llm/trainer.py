@@ -64,6 +64,10 @@ class TrainingConfig:
     dtype: str = "float32"
     hybrid_optimizer: bool = False  # Model on GPU, optimizer on CPU (avoids DML fallbacks)
 
+    # Quantization
+    ternary_scale: float = 0.7  # Δ = scale × mean(|W|), lower → more {-1,+1}, higher → more 0
+    per_channel: bool = False    # Per-channel vs per-tensor threshold
+
     # Data
     data_dir: str = "data"
     block_size: int = 128
@@ -342,19 +346,19 @@ class TernaryTrainer:
     def save_checkpoint(self, step: int):
         """Save model checkpoint and keep only the 3 most recent.
 
-        Ternary weights are packed to 2-bit (4 per byte) before saving.
-        Optimizer states are quantized to FP16 (50% smaller).
+        Latent weights → FP16 (preserves precision for AdamW resume).
+        Optimizer states → FP16 (50% smaller).
+        Packed ternary (2-bit) saved separately for inference export only.
         """
         from .quantization import pack_ternary, ternary_quantize
 
-        # Pack ternary weights, keep FP32 params as-is
+        # Save latent weights as FP16 (preserves precision for training resume)
         state_dict = {}
-        ternary_count = 0
+        inference_data = {}
         for k, v in self.model.state_dict().items():
             if "latent_weights" in k:
-                w_ternary = ternary_quantize(v.data)
-                state_dict[k] = {"packed": pack_ternary(w_ternary), "shape": list(v.shape)}
-                ternary_count += 1
+                state_dict[k] = v.half()  # FP16: full precision preserved
+                inference_data[k] = {"packed": pack_ternary(ternary_quantize(v.data)), "shape": list(v.shape)}
             else:
                 state_dict[k] = v
 
@@ -365,19 +369,20 @@ class TernaryTrainer:
         checkpoint = {
             "step": step,
             "model_state_dict": state_dict,
+            "inference_ternary": inference_data,  # packed ternary for inference only
             "optimizer_state_dict": opt_state,
             "config": self.config.__dict__,
             "train_losses": self.train_losses,
             "val_losses": self.val_losses,
             "learning_rates": self.learning_rates,
-            "ternary_packed": True,
+            "latent_fp16": True,
             "optimizer_fp16": True,
         }
 
         path = Path(self.config.save_dir) / f"checkpoint_{step:06d}.pt"
         torch.save(checkpoint, path)
         size_mb = path.stat().st_size / 1024 / 1024
-        print(f"  [SAVE] Checkpoint saved to {path} ({size_mb:.0f} MB, {ternary_count} ternary layers packed)")
+        print(f"  [SAVE] Checkpoint saved to {path} ({size_mb:.0f} MB)")
 
         # Cleanup: keep only 3 most recent checkpoints
         checkpoints = sorted(Path(self.config.save_dir).glob("checkpoint_*.pt"))
@@ -399,16 +404,23 @@ class TernaryTrainer:
     def load_checkpoint(self, path: str):
         """Load model checkpoint.
 
-        Handles packed ternary, FP16 optimizer, and old FP32 formats.
+        Handles FP16 latent weights, packed ternary (old), FP16 optimizer, and old FP32 formats.
         """
         from .quantization import unpack_ternary
 
         checkpoint = torch.load(path, map_location="cpu")
         raw_state = checkpoint["model_state_dict"]
 
-        # Unpack ternary weights if packed
-        is_packed = checkpoint.get("ternary_packed", False)
-        if is_packed:
+        # New format: FP16 latent weights → FP32
+        if checkpoint.get("latent_fp16", False):
+            state_dict = {}
+            for k, v in raw_state.items():
+                if isinstance(v, torch.Tensor) and v.dtype == torch.float16:
+                    state_dict[k] = v.float()
+                else:
+                    state_dict[k] = v
+        # Old format: packed ternary → unpack (legacy compatibility)
+        elif checkpoint.get("ternary_packed", False):
             state_dict = {}
             for k, v in raw_state.items():
                 if isinstance(v, dict) and "packed" in v:

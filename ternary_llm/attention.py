@@ -25,6 +25,8 @@ class TernaryMultiHeadAttention(nn.Module):
         hidden_dim: int,
         num_heads: int,
         dropout: float = 0.0,
+        ternary_scale: float = 0.7,
+        per_channel: bool = False,
     ):
         super().__init__()
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
@@ -35,10 +37,10 @@ class TernaryMultiHeadAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
 
         # Ternary projections
-        self.q_proj = TernaryLinear(hidden_dim, hidden_dim)
-        self.k_proj = TernaryLinear(hidden_dim, hidden_dim)
-        self.v_proj = TernaryLinear(hidden_dim, hidden_dim)
-        self.o_proj = TernaryLinear(hidden_dim, hidden_dim)
+        self.q_proj = TernaryLinear(hidden_dim, hidden_dim, ternary_scale=ternary_scale, per_channel=per_channel)
+        self.k_proj = TernaryLinear(hidden_dim, hidden_dim, ternary_scale=ternary_scale, per_channel=per_channel)
+        self.v_proj = TernaryLinear(hidden_dim, hidden_dim, ternary_scale=ternary_scale, per_channel=per_channel)
+        self.o_proj = TernaryLinear(hidden_dim, hidden_dim, ternary_scale=ternary_scale, per_channel=per_channel)
 
         self.attn_dropout = nn.Dropout(dropout)
 

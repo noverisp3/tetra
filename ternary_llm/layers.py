@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from .quantization import TernaryQuantizer
+from .quantization import FusedTernaryLinear, TernaryQuantizer
 
 
 class RMSNorm(nn.Module):
@@ -41,10 +41,19 @@ class TernaryLinear(nn.Module):
         bias: whether to use bias (default: False, following BitNet)
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        ternary_scale: float = 0.7,
+        per_channel: bool = False,
+    ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.ternary_scale = ternary_scale
+        self.per_channel = per_channel
 
         # Latent weights (FP32) - shadow weights for gradient updates
         self.latent_weights = nn.Parameter(
@@ -59,16 +68,9 @@ class TernaryLinear(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Quantize latent weights to ternary via STE
-        w_ternary = TernaryQuantizer.apply(self.latent_weights)
-
-        # Matmul with ternary weights (activations stay FP32 during training)
-        # In production inference: quantize activations to INT8, use XNOR+popcount
-        output = F.linear(x, w_ternary)
-
+        output = FusedTernaryLinear.apply(x, self.latent_weights, self.ternary_scale, self.per_channel)
         if self.bias is not None:
             output = output + self.bias
-
         return output
 
     def get_ternary_weights(self) -> torch.Tensor:
@@ -78,3 +80,5 @@ class TernaryLinear(nn.Module):
     def get_num_bits(self) -> int:
         """Calculate total bits for ternary weights."""
         return math.ceil(math.log2(3)) * self.latent_weights.numel()
+
+

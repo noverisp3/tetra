@@ -51,6 +51,12 @@ def main():
                         help="Force device (default: auto-detect)")
     parser.add_argument("--hybrid", action="store_true",
                         help="Hybrid mode: model on GPU, optimizer on CPU (avoids DML fallbacks)")
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader workers for async prefetch (default: 4)")
+    parser.add_argument("--ternary-scale", type=float, default=0.7,
+                        help="Dynamic threshold scale: Δ = scale × mean(|W|), lower = more {-1,+1}, higher = more 0 (default: 0.7)")
+    parser.add_argument("--per-channel", action="store_true",
+                        help="Per-channel quantization threshold (instead of per-tensor)")
     args = parser.parse_args()
 
     config = TrainingConfig()
@@ -87,6 +93,8 @@ def main():
         config.device = args.device
     if args.hybrid:
         config.hybrid_optimizer = True
+    config.ternary_scale = args.ternary_scale
+    config.per_channel = args.per_channel
 
     # Step 1: Prepare data
     if args.data_cache:
@@ -118,6 +126,8 @@ def main():
             block_size=config.block_size,
             batch_size=config.batch_size,
             val_split=config.val_split,
+            num_workers=args.num_workers,
+            pin_memory=True,
         )
     else:
         train_loader, val_loader = create_dataloaders(
@@ -125,6 +135,8 @@ def main():
             block_size=config.block_size,
             batch_size=config.batch_size,
             val_split=config.val_split,
+            num_workers=args.num_workers,
+            pin_memory=True,
         )
 
     # Step 3: Create model
@@ -136,6 +148,8 @@ def main():
         num_heads=config.num_heads,
         ffn_dim=config.ffn_dim,
         max_seq_len=config.max_seq_len,
+        ternary_scale=config.ternary_scale,
+        per_channel=config.per_channel,
     )
 
     total_params = sum(p.numel() for p in model.parameters())

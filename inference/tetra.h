@@ -69,6 +69,25 @@ struct TernaryWeightXNOR {
     float alpha;        // v2: per-matrix absmean scale factor
 };
 
+// ─── Decode-optimized LUT for 2-bit → float conversion ─────────
+// Single table lookup per 4 weights — eliminates bit shifts at decode time.
+// 256 entries × 16 bytes = 4 KB (fits L1 cache).
+struct ByteDecoded { float v[4]; };
+static ByteDecoded BYTE_LUT[256];
+
+static void init_byte_lut() {
+    static bool initialized = false;
+    if (initialized) return;
+    const float vals[4] = {-1.0f, 0.0f, 1.0f, 0.0f};
+    for (int b = 0; b < 256; b++) {
+        BYTE_LUT[b].v[0] = vals[(b >> 6) & 3];
+        BYTE_LUT[b].v[1] = vals[(b >> 4) & 3];
+        BYTE_LUT[b].v[2] = vals[(b >> 2) & 3];
+        BYTE_LUT[b].v[3] = vals[b & 3];
+    }
+    initialized = true;
+}
+
 struct FP32Weight {
     std::vector<float> data;
     std::vector<int> shape;
@@ -327,6 +346,147 @@ static void ternary_matmul(
     ternary_matmul_precomputed(x, w, out);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// DECODE-OPTIMIZED MATMUL
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Prefetch helper ────────────────────────────────────────────
+#ifdef _MSC_VER
+#define TETRA_PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
+#else
+#define TETRA_PREFETCH(addr) __builtin_prefetch(addr, 0, 3)
+#endif
+
+// ─── Decode ternary matmul: LUT unpack + SIMD dot product ───────
+// Processes 256 weights (64 bytes = 1 cache line) per iteration.
+// LUT eliminates bit shifts: single table lookup per byte → 4 floats.
+// Prefetches next cache line while computing current one.
+//
+// Memory layout per iteration:
+//   packed:  64 bytes  (256 weights × 2 bits) — 1 cache line, sequential read
+//   unpacked: 256 floats × 4 bytes = 1 KB     — fits in L1
+//   activation x[c..c+256]: 1 KB               — stays in L1 across iterations
+static void ternary_matmul_decode(
+    const float* x, const uint8_t* packed, float* out, int rows, int cols
+) {
+    init_byte_lut();
+
+    alignas(64) float chunk[256];
+    const int CHUNK = 256;
+    const int CHUNK_BYTES = CHUNK / 4;  // 64 bytes = 1 cache line
+
+    for (int r = 0; r < rows; r++) {
+        const uint8_t* row = packed + (r * cols) / 4;
+        float sum = 0.0f;
+        int c = 0;
+
+        // Prefetch first cache line of this row
+        TETRA_PREFETCH(row);
+
+        // ── Main loop: 256 weights per iteration ──
+        // Each iteration reads exactly 1 cache line of packed data.
+        for (; c + CHUNK <= cols; c += CHUNK) {
+            const uint8_t* src = row + c / 4;
+
+            // Prefetch next cache line while we unpack current
+            TETRA_PREFETCH(src + CHUNK_BYTES);
+
+            // Unpack: 64 bytes → 256 floats via LUT (no bit shifts)
+            // 16 unrolled iterations × 4 weights = 64 weights per inner loop
+            // 4 inner loops × 64 = 256 weights total
+            #pragma loop(hint_parallel(4))
+            for (int j = 0; j < CHUNK_BYTES; j += 4) {
+                // Read 4 bytes at once (32-bit load, single cache access)
+                uint32_t four;
+                memcpy(&four, src + j, 4);
+
+                // Extract 4 bytes and lookup (compiler-friendly: constant shifts)
+                const ByteDecoded& d0 = BYTE_LUT[four & 0xFF];
+                const ByteDecoded& d1 = BYTE_LUT[(four >> 8) & 0xFF];
+                const ByteDecoded& d2 = BYTE_LUT[(four >> 16) & 0xFF];
+                const ByteDecoded& d3 = BYTE_LUT[four >> 24];
+
+                int base = j * 4;
+                chunk[base]    = d0.v[0]; chunk[base+1]  = d0.v[1];
+                chunk[base+2]  = d0.v[2]; chunk[base+3]  = d0.v[3];
+                chunk[base+4]  = d1.v[0]; chunk[base+5]  = d1.v[1];
+                chunk[base+6]  = d1.v[2]; chunk[base+7]  = d1.v[3];
+                chunk[base+8]  = d2.v[0]; chunk[base+9]  = d2.v[1];
+                chunk[base+10] = d2.v[2]; chunk[base+11] = d2.v[3];
+                chunk[base+12] = d3.v[0]; chunk[base+13] = d3.v[1];
+                chunk[base+14] = d3.v[2]; chunk[base+15] = d3.v[3];
+            }
+
+            // SIMD dot product on unpacked chunk
+            sum += dot_product_simd(x + c, chunk, CHUNK);
+        }
+
+        // ── Remainder: handle remaining weights ──
+        if (c < cols) {
+            int rem = cols - c;
+            int rem_bytes = (rem + 3) / 4;
+            const uint8_t* src = row + c / 4;
+
+            for (int j = 0; j < rem_bytes; j++) {
+                const ByteDecoded& d = BYTE_LUT[src[j]];
+                int base = j * 4;
+                for (int k = 0; k < 4 && base + k < rem; k++) {
+                    chunk[base + k] = d.v[k];
+                }
+            }
+            sum += dot_product_simd(x + c, chunk, rem);
+        }
+
+        out[r] = sum;
+    }
+}
+
+// ─── Decode FP32 matmul with prefetch ───────────────────────────
+// Used for LM head (vocab projection) during single-token decode.
+static void matmul_fp32_decode(const float* x, const float* w, float* out,
+                                int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        // Prefetch 3 rows ahead (≈3 × cols × 4 bytes)
+        if (r + 3 < rows) {
+            TETRA_PREFETCH(w + (r + 3) * cols);
+        }
+        out[r] = dot_product_simd(x, w + r * cols, cols);
+    }
+}
+
+// ─── Precomputed decode: SIMD dot product + prefetch ─────────────
+// Uses precomputed floats (dequantized at load time) with prefetching.
+// Fastest path when weights fit in L2/L3 cache.
+static void ternary_matmul_precomputed_decode(
+    const float* x, const TernaryWeightXNOR& w, float* out
+) {
+    const int rows = w.rows;
+    const int cols = w.cols;
+    const float* data = w.floats.data();
+
+    for (int r = 0; r < rows; r++) {
+        // Prefetch next row (2 rows ahead to hide memory latency)
+        if (r + 2 < rows) {
+            TETRA_PREFETCH(data + (r + 2) * cols);
+        }
+        out[r] = dot_product_simd(x, data + r * cols, cols);
+    }
+}
+
+// ─── Decode dispatch ────────────────────────────────────────────
+// Default: precomputed with prefetch (fastest for current model sizes).
+// LUT path available for memory-constrained / very large models.
+static void ternary_matmul_auto(
+    const float* x, const TernaryWeightXNOR& w, float* out,
+    float x_absmean, bool decode
+) {
+    if (decode) {
+        ternary_matmul_precomputed_decode(x, w, out);
+    } else {
+        ternary_matmul_precomputed(x, w, out);
+    }
+}
+
 // ─── FP32 matmul (embeddings, norms) ─────────────────────────────
 static void matmul_fp32(const float* x, const float* w, float* out,
                          int rows, int cols) {
@@ -492,6 +652,7 @@ static std::vector<float> forward(
     int FFN = model.header.ffn_dim;
     int V  = model.header.vocab_size;
     int seq_len = (int)tokens.size();
+    bool decode = (seq_len == 1);  // Single-token = decode phase
 
     std::vector<float> x(H), q(H), k(H), v(H);
     std::vector<float> attn_scores(model.header.max_seq_len);
@@ -528,9 +689,9 @@ static std::vector<float> forward(
         std::string o_name = std::string(prefix) + "attn.o_proj.latent_weights";
 
         // XNOR+popcount ternary projections
-        ternary_matmul(normed.data(), model.tw(q_name), q.data(), x_scale);
-        ternary_matmul(normed.data(), model.tw(k_name), k.data(), x_scale);
-        ternary_matmul(normed.data(), model.tw(v_name), v.data(), x_scale);
+        ternary_matmul_auto(normed.data(), model.tw(q_name), q.data(), x_scale, decode);
+        ternary_matmul_auto(normed.data(), model.tw(k_name), k.data(), x_scale, decode);
+        ternary_matmul_auto(normed.data(), model.tw(v_name), v.data(), x_scale, decode);
 
         // Store K,V in cache
         for (int i = 0; i < H; i++) {
@@ -543,15 +704,18 @@ static std::vector<float> forward(
             float scale = 1.0f / sqrtf((float)HD);
             int actual_len = pos + 1;
 
+            // Attention scores: Q · K for each time step
+            const float* q_head = q.data() + head * HD;
             for (int t = 0; t < actual_len; t++) {
-                float dot = 0.0f;
-                for (int d = 0; d < HD; d++) {
-                    dot += q[head * HD + d] * cache.k_cache[l][t * H + head * HD + d];
-                }
-                attn_scores[t] = dot * scale;
+                attn_scores[t] = dot_product_simd(
+                    q_head,
+                    cache.k_cache[l].data() + t * H + head * HD,
+                    HD
+                ) * scale;
             }
             softmax(attn_scores.data(), actual_len);
 
+            // Attention output: weighted sum of V
             for (int d = 0; d < HD; d++) {
                 float sum = 0.0f;
                 for (int t = 0; t < actual_len; t++) {
@@ -564,7 +728,7 @@ static std::vector<float> forward(
         // Output projection
         std::vector<float> proj_out(H);
         float o_scale = absmean(attn_out.data(), H);
-        ternary_matmul(attn_out.data(), model.tw(o_name), proj_out.data(), o_scale);
+        ternary_matmul_auto(attn_out.data(), model.tw(o_name), proj_out.data(), o_scale, decode);
 
         for (int i = 0; i < H; i++) x[i] += proj_out[i];
 
@@ -579,15 +743,15 @@ static std::vector<float> forward(
         std::string down_name = std::string(prefix) + "ffn.down_proj.latent_weights";
 
         // SwiGLU: gate and up projections
-        ternary_matmul(ffn_normed.data(), model.tw(gate_name), gate.data(), ffn_scale);
-        ternary_matmul(ffn_normed.data(), model.tw(up_name), up.data(), ffn_scale);
+        ternary_matmul_auto(ffn_normed.data(), model.tw(gate_name), gate.data(), ffn_scale, decode);
+        ternary_matmul_auto(ffn_normed.data(), model.tw(up_name), up.data(), ffn_scale, decode);
 
         // SiLU(gate) * up
         for (int i = 0; i < FFN; i++) hidden[i] = silu(gate[i]) * up[i];
 
         // Down projection
         float h_scale = absmean(hidden.data(), FFN);
-        ternary_matmul(hidden.data(), model.tw(down_name), ffn_out.data(), h_scale);
+        ternary_matmul_auto(hidden.data(), model.tw(down_name), ffn_out.data(), h_scale, decode);
 
         for (int i = 0; i < H; i++) x[i] += ffn_out[i];
     }
@@ -596,10 +760,16 @@ static std::vector<float> forward(
     rmsnorm(x.data(), model.fw_ptr("norm.weight"), H);
 
     std::vector<float> logits(V);
-    for (int vi = 0; vi < V; vi++) {
-        float dot = 0.0f;
-        for (int i = 0; i < H; i++) dot += x[i] * tok_emb[vi * H + i];
-        logits[vi] = dot;
+    if (decode) {
+        // Decode: SIMD dot product with prefetch for each vocab entry
+        matmul_fp32_decode(x.data(), tok_emb, logits.data(), V, H);
+    } else {
+        // Prefill: scalar (ok for small seq)
+        for (int vi = 0; vi < V; vi++) {
+            float dot = 0.0f;
+            for (int i = 0; i < H; i++) dot += x[i] * tok_emb[vi * H + i];
+            logits[vi] = dot;
+        }
     }
 
     cache.pos++;

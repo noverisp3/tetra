@@ -175,15 +175,19 @@ class ChunkedDataset(Dataset):
         return x, y
 
 
-def create_dataloaders(tokens, block_size=128, batch_size=8, val_split=0.05):
+def create_dataloaders(tokens, block_size=128, batch_size=8, val_split=0.05, num_workers=0, pin_memory=False):
     split_idx = int(len(tokens) * (1 - val_split))
     train_ds = ChunkedDataset(tokens[:split_idx], block_size)
     val_ds = ChunkedDataset(tokens[split_idx:], block_size)
     print(f"Train samples: {len(train_ds):,} | Val samples: {len(val_ds):,}")
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0,
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+        num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0,
     )
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0,
+    )
     return train_loader, val_loader
 
 
@@ -297,7 +301,7 @@ class MultiSourceChunkedDataset(Dataset):
         return x, y
 
 
-def create_multi_source_dataloaders(data_dir, block_size=128, batch_size=8, val_split=0.05):
+def create_multi_source_dataloaders(data_dir, block_size=128, batch_size=8, val_split=0.05, num_workers=0, pin_memory=False):
     """Create train/val dataloaders from multi-source chunks."""
     ds = MultiSourceChunkedDataset(data_dir, block_size, val_split=val_split)
     n_val = ds.total_chunks - ds.val_start
@@ -306,10 +310,13 @@ def create_multi_source_dataloaders(data_dir, block_size=128, batch_size=8, val_
     val_ds = MultiSourceChunkedDataset(data_dir, block_size, val_split=val_split)
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0,
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+        num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=0,
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0,
     )
     print(f"Train samples: {len(train_ds):,} | Val samples: {n_val:,}")
+    return train_loader, val_loader
     return train_loader, val_loader
