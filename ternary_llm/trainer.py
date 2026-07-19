@@ -239,20 +239,19 @@ class TernaryTrainer:
         self.model.train()
         total_loss = 0.0
         step = step_start
+        micro_count = 0
+        steps_remaining = self.config.max_steps - step_start
+        pbar = tqdm(total=steps_remaining, desc=f"Training", unit="step")
 
-        remaining = self.config.max_steps - step_start
-        micro_steps_remaining = remaining * self.config.gradient_accumulation_steps
-        pbar = tqdm(self.train_loader, desc=f"Training", total=min(len(self.train_loader), micro_steps_remaining))
-
-        for batch_idx, batch in enumerate(pbar):
+        for batch in self.train_loader:
             if step >= self.config.max_steps:
                 break
 
             loss = self.train_step(batch)
             total_loss += loss
+            micro_count += 1
 
-            # Gradient accumulation
-            if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+            if micro_count % self.config.gradient_accumulation_steps == 0:
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.config.grad_clip
@@ -275,6 +274,7 @@ class TernaryTrainer:
                 # LR scheduler
                 self.scheduler.step()
                 step += 1
+                pbar.update(1)
 
                 # Logging
                 if step % self.config.log_interval == 0:
@@ -282,9 +282,7 @@ class TernaryTrainer:
                     lr = self.optimizer.param_groups[0]["lr"]
                     self.train_losses.append(avg_loss)
                     self.learning_rates.append(lr)
-                    pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}", step=f"{step}/{self.config.max_steps}")
-                    pbar.n = (step - step_start) * self.config.gradient_accumulation_steps + (batch_idx + 1) % self.config.gradient_accumulation_steps
-                    pbar.refresh()
+                    pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
                     total_loss = 0.0
 
                 # Validation
