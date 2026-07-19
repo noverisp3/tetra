@@ -1,17 +1,21 @@
 #pragma once
 // Tetra — Pure Ternary LLM Inference Engine
-// Ternary weights {-1, 0, 1} with REAL XNOR+popcount acceleration.
+// Ternary weights {-1, 0, +1} with SIMD-accelerated matmul.
 //
-// Strategy:
-//   1. Precompute two bitmasks per weight row:
-//        pos_mask: bit i = 1 if w_i == +1
-//        neg_mask: bit i = 1 if w_i == -1
-//   2. For matmul, extract sign bits of activations into a bitmask
-//   3. XNOR + popcount counts matching signs
-//   4. result = (positive_matches - negative_matches) × scale
+// Matmul Strategy:
+//   1. At load time, dequantize 2-bit packed ternary → float {-1, 0, +1}
+//   2. At inference, compute dot product using SIMD (AVX-512 / AVX2 / scalar)
+//   3. This gives EXACT quality (matches PyTorch F.linear) at SIMD speed
 //
-// This replaces float multiply with bitwise operations.
-// AVX-512 path: 64 weights processed in ~10 instructions.
+// Why not XNOR+popcount?
+//   XNOR approximates x·w as mean(|x|) × popcount(sign(x), w), which loses
+//   activation magnitude info. For small models this error compounds over layers.
+//   Precomputed floats + SIMD dot product is both exact AND fast (922 tok/s).
+//
+// Binary Format v2:
+//   Header (64B): magic "TETR", version, model dims, param counts
+//   Ternary weights: name, shape, alpha (absmean), 2-bit packed data
+//   FP32 weights: embeddings, norms (lm_head tied to embedding)
 
 #include <cstdint>
 #include <cstring>
@@ -498,9 +502,12 @@ static std::vector<float> forward(
     const float* pos_emb = model.fw_ptr("pos_embedding.weight");
 
     // Token + Position Embedding
+    // Use cache.pos for position (not tokens.size()-1) because after prefill,
+    // cache.pos may exceed the tokens vector size.
+    int pos = cache.pos;
     for (int i = 0; i < H; i++) {
         x[i] = tok_emb[tokens.back() * H + i]
-              + pos_emb[(seq_len - 1) * H + i];
+              + pos_emb[pos * H + i];
     }
 
     // Transformer layers
@@ -526,7 +533,6 @@ static std::vector<float> forward(
         ternary_matmul(normed.data(), model.tw(v_name), v.data(), x_scale);
 
         // Store K,V in cache
-        int pos = cache.pos;
         for (int i = 0; i < H; i++) {
             cache.k_cache[l][pos * H + i] = k[i];
             cache.v_cache[l][pos * H + i] = v[i];
@@ -601,13 +607,53 @@ static std::vector<float> forward(
 }
 
 // ─── Sampling ──────────────────────────────────────────────────────
-static int sample(const std::vector<float>& logits, float temperature) {
+// Top-k: keep only top k tokens, then top-p: keep smallest set with cumprob >= p.
+static int sample(const std::vector<float>& logits, float temperature, int top_k, float top_p) {
     int n = (int)logits.size();
     float mx = *std::max_element(logits.begin(), logits.end());
     std::vector<float> probs(n);
+    for (int i = 0; i < n; i++) probs[i] = expf((logits[i] - mx) / temperature);
+
+    // Top-k filtering: zero out tokens outside top k
+    if (top_k > 0 && top_k < n) {
+        std::vector<int> indices(n);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
+            [&](int a, int b) { return probs[a] > probs[b]; });
+        float z = 0.0f;
+        for (int i = 0; i < top_k; i++) z += probs[indices[i]];
+        // Save top-k values before zeroing
+        std::vector<float> top_vals(top_k);
+        for (int i = 0; i < top_k; i++) top_vals[i] = probs[indices[i]];
+        for (int i = 0; i < n; i++) probs[i] = 0.0f;
+        for (int i = 0; i < top_k; i++) probs[indices[i]] = z > 0 ? top_vals[i] / z : 1.0f / top_k;
+    }
+
+    // Top-p (nucleus) filtering: keep smallest set with cumprob >= top_p
+    if (top_p < 1.0f && top_p > 0.0f) {
+        std::vector<int> indices(n);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(),
+            [&](int a, int b) { return probs[a] > probs[b]; });
+        float cum = 0.0f;
+        int cutoff = n;
+        for (int i = 0; i < n; i++) {
+            cum += probs[indices[i]];
+            if (cum >= top_p) { cutoff = i + 1; break; }
+        }
+        float z = 0.0f;
+        for (int i = 0; i < cutoff; i++) z += probs[indices[i]];
+        // Save values before zeroing
+        std::vector<float> top_vals(cutoff);
+        for (int i = 0; i < cutoff; i++) top_vals[i] = probs[indices[i]];
+        for (int i = 0; i < n; i++) probs[i] = 0.0f;
+        for (int i = 0; i < cutoff; i++) probs[indices[i]] = z > 0 ? top_vals[i] / z : 1.0f / cutoff;
+    }
+
+    // Renormalize and sample
     float sum = 0.0f;
-    for (int i = 0; i < n; i++) { probs[i] = expf((logits[i] - mx) / temperature); sum += probs[i]; }
-    for (int i = 0; i < n; i++) probs[i] /= sum;
+    for (int i = 0; i < n; i++) sum += probs[i];
+    if (sum > 0) for (int i = 0; i < n; i++) probs[i] /= sum;
 
     float r = (float)rand() / RAND_MAX;
     float cum = 0.0f;

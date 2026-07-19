@@ -38,7 +38,7 @@ Binary file format (v2):
             [rows*cols*4 bytes] fp32 weights (little-endian)
 
 Usage:
-    python inference/export_model.py checkpoints_local/checkpoint_000200.pt
+    python inference/export_model.py checkpoints/checkpoint_010000.pt
 """
 import sys
 import struct
