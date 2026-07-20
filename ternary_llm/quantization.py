@@ -1,7 +1,34 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+import math, os, sys
+
+# ---------------------------------------------------------------------------
+# Optional C++ SIMD extension for fast pack/unpack
+# ---------------------------------------------------------------------------
+_ternary_ops = None
+
+def _load_cpp_extension():
+    """Try to load C++ ternary_ops extension, return False on failure."""
+    global _ternary_ops
+    if _ternary_ops is not None:
+        return True
+    try:
+        from torch.utils.cpp_extension import load
+        src = os.path.join(os.path.dirname(__file__), "csrc", "ternary_ops.cpp")
+        if not os.path.exists(src):
+            return False
+        _ternary_ops = load(
+            name="ternary_ops",
+            sources=[src],
+            extra_cflags=["/arch:AVX2"],
+            verbose=False,
+        )
+        return True
+    except Exception:
+        return False
+
+_has_cpp = _load_cpp_extension()
 
 
 class TernaryQuantizer(torch.autograd.Function):
@@ -127,6 +154,8 @@ def unpack_ternary(packed: bytes, shape: tuple, device: str = "cpu") -> torch.Te
 
 def pack_ternary_tensor(w: torch.Tensor) -> torch.Tensor:
     """Pack ternary float tensor {-1, 0, +1} → uint8 tensor (4 weights/byte)."""
+    if _has_cpp and w.is_cpu and w.dtype in (torch.float32, torch.float16):
+        return _ternary_ops.pack_ternary(w.contiguous())
     w_u8 = (w + 1).to(torch.uint8)  # -1→0, 0→1, +1→2
     flat = w_u8.flatten()
     n = flat.size(0)
@@ -140,6 +169,8 @@ def pack_ternary_tensor(w: torch.Tensor) -> torch.Tensor:
 
 def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple) -> torch.Tensor:
     """Unpack uint8 tensor → float tensor {-1, 0, +1}."""
+    if _has_cpp and packed.is_cpu:
+        return _ternary_ops.unpack_ternary(packed.contiguous(), list(shape))
     w0 = (torch.div(packed, 64, rounding_mode='floor') % 4).to(torch.int8) - 1
     w1 = (torch.div(packed, 16, rounding_mode='floor') % 4).to(torch.int8) - 1
     w2 = (torch.div(packed, 4, rounding_mode='floor') % 4).to(torch.int8) - 1
