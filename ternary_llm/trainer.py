@@ -188,11 +188,18 @@ class TernaryTrainer:
             min_lr=config.min_lr,
         )
 
-        # Mixed precision (manual FP16 on GPU, since autocast not supported on DML)
+        # Mixed precision: auto-select best dtype for device
         self.activation_dtype = None
-        if config.dtype == "float16" and self.device != torch.device("cpu"):
-            self.activation_dtype = torch.float16
-            print(f"  FP16 activations enabled")
+        if config.dtype in ("float16", "bfloat16") and self.device != torch.device("cpu"):
+            bf16_ok = self.device.type == "cuda" and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            if config.dtype == "bfloat16" and bf16_ok:
+                self.activation_dtype = torch.bfloat16
+            elif config.dtype == "bfloat16":
+                print("  bfloat16 not supported on this device, falling back to float16")
+                self.activation_dtype = torch.float16
+            else:
+                self.activation_dtype = torch.float16
+            print(f"  {str(self.activation_dtype).split('.')[-1]} activations enabled")
 
         # Create save directory
         Path(config.save_dir).mkdir(parents=True, exist_ok=True)
