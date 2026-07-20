@@ -35,7 +35,7 @@ class TrainingConfig:
 
     # Training
     batch_size: int = 16
-    gradient_accumulation_steps: int = 1  # effective batch = 16
+    gradient_accumulation_steps: int = 4
     max_steps: int = 10000
     learning_rate: float = 1e-3
     min_lr: float = 1e-4
@@ -153,9 +153,13 @@ class TernaryTrainer:
         self.hybrid = False
         if config.hybrid_optimizer and self.device != torch.device("cpu"):
             self.hybrid = True
-            # Create CPU parameter clones for optimizer
+            # Create CPU parameter clones for optimizer (deduplicate tied weights)
+            seen = set()
             self.cpu_params = []
             for p in model.parameters():
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
                 cp = nn.Parameter(p.data.cpu().clone(), requires_grad=p.requires_grad)
                 self.cpu_params.append(cp)
             self.optimizer = torch.optim.AdamW(
@@ -221,9 +225,17 @@ class TernaryTrainer:
 
         return raw_loss
 
+    def _unique_params(self):
+        """Yield unique model parameters (skip tied weight duplicates)."""
+        seen = set()
+        for p in self.model.parameters():
+            if id(p) not in seen:
+                seen.add(id(p))
+                yield p
+
     def _hybrid_sync_gradients(self):
         """Copy gradients from GPU model to CPU params."""
-        for gp, cp in zip(self.model.parameters(), self.cpu_params):
+        for gp, cp in zip(self._unique_params(), self.cpu_params):
             if gp.grad is not None:
                 cp.grad = gp.grad.cpu()
             else:
@@ -231,7 +243,7 @@ class TernaryTrainer:
 
     def _hybrid_sync_weights(self):
         """Copy updated weights from CPU params back to GPU model."""
-        for gp, cp in zip(self.model.parameters(), self.cpu_params):
+        for gp, cp in zip(self._unique_params(), self.cpu_params):
             gp.data.copy_(cp.data.to(gp.device))
 
     def train_epoch(self, step_start: int) -> int:
@@ -252,9 +264,9 @@ class TernaryTrainer:
             micro_count += 1
 
             if micro_count % self.config.gradient_accumulation_steps == 0:
-                # Gradient clipping
+                # Gradient clipping (unique params only)
                 torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.grad_clip
+                    self._unique_params(), self.config.grad_clip
                 )
 
                 # Optimizer step
@@ -369,11 +381,12 @@ class TernaryTrainer:
                 if "accumulator" in k and v.is_floating_point():
                     state_dict[k] = v.half()
         else:
-            # STE: latent weights → FP16 (preserves precision for training resume)
-            for k, v in self.model.state_dict().items():
+            # STE: move all to CPU first (single bulk transfer), then process
+            sd = {k: v.cpu() for k, v in self.model.state_dict().items()}
+            for k, v in sd.items():
                 if "latent_weights" in k:
                     state_dict[k] = v.half()
-                    inference_data[k] = {"packed": pack_ternary(ternary_quantize(v.data)), "shape": list(v.shape)}
+                    inference_data[k] = {"packed": pack_ternary(ternary_quantize(v)), "shape": list(v.shape)}
                 else:
                     state_dict[k] = v
 
@@ -527,7 +540,8 @@ class TernaryTrainer:
 
         elapsed = time.time() - start_time
         print(f"\nTraining complete in {elapsed / 60:.1f} minutes")
-        print(f"Final train loss: {self.train_losses[-1]:.4f}")
+        if self.train_losses:
+            print(f"Final train loss: {self.train_losses[-1]:.4f}")
         if self.val_losses:
             print(f"Final val loss: {self.val_losses[-1]:.4f}")
 
