@@ -219,14 +219,14 @@ class StochasticBitFlipLinear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, packed_flat, shape_w, scale, accumulator, threshold):
-        w_ternary = unpack_ternary_tensor(packed_flat, shape_w).to(x.dtype) * scale
+        w_raw = unpack_ternary_tensor(packed_flat, shape_w).to(x.dtype)
         ctx.save_for_backward(x)
+        ctx.w_raw = w_raw
         ctx.packed_flat = packed_flat
-        ctx.shape_w = shape_w
         ctx.scale = scale
         ctx.accumulator = accumulator
         ctx.threshold = threshold
-        return F.linear(x, w_ternary)
+        return F.linear(x, w_raw * scale)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -234,7 +234,7 @@ class StochasticBitFlipLinear(torch.autograd.Function):
         scale = ctx.scale
         in_features = x.size(-1)
 
-        w_ternary = unpack_ternary_tensor(ctx.packed_flat, ctx.shape_w).to(x.dtype) * scale
+        w_ternary = ctx.w_raw * scale
         grad_output_flat = grad_output.reshape(-1, grad_output.size(-1))
         grad_x_flat = torch.mm(grad_output_flat, w_ternary)
         grad_x = grad_x_flat.view(*x.shape[:-1], in_features)
@@ -245,16 +245,15 @@ class StochasticBitFlipLinear(torch.autograd.Function):
         )
 
         with torch.no_grad():
-            # Gradient sign: chi direction, bo magnitude → on dinh, khong phu thuoc batch size
             ctx.accumulator.add_(torch.sign(-grad_w) / scale)
             flip_up = ctx.accumulator > ctx.threshold
             flip_down = ctx.accumulator < -ctx.threshold
 
             if flip_up.any() or flip_down.any():
-                w_curr = unpack_ternary_tensor(ctx.packed_flat, ctx.shape_w).to(x.device)
                 flip_dir = torch.where(flip_up, 1.0, 0.0) + torch.where(flip_down, -1.0, 0.0)
-                w_new = (w_curr + flip_dir).clamp(-1, 1)
+                w_new = (ctx.w_raw + flip_dir).clamp(-1, 1)
                 ctx.packed_flat.copy_(pack_ternary_tensor(w_new).to(ctx.packed_flat.device))
+                ctx.w_raw = w_new
                 ctx.accumulator[flip_up | flip_down] = 0.0
 
         return grad_x, None, None, None, None, None
