@@ -232,20 +232,32 @@ class TernaryTrainer:
             msg += f" VRAM={vram_gb:.1f}GB"
         print(msg, flush=True)
 
+    def _clear_cache(self):
+        """Free cached memory from CUDA allocator; best-effort on DML."""
+        import gc
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
     def train_step(self, batch: tuple[torch.Tensor, torch.Tensor]) -> float:
         """Single training step with gradient accumulation."""
+        import time
         x, y = batch
         x = x.to(self.device)
         y = y.to(self.device)
 
-        self.log_mem("before forward")
+        t0 = time.perf_counter()
         _, loss, _ = self.model(x, y, activation_dtype=self.activation_dtype)
-        self.log_mem("after forward")
+        t1 = time.perf_counter()
         raw_loss = loss.item()
         loss = loss / self.config.gradient_accumulation_steps
-        self.log_mem("before backward")
         loss.backward()
-        self.log_mem("after backward")
+        t2 = time.perf_counter()
+        self._clear_cache()
+
+        self.fwd_time = getattr(self, 'fwd_time', 0.0) + (t1 - t0)
+        self.bwd_time = getattr(self, 'bwd_time', 0.0) + (t2 - t1)
+        self.micro_steps = getattr(self, 'micro_steps', 0) + 1
 
         return raw_loss
 
@@ -288,7 +300,25 @@ class TernaryTrainer:
             micro_count += 1
 
             if micro_count % self.config.gradient_accumulation_steps == 0:
+                # Timing breakdown
+                if self.fwd_time > 0:
+                    avg_fwd = self.fwd_time / self.micro_steps
+                    avg_bwd = self.bwd_time / self.micro_steps
+                    tqdm.write(
+                        f"  [TIME] fwd={avg_fwd:.1f}s | bwd={avg_bwd:.1f}s | total={avg_fwd+avg_bwd:.1f}s"
+                    )
+                    # Per-layer timing (last micro-batch)
+                    if hasattr(self.model, '_layer_times') and self.model._layer_times:
+                        lt = self.model._layer_times
+                        tqdm.write(f"  [TIME] layers: " + " | ".join(
+                            f"L{i}={lt[i]:.3f}s" for i in range(len(lt))
+                        ))
+                self.fwd_time = 0.0
+                self.bwd_time = 0.0
+                self.micro_steps = 0
+
                 # Gradient clipping (unique params only)
+                opt_t0 = time.perf_counter()
                 torch.nn.utils.clip_grad_norm_(
                     self._unique_params(), self.config.grad_clip
                 )
@@ -303,14 +333,24 @@ class TernaryTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.hybrid:
                     self.model.zero_grad(set_to_none=True)
+                opt_time = time.perf_counter() - opt_t0
+
+                # Free cached allocator memory after optimizer step
+                self._clear_cache()
 
                 # Stochastic Bit-Flip: apply accumulated flips every N steps
                 if (self.config.mode == "stochastic"
                     and step > 0
                     and step % self.config.flip_every_n_steps == 0):
+                    tqdm.write(f"  [TIME] opt={opt_time:.1f}s")
                     self.log_mem("before apply_bit_flips")
+                    flip_t0 = time.perf_counter()
                     self.model.apply_bit_flips()
+                    flip_time = time.perf_counter() - flip_t0
                     self.log_mem("after apply_bit_flips")
+                    tqdm.write(f"  [TIME] flip={flip_time:.1f}s")
+                else:
+                    tqdm.write(f"  [TIME] opt={opt_time:.1f}s")
 
                 # LR scheduler
                 self.scheduler.step()

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import time
 from .layers import RMSNorm
 from .attention import TernaryMultiHeadAttention
 from .ffn import TernaryFFN
@@ -176,9 +177,12 @@ class TernaryTransformerModel(nn.Module):
 
         # Transformer layers
         new_key_values = []
+        self._layer_times = []
         for i, layer in enumerate(self.layers):
+            t0 = time.perf_counter()
             past_kv = past_key_values[i] if past_key_values is not None else None
             x, kv = layer(x, past_kv=past_kv)
+            self._layer_times.append(time.perf_counter() - t0)
             new_key_values.append(kv)
 
         # Final norm

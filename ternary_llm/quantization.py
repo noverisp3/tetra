@@ -214,10 +214,14 @@ class StochasticBitFlipLinear(torch.autograd.Function):
         )
 
         with torch.no_grad():
-            ctx.accumulator.add_(torch.sign(-grad_w) / scale)
+            grad_w.sign_().neg_()
+            ctx.accumulator.add_(grad_w / scale)
 
         # Release unpacked weights early to free GPU memory on DML
         ctx.w_raw = None
+
+        # Free intermediate tensors explicitly for DML allocator
+        del w_ternary, grad_w, grad_output_flat
 
         return grad_x, None, None, None, None, None
 
