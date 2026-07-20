@@ -68,14 +68,36 @@ threshold = 20.0 / scale   # default auto-compute
 
 Lower threshold → too much flipping (diverges). Higher → not enough learning (underfits).
 
-## Training Speed (500m on Intel Iris Xe, DML, 16GB shared VRAM)
+## Training Speed
 
-| Config | ms/step | Est. 10K steps | Tok/s |
-|--------|---------|----------------|-------|
-| `--grad-accum 4` (default) | ~24000 | ~67h | ~170 |
-| `--grad-accum 1` | ~8000 | ~24h | ~520 |
+Batch=4, Seq=1024 (except 500m CPU: batch=2, seq=512). DML = Intel Iris Xe via DirectML. CPU = same hardware, MKL.
 
-`torch.compile` and `torch.amp.autocast` are not supported on DirectML. XNOR+popcount custom kernels not implementable on DML (no custom kernel support).
+| Preset | Device | Params | Fwd | Bwd | Total/step | RAM | Est. 10K steps |
+|--------|--------|--------|-----|-----|-----------|-----|-----------------|
+| **tiny** | DML | 2.2M | 0.13s | 0.53s | 0.66s | — | 1.8h |
+| **medium** | DML | 55M | 1.64s | 3.24s | 4.88s | — | 13.6h |
+| **medium** | CPU | 55M | 0.47s | 2.36s | 2.83s | ~1GB | 7.9h |
+| **large** | DML | 92M | 2.40s | 4.59s | 6.99s | — | 19.4h |
+| **500m** | DML | 516M | ~10s | ~25s | ~35s | OOM step 2 | — |
+| **500m** | CPU | 516M | 7.5s | 17.1s | 24.5s | 2.8GB | 68h |
+
+CPU avoids DML OOM on 16GB shared VRAM. C++ SIMD pack/unpack (~5s for 500M weights) accelerates unpack on CPU. Bottleneck is matmul (77% of time) on Iris Xe 4-core CPU with MKL. `torch.compile` and `torch.amp.autocast` are not supported on DirectML.
+
+## C++ Extension
+
+SIMD-accelerated pack/unpack and ternary matmul (auto-loaded, Python fallback):
+
+```bash
+python build_cpp.py
+```
+
+| Function | Python (DML, 500M) | C++ SIMD (CPU, 500M) |
+|----------|-------------------|---------------------|
+| pack_ternary | ~6s | 3.7s |
+| unpack_ternary | ~6s | 1.2s |
+| ternary_matmul (CPU) | — | 7s (512×2048, AVX2) |
+
+Includes fused stochastic backward (grad_x + accumulator update in one pass). See `ternary_llm/csrc/ternary_ops.cpp`.
 
 ## Usage
 
@@ -86,8 +108,14 @@ python train.py --preset tiny --steps 1000
 # Stochastic Bit-Flip
 python train.py --mode stochastic --preset medium --steps 5000
 
-# 500M model with mixed precision
-python train.py --preset 500m --steps 10000 --batch-size 4 --device directml --hybrid --dtype float16
+# 500M model on CPU (stable, no OOM)
+python train.py --mode stochastic --preset 500m --steps 10000 --batch-size 2 --device cpu --dtype float32
+
+# 500M model on DirectML (faster, may OOM on 16GB)
+python train.py --mode stochastic --preset 500m --steps 10000 --batch-size 4 --device directml --hybrid --dtype float16
+
+# Build C++ SIMD extension for faster pack/unpack
+python build_cpp.py
 
 # Resume from latest checkpoint
 python train.py --resume
@@ -115,6 +143,14 @@ python scripts/benchmark_speed.py --steps 10
 | `--dtype` | `float32`, `float16`, or `bfloat16` |
 | `--hybrid` | Model on GPU, optimizer on CPU (avoids DML fallback ops) |
 | `--resume` | Auto-resume from latest checkpoint |
+
+### C++ Extension Build
+
+```bash
+python build_cpp.py          # AVX2 auto-detected
+```
+
+Requires MSVC (Visual Studio 2022). The extension auto-loads at runtime; falls back to Python if not built.
 
 ## C++ Inference
 
@@ -184,6 +220,10 @@ ternary_llm/
   trainer.py              # TernaryTrainer (handles both modes, hybrid opt, checkpoint)
   int8.py                 # INT8 fake-quantization (reference, not used in model)
   __init__.py
+  csrc/
+    ternary_ops.cpp       # C++ SIMD pack/unpack/matmul (AVX2)
+    setup.py              # PyTorch extension build
+    __init__.py
 
 inference/
   tetra.h / tetra.cpp     # C++ inference engine (SIMD matmul, KV cache, sampling)
