@@ -134,6 +134,16 @@ class StochasticTernaryLinear(nn.Module):
         return output
 
     @torch.no_grad()
+    def apply_bit_flips(self) -> None:
+        """Check accumulator and flip bits where threshold exceeded."""
+        from .quantization import apply_bit_flips as _apply_bit_flips
+        _apply_bit_flips(
+            self.packed_weights, self.accumulator,
+            self.threshold, self.scale,
+            (self.out_features, self.in_features)
+        )
+
+    @torch.no_grad()
     def get_ternary_weights(self) -> torch.Tensor:
         from .quantization import unpack_ternary_tensor
         return unpack_ternary_tensor(self.packed_weights, (self.out_features, self.in_features))

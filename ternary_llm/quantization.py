@@ -182,7 +182,8 @@ class StochasticBitFlipLinear(torch.autograd.Function):
     """Stochastic Bit-Flip for ternary weights.
 
     Forward: unpack 2-bit → ternary float → scale → matmul
-    Backward: accumulate gradient → flip bit when threshold exceeded
+    Backward: accumulate gradient into accumulator (bit flip deferred
+              to model.apply_bit_flips() called every N steps)
     """
 
     @staticmethod
@@ -214,14 +215,23 @@ class StochasticBitFlipLinear(torch.autograd.Function):
 
         with torch.no_grad():
             ctx.accumulator.add_(torch.sign(-grad_w) / scale)
-            flip_up = ctx.accumulator > ctx.threshold
-            flip_down = ctx.accumulator < -ctx.threshold
-
-            if flip_up.any() or flip_down.any():
-                flip_dir = torch.where(flip_up, 1.0, 0.0) + torch.where(flip_down, -1.0, 0.0)
-                w_new = (ctx.w_raw + flip_dir).clamp(-1, 1)
-                ctx.packed_flat.copy_(pack_ternary_tensor(w_new).to(ctx.packed_flat.device))
-                ctx.w_raw = w_new
-                ctx.accumulator[flip_up | flip_down] = 0.0
 
         return grad_x, None, None, None, None, None
+
+
+@torch.no_grad()
+def apply_bit_flips(packed_weights: torch.Tensor, accumulator: torch.Tensor,
+                     threshold: float, scale: float, shape_w: tuple) -> None:
+    """Check accumulators and flip bits where threshold exceeded.
+
+    Called externally every N steps instead of per-step in backward.
+    Resets flipped accumulator entries to zero.
+    """
+    flip_up = accumulator > threshold
+    flip_down = accumulator < -threshold
+    if flip_up.any() or flip_down.any():
+        w_raw = unpack_ternary_tensor(packed_weights, shape_w)
+        flip_dir = torch.where(flip_up, 1.0, 0.0) + torch.where(flip_down, -1.0, 0.0)
+        w_new = (w_raw + flip_dir).clamp(-1, 1)
+        packed_weights.copy_(pack_ternary_tensor(w_new).to(packed_weights.device))
+        accumulator[flip_up | flip_down] = 0.0

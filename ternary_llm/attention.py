@@ -114,3 +114,10 @@ class StochasticMultiHeadAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=dp, is_causal=(mask is None))
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(out)
+
+    @torch.no_grad()
+    def apply_bit_flips(self) -> None:
+        self.q_proj.apply_bit_flips()
+        self.k_proj.apply_bit_flips()
+        self.v_proj.apply_bit_flips()
+        self.o_proj.apply_bit_flips()

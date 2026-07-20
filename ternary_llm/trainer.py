@@ -67,6 +67,9 @@ class TrainingConfig:
     # Mode
     mode: str = "ste"  # "ste" or "stochastic"
 
+    # Stochastic Bit-Flip
+    flip_every_n_steps: int = 5  # check threshold & flip bits every N optimizer steps
+
     # Quantization (STE)
     ternary_scale: float = 0.7  # Δ = scale × mean(|W|), lower → more {-1,+1}, higher → more 0
     per_channel: bool = False    # Per-channel vs per-tensor threshold
@@ -276,6 +279,12 @@ class TernaryTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.hybrid:
                     self.model.zero_grad(set_to_none=True)
+
+                # Stochastic Bit-Flip: apply accumulated flips every N steps
+                if (self.config.mode == "stochastic"
+                    and step > 0
+                    and step % self.config.flip_every_n_steps == 0):
+                    self.model.apply_bit_flips()
 
                 # LR scheduler
                 self.scheduler.step()

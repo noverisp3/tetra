@@ -264,6 +264,11 @@ class StochasticTransformerBlock(nn.Module):
         x = x + r
         return x
 
+    @torch.no_grad()
+    def apply_bit_flips(self) -> None:
+        self.attn.apply_bit_flips()
+        self.ffn.apply_bit_flips()
+
 
 class StochasticTransformerModel(nn.Module):
     """Full transformer with Stochastic Bit-Flip (packed 2-bit weights, accumulator flip).
@@ -293,7 +298,7 @@ class StochasticTransformerModel(nn.Module):
         self.lm_head.weight = self.token_embedding.weight
         return self
 
-    def forward(self, input_ids, targets=None):
+    def forward(self, input_ids, targets=None, past_key_values=None, activation_dtype=None):
         B, T = input_ids.shape
         pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
         x = self.token_embedding(input_ids) + self.pos_embedding(pos)
@@ -305,7 +310,7 @@ class StochasticTransformerModel(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
-        return logits, loss
+        return logits, loss, None
 
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens=100, temperature=1.0, top_k=None):
@@ -320,3 +325,8 @@ class StochasticTransformerModel(nn.Module):
             next_id = torch.multinomial(probs, num_samples=1).clamp(0, self.token_embedding.num_embeddings - 1)
             input_ids = torch.cat([input_ids, next_id], dim=1)
         return input_ids
+
+    @torch.no_grad()
+    def apply_bit_flips(self) -> None:
+        for layer in self.layers:
+            layer.apply_bit_flips()

@@ -18,7 +18,7 @@ def run(label, model, loader):
     losses, best = [], float("inf")
     for i, (x, y) in enumerate(loader):
         if i >= steps: break
-        _, loss = model(x, y)
+        _, loss, _ = model(x, y)
         loss.backward()
         opt.step()
         opt.zero_grad(set_to_none=True)

@@ -70,3 +70,9 @@ class StochasticFFN(nn.Module):
         hidden = F.silu(gate) * up
         output = self.down_proj(hidden)
         return self.dropout(output)
+
+    @torch.no_grad()
+    def apply_bit_flips(self) -> None:
+        self.gate_proj.apply_bit_flips()
+        self.up_proj.apply_bit_flips()
+        self.down_proj.apply_bit_flips()

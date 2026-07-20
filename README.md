@@ -103,6 +103,7 @@ python scripts/benchmark_speed.py --steps 10
 | `--mode ste\|stochastic` | Training mode (default: ste) |
 | `--ternary-scale` | [STE] Scale factor or [Stochastic] weight magnitude (default: 0.7) |
 | `--threshold` | [Stochastic] Flip threshold (default: 20/scale) |
+| `--flip-every-n-steps` | [Stochastic] Check & flip bits every N steps (default: 5, cuts ~80% bit overhead) |
 | `--per-channel` | [STE] Per-channel quantization threshold |
 | `--preset tiny\|medium\|large\|500m` | Model size |
 | `--data-cache` | Multi-source data directory (FineWeb+Cosmopedia+Orca) |
