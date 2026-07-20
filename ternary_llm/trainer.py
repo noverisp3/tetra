@@ -155,6 +155,13 @@ class TernaryTrainer:
                     self.device = torch.device("cpu")
         print(f"  Device: {self.device}")
 
+        # C++ extension status
+        from .quantization import _has_cpp
+        if _has_cpp:
+            print("  C++ SIMD unpack: enabled (~1.2s/500M weights)")
+        else:
+            print("  C++ SIMD unpack: disabled (build with: python build_cpp.py)")
+
         self.model = model.to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader

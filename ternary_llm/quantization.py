@@ -168,9 +168,18 @@ def pack_ternary_tensor(w: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple) -> torch.Tensor:
-    """Unpack uint8 tensor → float tensor {-1, 0, +1}."""
-    if _has_cpp and packed.is_cpu:
-        return _ternary_ops.unpack_ternary(packed.contiguous(), list(shape))
+    """Unpack uint8 tensor → float tensor {-1, 0, +1}.
+
+    Uses C++ SIMD unpack on CPU when available (fastest path),
+    falls back to Python element-wise ops on the original device.
+    """
+    if _has_cpp:
+        # C++ unpack always runs on CPU, then moves to target device
+        target = packed.device
+        w = _ternary_ops.unpack_ternary(packed.cpu().contiguous(), list(shape))
+        if target.type != "cpu":
+            w = w.to(target)
+        return w
     w0 = (torch.div(packed, 64, rounding_mode='floor') % 4).to(torch.int8) - 1
     w1 = (torch.div(packed, 16, rounding_mode='floor') % 4).to(torch.int8) - 1
     w2 = (torch.div(packed, 4, rounding_mode='floor') % 4).to(torch.int8) - 1
