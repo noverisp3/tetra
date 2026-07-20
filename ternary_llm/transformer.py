@@ -242,7 +242,7 @@ class TernaryTransformerModel(nn.Module):
 
 
 class StochasticTransformerBlock(nn.Module):
-    """Transformer block với Stochastic Bit-Flip layers."""
+    """Transformer block with Stochastic Bit-Flip layers."""
 
     def __init__(self, hidden_dim, num_heads, ffn_dim, dropout=0.0, scale=1.0, threshold=None):
         super().__init__()
@@ -266,10 +266,10 @@ class StochasticTransformerBlock(nn.Module):
 
 
 class StochasticTransformerModel(nn.Module):
-    """Full transformer với Stochastic Bit-Flip (packed 2-bit weights, accumulator flip).
+    """Full transformer with Stochastic Bit-Flip (packed 2-bit weights, accumulator flip).
 
-    Không có optimizer cho ternary weights — gradient tự tích lũy vào
-    accumulator và flip khi vượt threshold.
+    No optimizer for ternary weights — gradient auto-accumulates into
+    accumulator and flips when threshold exceeded.
     """
 
     def __init__(self, vocab_size, hidden_dim, num_layers, num_heads, ffn_dim,

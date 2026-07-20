@@ -90,7 +90,7 @@ class TernaryMultiHeadAttention(nn.Module):
 
 
 class StochasticMultiHeadAttention(nn.Module):
-    """Multi-Head Attention với Stochastic Bit-Flip."""
+    """Multi-Head Attention with Stochastic Bit-Flip."""
 
     def __init__(self, hidden_dim, num_heads, dropout=0.0, scale=1.0, threshold=None):
         super().__init__()

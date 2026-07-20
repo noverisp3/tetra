@@ -8,8 +8,8 @@ class TernaryQuantizer(torch.autograd.Function):
     """Ternary quantization {-1, 0, +1} with Straight-Through Estimator.
 
     Dynamic threshold: Δ = scale × mean(|W|), default scale=0.7.
-    Δ được scale xuống để tăng entropy, giảm số lượng zero trong ma trận
-    ternary, tránh suy thoái mô hình (toàn bộ weight → 0).
+    Lower scale increases entropy (fewer zeros in ternary matrix),
+    preventing model collapse (all weights → 0).
 
     Forward:  clamp(W/Δ, -1, 1) → round → {-1, 0, +1}
     Backward: STE passes grad straight through
@@ -123,7 +123,7 @@ def unpack_ternary(packed: bytes, shape: tuple, device: str = "cpu") -> torch.Te
     return torch.from_numpy(flat.astype(np.float32)).reshape(shape).to(device)
 
 
-# ─── Fast Tensor Pack/Unpack cho Stochastic Bit-Flip ───────────────────────
+# Fast Tensor Pack/Unpack for Stochastic Bit-Flip
 
 def pack_ternary_tensor(w: torch.Tensor) -> torch.Tensor:
     """Pack ternary float tensor {-1, 0, +1} → uint8 tensor (4 weights/byte)."""
@@ -167,7 +167,7 @@ def init_ternary_weight(out_features: int, in_features: int, sparsity: float = 0
         idx = torch.randperm(n)
         w[idx[:pos]] = 2   # +1
         w[idx[pos:pos + neg]] = 0  # -1 (encoded as 0, i.e. value -1+1=0)
-    # Pad và pack
+    # Pad and pack
     padded = (n + 3) // 4 * 4
     if padded != n:
         w = torch.nn.functional.pad(w, (0, padded - n), value=1)
@@ -176,13 +176,13 @@ def init_ternary_weight(out_features: int, in_features: int, sparsity: float = 0
     return packed.contiguous()
 
 
-# ─── Stochastic Bit-Flip Autograd ─────────────────────────────────────────
+# Stochastic Bit-Flip Autograd
 
 class StochasticBitFlipLinear(torch.autograd.Function):
-    """Stochastic Bit-Flip training cho ternary weights.
+    """Stochastic Bit-Flip for ternary weights.
 
     Forward: unpack 2-bit → ternary float → scale → matmul
-    Backward: accumulate gradient → lật bit khi vượt threshold
+    Backward: accumulate gradient → flip bit when threshold exceeded
     """
 
     @staticmethod
