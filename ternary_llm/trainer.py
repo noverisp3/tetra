@@ -212,16 +212,35 @@ class TernaryTrainer:
         self.val_losses = []
         self.learning_rates = []
 
+        # Initial memory snapshot
+        self.log_mem("init")
+
+    def log_mem(self, tag: str):
+        try:
+            import psutil
+            ram_gb = psutil.Process().memory_info().rss / 1024**3
+            if self.device.type == "cuda":
+                vram_gb = torch.cuda.memory_allocated() / 1024**3
+                print(f"  [MEM] {tag}: RAM={ram_gb:.1f}GB VRAM={vram_gb:.1f}GB", flush=True)
+            else:
+                print(f"  [MEM] {tag}: RAM={ram_gb:.1f}GB", flush=True)
+        except Exception:
+            pass
+
     def train_step(self, batch: tuple[torch.Tensor, torch.Tensor]) -> float:
         """Single training step with gradient accumulation."""
         x, y = batch
         x = x.to(self.device)
         y = y.to(self.device)
 
+        self.log_mem("before forward")
         _, loss, _ = self.model(x, y, activation_dtype=self.activation_dtype)
+        self.log_mem("after forward")
         raw_loss = loss.item()
         loss = loss / self.config.gradient_accumulation_steps
+        self.log_mem("before backward")
         loss.backward()
+        self.log_mem("after backward")
 
         return raw_loss
 
@@ -284,7 +303,9 @@ class TernaryTrainer:
                 if (self.config.mode == "stochastic"
                     and step > 0
                     and step % self.config.flip_every_n_steps == 0):
+                    self.log_mem("before apply_bit_flips")
                     self.model.apply_bit_flips()
+                    self.log_mem("after apply_bit_flips")
 
                 # LR scheduler
                 self.scheduler.step()
