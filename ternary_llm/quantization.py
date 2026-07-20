@@ -172,10 +172,10 @@ def pack_ternary_tensor(w: torch.Tensor) -> torch.Tensor:
 
 def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple) -> torch.Tensor:
     """Unpack uint8 tensor → float tensor {-1, 0, +1}."""
-    w0 = (torch.div(packed, 64, rounding_mode='floor') & 3).to(torch.int8) - 1
-    w1 = (torch.div(packed, 16, rounding_mode='floor') & 3).to(torch.int8) - 1
-    w2 = (torch.div(packed, 4, rounding_mode='floor') & 3).to(torch.int8) - 1
-    w3 = (packed & 3).to(torch.int8) - 1
+    w0 = (torch.div(packed, 64, rounding_mode='floor') % 4).to(torch.int8) - 1
+    w1 = (torch.div(packed, 16, rounding_mode='floor') % 4).to(torch.int8) - 1
+    w2 = (torch.div(packed, 4, rounding_mode='floor') % 4).to(torch.int8) - 1
+    w3 = (packed % 4).to(torch.int8) - 1
     flat = torch.stack([w0, w1, w2, w3], dim=-1).flatten()
     total = 1
     for d in shape:
