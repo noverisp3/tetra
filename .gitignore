@@ -1,4 +1,4 @@
-# === Python ===
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -7,20 +7,20 @@ dist/
 build/
 *.egg
 
-# === Pytest ===
+# Pytest
 .pytest_cache/
 
-# === Training data (too large for git) ===
+# Training data (too large for git)
 data/*.txt
 data/*.bin
 data/*.json
 data_local/
 
-# === Checkpoints (large, regenerate) ===
+# Checkpoints (large, regenerate)
 checkpoints/
 checkpoints_local/
 
-# === Build artifacts ===
+# Build artifacts
 *.obj
 *.exe
 *.pdb
@@ -29,23 +29,23 @@ checkpoints_local/
 *.so
 *.dylib
 
-# === Exported models (large) ===
+# Exported models (large)
 *.bin
 !tokenizer/tetra_tokenizer.json
 !tokenizer/vocab_info.json
 
-# === IDE ===
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# === OS ===
+# OS
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# === Temporary ===
+# Temporary
 temp_*.py
 debug.txt

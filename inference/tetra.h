@@ -48,14 +48,14 @@
 
 namespace tetra {
 
-// ─── Portable popcount fallback ────────────────────────────────────
+// Portable popcount fallback
 #ifndef _MSC_VER
 static inline uint64_t TETRA_POPCOUNT64(uint64_t x) {
     return __builtin_popcountll(x);
 }
 #endif
 
-// ─── Ternary weight format for XNOR+popcount ──────────────────────
+// Ternary weight format for XNOR+popcount
 // Each row stores two bitmasks:
 //   pos_mask[word]: bit i = 1 iff weight[row][i] == +1
 //   neg_mask[word]: bit i = 1 iff weight[row][i] == -1
@@ -70,7 +70,7 @@ struct TernaryWeightXNOR {
     float alpha;        // v2: per-matrix absmean scale factor
 };
 
-// ─── Decode-optimized LUT for 2-bit → float conversion ─────────
+// Decode-optimized LUT for 2-bit → float conversion
 // Single table lookup per 4 weights — eliminates bit shifts at decode time.
 // 256 entries × 16 bytes = 4 KB (fits L1 cache).
 struct ByteDecoded { float v[4]; };
@@ -101,7 +101,7 @@ struct ModelHeader {
     uint64_t ternary_params, fp32_params;
 };
 
-// ─── Convert 2-bit packed ternary to XNOR bitmasks ────────────────
+// Convert 2-bit packed ternary to XNOR bitmasks
 static TernaryWeightXNOR convert_to_xnor(
     const uint8_t* packed, int rows, int cols
 ) {
@@ -134,7 +134,7 @@ static TernaryWeightXNOR convert_to_xnor(
     return w;
 }
 
-// ─── XNOR+popcount: extract activation signs, pack into bitmask ───
+// XNOR+popcount: extract activation signs, pack into bitmask
 // For a vector of floats, extract sign bit of each float and pack
 // them into uint64 words. sign_mask[word] bit i = 1 iff x[word*64+i] > 0.
 static void extract_sign_mask(const float* x, int n, uint64_t* sign_mask) {
@@ -202,7 +202,7 @@ static void extract_sign_mask(const float* x, int n, uint64_t* sign_mask) {
 #endif
 }
 
-// ─── Core XNOR+popcount dot product ───────────────────────────────
+// Core XNOR+popcount dot product
 // Compute dot product of activation signs with one ternary weight row.
 // Returns integer score in [-cols, cols].
 static inline int64_t xnor_popcount_row(
@@ -222,7 +222,7 @@ static inline int64_t xnor_popcount_row(
     return pos_count - neg_count;
 }
 
-// ─── Full ternary matmul via XNOR+popcount ────────────────────────
+// Full ternary matmul via XNOR+popcount
 // out[r] = Σ sign(x[c]) * w[r][c] for all c
 // This approximates the real dot product using only sign information.
 // The scale factor compensates for lost magnitude information.
@@ -255,7 +255,7 @@ static void ternary_matmul_xnor(
     }
 }
 
-// ─── Dequantize one row of 2-bit packed ternary → float array ─────
+// Dequantize one row of 2-bit packed ternary → float array
 // Unpacks 4 weights per byte (MSB first) into temp_w[0..cols-1].
 // Each weight becomes -1.0f, 0.0f, or +1.0f.
 // Encoding: 00=-1, 01=0, 10=+1
@@ -281,7 +281,7 @@ static inline void dequantize_row(
     }
 }
 
-// ─── SIMD dot product: sum(x[i] * w[i]) for i in [0, cols) ───────
+// SIMD dot product: sum(x[i] * w[i]) for i in [0, cols)
 // Detection priority: AVX10 → AVX-512 → AVX2+FMA → scalar
 #if defined(__AVX10_1__) || defined(__AVX10__)
 static inline float dot_product_simd(const float* a, const float* b, int n) {
@@ -351,7 +351,7 @@ static inline float dot_product_simd(const float* a, const float* b, int n) {
 }
 #endif
 
-// ─── Dequantize-On-The-Fly ternary matmul ─────────────────────────
+// Dequantize-On-The-Fly ternary matmul
 // Exact quality: dequantize 2-bit → {-1,0,+1} float, then SIMD dot product.
 // hidden_dim=128 → AVX-512 needs 8 FMA per row, AVX2 needs 16 FMA per row.
 static void ternary_matmul_dequant(
@@ -369,7 +369,7 @@ static void ternary_matmul_dequant(
     }
 }
 
-// ─── Precompute: dequantize entire matrix into float array ─────────
+// Precompute: dequantize entire matrix into float array
 static void precompute_floats(TernaryWeightXNOR& w) {
     w.floats.resize(w.rows * w.cols);
     for (int r = 0; r < w.rows; r++) {
@@ -377,7 +377,7 @@ static void precompute_floats(TernaryWeightXNOR& w) {
     }
 }
 
-// ─── Fast matmul using precomputed float weights ──────────────────
+// Fast matmul using precomputed float weights
 // Best performance: dequantize once at load, then pure SIMD dot products.
 static void ternary_matmul_precomputed(
     const float* x, const TernaryWeightXNOR& w, float* out
@@ -387,7 +387,7 @@ static void ternary_matmul_precomputed(
     }
 }
 
-// ─── Dispatch ──────────────────────────────────────────────────────
+// Dispatch
 // Exact quality + SIMD speed via precomputed dequantized weights.
 static void ternary_matmul(
     const float* x,
@@ -398,18 +398,14 @@ static void ternary_matmul(
     ternary_matmul_precomputed(x, w, out);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// DECODE-OPTIMIZED MATMUL
-// ═══════════════════════════════════════════════════════════════════
-
-// ─── Prefetch helper ────────────────────────────────────────────
+// Prefetch helper
 #ifdef _MSC_VER
 #define TETRA_PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
 #else
 #define TETRA_PREFETCH(addr) __builtin_prefetch(addr, 0, 3)
 #endif
 
-// ─── Decode ternary matmul: LUT unpack + SIMD dot product ───────
+// Decode ternary matmul: LUT unpack + SIMD dot product
 // Processes 256 weights (64 bytes = 1 cache line) per iteration.
 // LUT eliminates bit shifts: single table lookup per byte → 4 floats.
 // Prefetches next cache line while computing current one.
@@ -435,7 +431,7 @@ static void ternary_matmul_decode(
         // Prefetch first cache line of this row
         TETRA_PREFETCH(row);
 
-        // ── Main loop: 256 weights per iteration ──
+        // Main loop: 256 weights per iteration
         // Each iteration reads exactly 1 cache line of packed data.
         for (; c + CHUNK <= cols; c += CHUNK) {
             const uint8_t* src = row + c / 4;
@@ -473,7 +469,7 @@ static void ternary_matmul_decode(
             sum += dot_product_simd(x + c, chunk, CHUNK);
         }
 
-        // ── Remainder: handle remaining weights ──
+        // Remainder: handle remaining weights
         if (c < cols) {
             int rem = cols - c;
             int rem_bytes = (rem + 3) / 4;
@@ -493,7 +489,7 @@ static void ternary_matmul_decode(
     }
 }
 
-// ─── Decode FP32 matmul with prefetch ───────────────────────────
+// Decode FP32 matmul with prefetch
 // Used for LM head (vocab projection) during single-token decode.
 static void matmul_fp32_decode(const float* x, const float* w, float* out,
                                 int rows, int cols) {
@@ -506,7 +502,7 @@ static void matmul_fp32_decode(const float* x, const float* w, float* out,
     }
 }
 
-// ─── Precomputed decode: SIMD dot product + prefetch ─────────────
+// Precomputed decode: SIMD dot product + prefetch
 // Uses precomputed floats (dequantized at load time) with prefetching.
 // Fastest path when weights fit in L2/L3 cache.
 static void ternary_matmul_precomputed_decode(
@@ -525,7 +521,7 @@ static void ternary_matmul_precomputed_decode(
     }
 }
 
-// ─── Decode dispatch ────────────────────────────────────────────
+// Decode dispatch
 // Default: precomputed with prefetch (fastest for current model sizes).
 // LUT path available for memory-constrained / very large models.
 static void ternary_matmul_auto(
@@ -539,7 +535,7 @@ static void ternary_matmul_auto(
     }
 }
 
-// ─── FP32 matmul (embeddings, norms) ─────────────────────────────
+// FP32 matmul (embeddings, norms)
 static void matmul_fp32(const float* x, const float* w, float* out,
                          int rows, int cols) {
     for (int r = 0; r < rows; r++) {
@@ -549,7 +545,7 @@ static void matmul_fp32(const float* x, const float* w, float* out,
     }
 }
 
-// ─── RMSNorm ───────────────────────────────────────────────────────
+// RMSNorm
 static void rmsnorm(float* x, const float* weight, int dim, float eps=1e-6f) {
     float sum_sq = 0.0f;
     for (int i = 0; i < dim; i++) sum_sq += x[i] * x[i];
@@ -557,10 +553,10 @@ static void rmsnorm(float* x, const float* weight, int dim, float eps=1e-6f) {
     for (int i = 0; i < dim; i++) x[i] = (x[i] / rms) * weight[i];
 }
 
-// ─── SiLU ──────────────────────────────────────────────────────────
+// SiLU
 static float silu(float x) { return x / (1.0f + expf(-x)); }
 
-// ─── Softmax ───────────────────────────────────────────────────────
+// Softmax
 static void softmax(float* x, int n) {
     float mx = *std::max_element(x, x + n);
     float sum = 0.0f;
@@ -568,14 +564,14 @@ static void softmax(float* x, int n) {
     for (int i = 0; i < n; i++) x[i] /= sum;
 }
 
-// ─── Mean absolute value (for XNOR scale factor) ──────────────────
+// Mean absolute value (for XNOR scale factor)
 static float absmean(const float* x, int n) {
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += fabsf(x[i]);
     return sum / n;
 }
 
-// ─── Model ─────────────────────────────────────────────────────────
+// Model
 struct Model {
     ModelHeader header;
     std::unordered_map<std::string, TernaryWeightXNOR> ternary_weights;
@@ -678,7 +674,7 @@ static Model load_model(const char* path) {
     return model;
 }
 
-// ─── KV Cache ──────────────────────────────────────────────────────
+// KV Cache
 struct KVCache {
     std::vector<std::vector<float>> k_cache;
     std::vector<std::vector<float>> v_cache;
@@ -691,7 +687,7 @@ struct KVCache {
     }
 };
 
-// ─── Forward pass ──────────────────────────────────────────────────
+// Forward pass
 static std::vector<float> forward(
     const Model& model,
     const std::vector<int>& tokens,
@@ -728,7 +724,7 @@ static std::vector<float> forward(
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "layers.%d.", l);
 
-        // === Attention (pre-norm) ===
+        // Attention (pre-norm)
         std::vector<float> normed = x;
         rmsnorm(normed.data(), model.fw_ptr(std::string(prefix) + "attn_norm.weight"), H);
 
@@ -784,7 +780,7 @@ static std::vector<float> forward(
 
         for (int i = 0; i < H; i++) x[i] += proj_out[i];
 
-        // === FFN (pre-norm) ===
+        // FFN (pre-norm)
         std::vector<float> ffn_normed = x;
         rmsnorm(ffn_normed.data(), model.fw_ptr(std::string(prefix) + "ffn_norm.weight"), H);
 
@@ -828,7 +824,7 @@ static std::vector<float> forward(
     return logits;
 }
 
-// ─── Sampling ──────────────────────────────────────────────────────
+// Sampling
 // Top-k: keep only top k tokens, then top-p: keep smallest set with cumprob >= p.
 static int sample(const std::vector<float>& logits, float temperature, int top_k, float top_p) {
     int n = (int)logits.size();

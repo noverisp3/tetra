@@ -13,7 +13,7 @@ from typing import Optional
 from tqdm import tqdm
 
 
-# --- Tokenizer --------------------------------------------------------
+# Tokenizer
 _tokenizer_cache = None
 
 
@@ -80,7 +80,7 @@ def get_tokenizer_compat(tokenizer_dir="tokenizer"):
     return TokenizerWrapper(raw)
 
 
-# --- Data Download & Tokenize -----------------------------------------
+# Data Download & Tokenize
 
 def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stories=None):
     cache_path = Path(cache_dir)
@@ -156,7 +156,7 @@ def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stori
     return tokens_array, metadata
 
 
-# --- Dataset ----------------------------------------------------------
+# Dataset
 
 class ChunkedDataset(Dataset):
     """Non-overlapping chunks of tokens. Much faster to shuffle than sliding window."""
@@ -200,7 +200,7 @@ def create_dataloaders(tokens, block_size=128, batch_size=8, val_split=0.05, num
     return train_loader, val_loader
 
 
-# --- Multi-Source Dataset -------------------------------------------
+# Multi-Source Dataset
 
 class MultiSourceChunkedDataset(Dataset):
     """Reads multiple .bin chunk files from different sources,

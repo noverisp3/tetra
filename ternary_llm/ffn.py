@@ -54,7 +54,7 @@ class TernaryFFN(nn.Module):
 
 
 class StochasticFFN(nn.Module):
-    """FFN với Stochastic Bit-Flip (không latent weights, packed 2-bit)."""
+    """FFN with Stochastic Bit-Flip (no latent weights, packed 2-bit)."""
 
     def __init__(self, hidden_dim, ffn_dim, dropout=0.0, scale=1.0, threshold=None):
         super().__init__()

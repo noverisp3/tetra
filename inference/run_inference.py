@@ -1,8 +1,8 @@
 """Tetra Inference Runner — bridges custom BPE tokenizer with C++ engine.
 
 Usage:
-    python inference/run_inference.py <model.bin> "Once upon a time"
-    python inference/run_inference.py <model.bin> "Once upon a time" --max-tokens 200 --temp 0.8 --top-k 50 --top-p 0.9
+    python inference/run_inference.py <model.bin> "Hello"
+    python inference/run_inference.py <model.bin> "Hello" --max-tokens 200 --temp 0.8 --top-k 50 --top-p 0.9
 """
 import sys
 import subprocess

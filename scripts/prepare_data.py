@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from ternary_llm.data import get_tokenizer_compat
 
 
-# ─── Config ────────────────────────────────────────────────────────
+# Config
 CHUNK_TOKENS = 25_000_000  # 25M tokens per chunk file
 
 SOURCES = {

@@ -83,11 +83,11 @@ class TernaryLinear(nn.Module):
 
 
 class StochasticTernaryLinear(nn.Module):
-    """Ternary linear layer với Stochastic Bit-Flip training.
+    """Ternary linear layer with Stochastic Bit-Flip training.
 
-    Không có latent weights FP32. Trọng số luôn là ternary {-1,0,+1}
-    dưới dạng packed 2-bit. Gradient tích lũy vào accumulator, flip khi
-    vượt threshold.
+    No latent weights FP32. Weights are always ternary {-1,0,+1}
+    in packed 2-bit format. Gradient accumulates in accumulator, flips when
+    threshold is exceeded.
 
     Args:
         in_features: input dimension
