@@ -223,7 +223,7 @@ def main():
     print("\n[Sample Generation]")
     import torch
     enc = get_tokenizer_compat(args.tokenizer_dir)
-    prompt = "Once upon a time"
+    prompt = "In the beginning"
     prompt_ids = enc.encode(prompt)
     prompt_tensor = torch.tensor([prompt_ids], device=trainer.device)
     model.eval()
