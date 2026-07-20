@@ -126,11 +126,14 @@ SIMD-accelerated engine with precomputed dequantized weights:
 
 ### Build
 
-Requires MSVC with AVX-512:
+Requires MSVC. Multiple SIMD targets:
 
 ```bash
 cd inference
-build.bat          # outputs tetra.exe
+build.bat              # scalar fallback
+build.bat avx2         # AVX2+FMA (widest compatibility)
+build.bat avx512       # AVX-512 (legacy Intel)
+build.bat avx10        # AVX10 (future Intel)
 ```
 
 ### Export & Run

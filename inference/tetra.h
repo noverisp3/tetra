@@ -4,13 +4,17 @@
 //
 // Matmul Strategy:
 //   1. At load time, dequantize 2-bit packed ternary → float {-1, 0, +1}
-//   2. At inference, compute dot product using SIMD (AVX-512 / AVX2 / scalar)
+//   2. At inference, compute dot product using SIMD (AVX10 / AVX-512 / AVX2+FMA / scalar)
 //   3. This gives EXACT quality (matches PyTorch F.linear) at SIMD speed
 //
-// Why not XNOR+popcount?
-//   XNOR approximates x·w as mean(|x|) × popcount(sign(x), w), which loses
-//   activation magnitude info. For small models this error compounds over layers.
-//   Precomputed floats + SIMD dot product is both exact AND fast (922 tok/s).
+// SIMD dispatch priority:
+//   AVX10 → AVX-512 → AVX2+FMA → scalar (detected at compile time)
+//
+// Build:
+//   build.bat          → scalar fallback
+//   build.bat avx2     → AVX2+FMA
+//   build.bat avx512   → AVX-512
+//   build.bat avx10    → AVX10
 //
 // Binary Format v2:
 //   Header (64B): magic "TETR", version, model dims, param counts
@@ -35,10 +39,7 @@
 #define TETRA_POPCOUNT64(x) __builtin_popcountll(x)
 #endif
 
-#ifdef __AVX512F__
 #include <immintrin.h>
-#define TETRA_HAS_AVX512 1
-#endif
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -138,10 +139,26 @@ static TernaryWeightXNOR convert_to_xnor(
 // them into uint64 words. sign_mask[word] bit i = 1 iff x[word*64+i] > 0.
 static void extract_sign_mask(const float* x, int n, uint64_t* sign_mask) {
     int words = (n + 63) / 64;
-    // Zero padding
     for (int w = 0; w < words; w++) sign_mask[w] = 0;
 
-#ifdef TETRA_HAS_AVX512
+#if defined(__AVX10_1__) || defined(__AVX10__)
+    // AVX10: _mm256_movepi32_mask processes 8 floats per iteration (needs 8× for 64)
+    int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        __m512 v0 = _mm512_loadu_ps(x + i);
+        __m512 v1 = _mm512_loadu_ps(x + i + 16);
+        __m512 v2 = _mm512_loadu_ps(x + i + 32);
+        __m512 v3 = _mm512_loadu_ps(x + i + 48);
+        uint64_t s0 = (uint64_t)_mm512_movepi32_mask(_mm512_castps_si512(v0));
+        uint64_t s1 = (uint64_t)_mm512_movepi32_mask(_mm512_castps_si512(v1));
+        uint64_t s2 = (uint64_t)_mm512_movepi32_mask(_mm512_castps_si512(v2));
+        uint64_t s3 = (uint64_t)_mm512_movepi32_mask(_mm512_castps_si512(v3));
+        sign_mask[i / 64] = s0 | (s1 << 16) | (s2 << 32) | (s3 << 48);
+    }
+    for (; i < n; i++) {
+        if (x[i] > 0.0f) sign_mask[i / 64] |= (1ULL << (i % 64));
+    }
+#elif defined(__AVX512F__)
     // Process 64 floats at a time (4 × __m512)
     int i = 0;
     for (; i + 64 <= n; i += 64) {
@@ -159,6 +176,21 @@ static void extract_sign_mask(const float* x, int n, uint64_t* sign_mask) {
         sign_mask[i / 64] = s0 | (s1 << 16) | (s2 << 32) | (s3 << 48);
     }
     // Handle remainder
+    for (; i < n; i++) {
+        if (x[i] > 0.0f) sign_mask[i / 64] |= (1ULL << (i % 64));
+    }
+#elif defined(__AVX2__)
+    // AVX2: _mm256_movemask_ps extracts 8 sign bits at a time
+    int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        uint64_t mask = 0;
+        for (int j = 0; j < 8; j++) {
+            __m256 v = _mm256_loadu_ps(x + i + j * 8);
+            int bits = _mm256_movemask_ps(v);
+            mask |= (uint64_t)(uint8_t)bits << (j * 8);
+        }
+        sign_mask[i / 64] = mask;
+    }
     for (; i < n; i++) {
         if (x[i] > 0.0f) sign_mask[i / 64] |= (1ULL << (i % 64));
     }
@@ -250,7 +282,8 @@ static inline void dequantize_row(
 }
 
 // ─── SIMD dot product: sum(x[i] * w[i]) for i in [0, cols) ───────
-#if defined(__AVX512F__)
+// Detection priority: AVX10 → AVX-512 → AVX2+FMA → scalar
+#if defined(__AVX10_1__) || defined(__AVX10__)
 static inline float dot_product_simd(const float* a, const float* b, int n) {
     __m512 vsum = _mm512_setzero_ps();
     int i = 0;
@@ -259,7 +292,27 @@ static inline float dot_product_simd(const float* a, const float* b, int n) {
         __m512 vb = _mm512_loadu_ps(b + i);
         vsum = _mm512_fmadd_ps(va, vb, vsum);
     }
-    // Horizontal sum: 16 floats
+    __m256 hi256 = _mm512_extractf32x8_ps(vsum, 1);
+    __m256 lo256 = _mm512_castps512_ps256(vsum);
+    __m256 sum256 = _mm256_add_ps(lo256, hi256);
+    __m128 hi128 = _mm256_extractf128_ps(sum256, 1);
+    __m128 lo128 = _mm256_castps256_ps128(sum256);
+    __m128 s = _mm_add_ps(lo128, hi128);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    float sum = _mm_cvtss_f32(s);
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+#elif defined(__AVX512F__)
+static inline float dot_product_simd(const float* a, const float* b, int n) {
+    __m512 vsum = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 va = _mm512_loadu_ps(a + i);
+        __m512 vb = _mm512_loadu_ps(b + i);
+        vsum = _mm512_fmadd_ps(va, vb, vsum);
+    }
     __m256 hi256 = _mm512_extractf32x8_ps(vsum, 1);
     __m256 lo256 = _mm512_castps512_ps256(vsum);
     __m256 sum256 = _mm256_add_ps(lo256, hi256);
@@ -279,9 +332,8 @@ static inline float dot_product_simd(const float* a, const float* b, int n) {
     for (; i + 8 <= n; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
-        vsum = _mm256_add_ps(vsum, _mm256_mul_ps(va, vb));
+        vsum = _mm256_fmadd_ps(va, vb, vsum);
     }
-    // Horizontal sum: 8 floats → 4 → 2 → 1
     __m128 hi = _mm256_extractf128_ps(vsum, 1);
     __m128 lo = _mm256_castps256_ps128(vsum);
     __m128 s  = _mm_add_ps(lo, hi);
