@@ -62,7 +62,7 @@ class FusedTernaryLinear(torch.autograd.Function):
             delta = latent_weights.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * scale
         else:
             delta = latent_weights.abs().mean().clamp(min=1e-6) * scale
-        w_ternary = (latent_weights / delta).clamp(-1, 1).round()
+        w_ternary = (latent_weights / delta).clamp(-1, 1).round().to(x.dtype)
         ctx.save_for_backward(x, w_ternary.detach())
         return F.linear(x, w_ternary)
 
@@ -74,7 +74,7 @@ class FusedTernaryLinear(torch.autograd.Function):
             grad_output.reshape(-1, grad_output.size(-1)).T,
             x.reshape(-1, x.size(-1))
         )
-        return grad_x, grad_w, None, None
+        return grad_x, grad_w.float(), None, None
 
 
 class Int8Quantizer(torch.autograd.Function):

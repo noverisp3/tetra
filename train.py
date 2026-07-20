@@ -61,6 +61,8 @@ def main():
                         help="[STE] Per-channel quantization threshold (instead of per-tensor)")
     parser.add_argument("--threshold", type=float, default=None,
                         help="[Stochastic] Bit-flip threshold (default: 20.0 / scale, auto-computed)")
+    parser.add_argument("--dtype", type=str, default=None, choices=["float32", "float16"],
+                        help="Training dtype: float32 (default) or float16 for mixed precision")
     args = parser.parse_args()
 
     config = TrainingConfig()
@@ -100,6 +102,8 @@ def main():
     config.mode = args.mode
     config.ternary_scale = args.ternary_scale
     config.per_channel = args.per_channel
+    if args.dtype:
+        config.dtype = args.dtype
 
     # Step 1: Prepare data
     if args.data_cache:

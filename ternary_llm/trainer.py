@@ -188,12 +188,11 @@ class TernaryTrainer:
             min_lr=config.min_lr,
         )
 
-        # Mixed precision (GPU only - CPU uses float32)
-        self.use_amp = False
-        if self.use_amp:
-            self.scaler = torch.amp.GradScaler()
-        else:
-            self.scaler = None
+        # Mixed precision (manual FP16 on GPU, since autocast not supported on DML)
+        self.activation_dtype = None
+        if config.dtype == "float16" and self.device != torch.device("cpu"):
+            self.activation_dtype = torch.float16
+            print(f"  FP16 activations enabled")
 
         # Create save directory
         Path(config.save_dir).mkdir(parents=True, exist_ok=True)
@@ -209,19 +208,10 @@ class TernaryTrainer:
         x = x.to(self.device)
         y = y.to(self.device)
 
-        if self.use_amp:
-            with torch.amp.autocast(
-                device_type="cuda",
-                dtype=torch.bfloat16 if self.config.dtype == "bfloat16" else torch.float16,
-            ):
-                _, loss = self.model(x, y)
-                loss = loss / self.config.gradient_accumulation_steps
-            self.scaler.scale(loss).backward()
-        else:
-            _, loss = self.model(x, y)
-            raw_loss = loss.item()
-            loss = loss / self.config.gradient_accumulation_steps
-            loss.backward()
+        _, loss = self.model(x, y, activation_dtype=self.activation_dtype)
+        raw_loss = loss.item()
+        loss = loss / self.config.gradient_accumulation_steps
+        loss.backward()
 
         return raw_loss
 
@@ -274,9 +264,6 @@ class TernaryTrainer:
                     self._hybrid_sync_gradients()
                     self.optimizer.step()
                     self._hybrid_sync_weights()
-                elif self.use_amp:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
                 else:
                     self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)

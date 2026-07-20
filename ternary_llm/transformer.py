@@ -144,11 +144,13 @@ class TernaryTransformerModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
+        activation_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
             input_ids: (batch_size, seq_len) token ids
             targets: (batch_size, seq_len) target token ids for loss
+            activation_dtype: cast activations to this dtype (e.g. float16 for AMP)
 
         Returns:
             logits: (batch_size, seq_len, vocab_size)
@@ -159,6 +161,8 @@ class TernaryTransformerModel(nn.Module):
         # Embeddings
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
         x = self.token_embedding(input_ids) + self.pos_embedding(positions)
+        if activation_dtype is not None:
+            x = x.to(activation_dtype)
         x = self.dropout(x)
 
         # Transformer layers
@@ -170,6 +174,8 @@ class TernaryTransformerModel(nn.Module):
 
         # LM head
         logits = self.lm_head(x)
+        if activation_dtype is not None:
+            logits = logits.float()
 
         # Compute loss if targets provided
         loss = None
