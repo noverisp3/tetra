@@ -29,45 +29,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
-class DMLAdamW(torch.optim.AdamW):
-    """AdamW variant that avoids aten::lerp.Scalar_out (unsupported on DML).
-
-    Replaces lerp_(grad, 1-b) with mul_(b).add_(grad, alpha=1-b).
-    """
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            loss = closure()
-        for group in self.param_groups:
-            beta1, beta2 = group['betas']
-            weight_decay = group['weight_decay']
-            eps = group['eps']
-            lr = group['lr']
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad
-                if weight_decay != 0:
-                    p.mul_(1 - lr * weight_decay)
-                state = self.state[p]
-                if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p)
-                    state['exp_avg_sq'] = torch.zeros_like(p)
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                state['step'] += 1
-                # Replace lerp_ with mul_ + add_ (DML-safe)
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                bias_corr1 = 1 - beta1 ** state['step']
-                bias_corr2 = 1 - beta2 ** state['step']
-                denom = (exp_avg_sq.sqrt() / bias_corr2 ** 0.5).add_(eps)
-                step_size = lr / bias_corr1
-                p.addcdiv_(exp_avg, denom, value=-step_size)
-        return loss
-
-
 @dataclass
 class TrainingConfig:
     """Training configuration for Ternary LLM."""
@@ -224,18 +185,9 @@ class TernaryTrainer:
                 betas=(config.beta1, config.beta2),
                 eps=config.eps,
                 weight_decay=config.weight_decay,
+                foreach=False,
             )
             print(f"  Hybrid mode: model on {self.device}, optimizer on CPU")
-        elif str(self.device).startswith("privateuseone"):
-            # DML: use custom optimizer avoiding aten::lerp fallback
-            self.optimizer = DMLAdamW(
-                model.parameters(),
-                lr=config.learning_rate,
-                betas=(config.beta1, config.beta2),
-                eps=config.eps,
-                weight_decay=config.weight_decay,
-            )
-            print(f"  DMLAdamW: avoiding lerp CPU fallback")
         else:
             # Standard: optimizer on same device as model
             self.optimizer = torch.optim.AdamW(
@@ -244,6 +196,7 @@ class TernaryTrainer:
                 betas=(config.beta1, config.beta2),
                 eps=config.eps,
                 weight_decay=config.weight_decay,
+                foreach=False,
             )
 
         # LR Scheduler
