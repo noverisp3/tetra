@@ -136,10 +136,16 @@ def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stori
             break
 
     if txt_path is None:
-        print("ERROR: No TinyStories data found!")
-        print(f"Please download TinyStoriesV2-GPT4-train.txt to {cache_path}/")
-        print("  https://huggingface.co/datasets/roneneldan/TinyStories/blob/main/TinyStoriesV2-GPT4-train.txt")
-        raise FileNotFoundError("TinyStories data not found")
+        print("Downloading TinyStoriesV2-GPT4-train.txt...")
+        import requests
+        url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt"
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+        txt_path = cache_path / "TinyStoriesV2-GPT4-train.txt"
+        with open(txt_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"  Downloaded to {txt_path} ({txt_path.stat().st_size / 1e6:.0f} MB)")
 
     print(f"Reading {txt_path} ({txt_path.stat().st_size / 1e6:.0f} MB)...")
     with open(txt_path, "r", encoding="utf-8") as f:
