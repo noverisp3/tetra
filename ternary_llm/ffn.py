@@ -43,8 +43,8 @@ class TernaryFFN(nn.Module):
         fused_out = self.gate_up_proj(x)
         gate, up = fused_out.chunk(2, dim=-1)
 
-        # SwiGLU activation
-        hidden = F.silu(gate) * up
+        # SwiGLU activation (float32 to prevent overflow in down_proj)
+        hidden = F.silu(gate).float() * up.float()
 
         # Down projection
         output = self.down_proj(hidden)
@@ -67,7 +67,7 @@ class StochasticFFN(nn.Module):
     def forward(self, x):
         gate = self.gate_proj(x)
         up = self.up_proj(x)
-        hidden = F.silu(gate) * up
+        hidden = F.silu(gate).float() * up.float()
         output = self.down_proj(hidden)
         return self.dropout(output)
 

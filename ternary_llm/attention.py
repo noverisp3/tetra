@@ -68,15 +68,14 @@ class TernaryMultiHeadAttention(nn.Module):
             k = torch.cat([past_k, k], dim=-2)
             v = torch.cat([past_v, v], dim=-2)
 
-        # Fused attention
+        # Fused attention (float32 to prevent softmax overflow in float16)
         dropout_p = self.attn_dropout.p if self.training else 0.0
-        # When using KV cache, query is single token, attends to all past positions
         is_causal = (mask is None) and (past_k is None)
         attn_output = F.scaled_dot_product_attention(
-            q, k, v,
+            q.float(), k.float(), v.float(),
             dropout_p=dropout_p,
             is_causal=is_causal,
-        )
+        ).to(x.dtype)
 
         # Reshape and project output
         attn_output = (
@@ -111,7 +110,7 @@ class StochasticMultiHeadAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         dp = self.attn_dropout.p if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dp, is_causal=(mask is None))
+        out = F.scaled_dot_product_attention(q.float(), k.float(), v.float(), dropout_p=dp, is_causal=(mask is None)).to(x.dtype)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(out)
 

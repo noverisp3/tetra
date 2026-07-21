@@ -288,26 +288,17 @@ class TernaryTrainer:
         )
 
         # Mixed precision
-        self.activation_dtype = None  # explicit dtype override (for DML/CPU)
-        self.autocast_dtype = None    # autocast dtype (for CUDA)
+        self.activation_dtype = None  # explicit dtype override
+        self.autocast_dtype = None    # autocast dtype (unused, kept for compat)
         self.scaler = None
-        if self.device.type == "cuda":
-            if config.dtype in ("float16", "bfloat16"):
-                bf16_ok = config.dtype == "bfloat16" and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-                self.autocast_dtype = torch.bfloat16 if bf16_ok else torch.float16
-                if self.autocast_dtype == torch.float16:
-                    self.scaler = torch.amp.GradScaler("cuda")
-                print(f"  CUDA autocast: {str(self.autocast_dtype).split('.')[-1]}")
-            else:
-                print(f"  CUDA: float32 (no autocast)")
+        if config.dtype in ("float16", "bfloat16"):
+            bf16_ok = config.dtype == "bfloat16" and self.device.type == "cuda" and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            self.activation_dtype = torch.bfloat16 if bf16_ok else torch.float16
+            if self.activation_dtype == torch.float16 and self.device.type == "cuda":
+                self.scaler = torch.amp.GradScaler("cuda")
+            print(f"  Activations: {str(self.activation_dtype).split('.')[-1]}")
         else:
-            # DML or CPU: explicit casting (autocast not available)
-            if config.dtype == "bfloat16":
-                print("  DML/CPU: bfloat16 not supported, using float32")
-                config.dtype = "float32"
-            if config.dtype == "float16":
-                self.activation_dtype = torch.float16
-                print("  float16 activations (explicit cast)")
+            print(f"  Full precision: float32")
 
         # Create save directory
         Path(config.save_dir).mkdir(parents=True, exist_ok=True)
@@ -353,11 +344,7 @@ class TernaryTrainer:
         y = y.to(self.device)
 
         t0 = time.perf_counter()
-        if self.autocast_dtype is not None:
-            with torch.amp.autocast(device_type="cuda", dtype=self.autocast_dtype):
-                _, loss, _ = self.model(x, y, activation_dtype=self.activation_dtype)
-        else:
-            _, loss, _ = self.model(x, y, activation_dtype=self.activation_dtype)
+        _, loss, _ = self.model(x, y, activation_dtype=self.activation_dtype)
         t1 = time.perf_counter()
         raw_loss = loss.item()
         if not math.isfinite(raw_loss):
