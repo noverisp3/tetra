@@ -22,12 +22,20 @@ from torch.utils.cpp_extension import load
 
 base_dir = os.path.join(os.path.dirname(__file__), "ternary_llm", "csrc")
 
+# Platform-appropriate SIMD flags
+if sys.platform == "win32":
+    avx2_flag = "/arch:AVX2"
+    avx512_flag = "/arch:AVX512"
+else:
+    avx2_flag = "-mavx2 -mfma"
+    avx512_flag = "-mavx512f -mavx512bw"
+
 # Build AVX2 version (baseline, always available)
 print("\nBuilding ternary_ops (AVX2)...")
 ops_avx2 = load(
     name="ternary_ops",
     sources=[os.path.join(base_dir, "ternary_ops_avx2.cpp")],
-    extra_cflags=["/arch:AVX2"],
+    extra_cflags=[avx2_flag],
     verbose=False,
 )
 # Validate
@@ -46,7 +54,7 @@ if os.path.exists(avx512_src):
         ops_avx512 = load(
             name="ternary_ops_avx512",
             sources=[avx512_src],
-            extra_cflags=["/arch:AVX512"],
+            extra_cflags=[avx512_flag],
             verbose=False,
         )
         # Validate
