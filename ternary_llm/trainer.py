@@ -29,6 +29,82 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
+class DMLAdamW(torch.optim.Optimizer):
+    """AdamW variant that avoids lerp_ (CPU fallback on DML).
+
+    Uses only mul_ + add_ + addcdiv_ which are DML-native.
+    Falls back to pow(2) + add_ if addcmul_ fails.
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=0.1, amsgrad=False, *, foreach=False):
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid lr: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid eps: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        defaults = dict(lr=lr, betas=betas, eps=eps,
+                        weight_decay=weight_decay, amsgrad=amsgrad)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            weight_decay = group["weight_decay"]
+            eps = group["eps"]
+            lr = group["lr"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("DMLAdamW does not support sparse gradients")
+
+                state = self.state[p]
+
+                # Initialise state
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                state["step"] += 1
+
+                # Decoupled weight decay
+                p.mul_(1 - lr * weight_decay)
+
+                # Biased first moment update (avoid lerp_)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+
+                # Biased second moment update (avoid lerp_)
+                exp_avg_sq.mul_(beta2).add_(grad * grad, alpha=1 - beta2)
+
+                # Bias correction
+                step = state["step"]
+                bias_correction1 = 1 - beta1 ** step
+                bias_correction2 = 1 - beta2 ** step
+
+                step_size = lr / bias_correction1
+                denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+
 @dataclass
 class TrainingConfig:
     """Training configuration for Ternary LLM."""
@@ -193,13 +269,14 @@ class TernaryTrainer:
             print(f"  Hybrid mode: model on {self.device}, optimizer on CPU")
         else:
             # Standard: optimizer on same device as model
-            self.optimizer = torch.optim.AdamW(
+            is_dml = self.device.type == "directml" or str(self.device) == "privateuseone"
+            opt_cls = DMLAdamW if is_dml else torch.optim.AdamW
+            self.optimizer = opt_cls(
                 model.parameters(),
                 lr=config.learning_rate,
                 betas=(config.beta1, config.beta2),
                 eps=config.eps,
                 weight_decay=config.weight_decay,
-                foreach=False,
             )
 
         # LR Scheduler

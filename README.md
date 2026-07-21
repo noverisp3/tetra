@@ -215,36 +215,36 @@ python inference/benchmark_ppl.py --checkpoint checkpoints/checkpoint_010000.pt
 ## Project Structure
 
 ```
-train.py                  # Main entry point
+train.py                    # Main entry point
 
 scripts/
-  benchmark_speed.py      # Speed benchmark across presets
-  prepare_data.py         # Stream data from HF → tokenized chunks
-  train_tokenizer.py      # Train BPE tokenizer on TinyStories
+  benchmark_speed.py        # Speed benchmark across presets
+  prepare_data.py           # Stream data from HF → tokenized chunks
+  train_tokenizer.py        # Train BPE tokenizer on TinyStories
 
 ternary_llm/
-  quantization.py         # STE + Stochastic Bit-Flip autograd functions, pack/unpack
-  layers.py               # TernaryLinear, StochasticTernaryLinear, RMSNorm
-  attention.py            # MultiHeadAttention with KV cache
-  ffn.py                  # SwiGLU FFN: fused gate_up_proj (2×FFN dim)
-  transformer.py          # Full model, generate with KV cache, sample
-  data.py                 # ChunkedDataset, MultiSourceChunkedDataset
-  trainer.py              # TernaryTrainer (handles both modes, hybrid opt, checkpoint)
-  int8.py                 # INT8 fake-quantization (reference, not used in model)
+  quantization.py           # STE + Stochastic Bit-Flip autograd functions, pack/unpack
+  layers.py                 # TernaryLinear, StochasticTernaryLinear, RMSNorm
+  attention.py              # MultiHeadAttention with KV cache
+  ffn.py                    # SwiGLU FFN: fused gate_up_proj (2×FFN dim)
+  transformer.py            # Full model, generate with KV cache, sample
+  data.py                   # ChunkedDataset, MultiSourceChunkedDataset
+  trainer.py                # TernaryTrainer (handles both modes, hybrid opt, checkpoint)
+  int8.py                   # INT8 fake-quantization (reference, not used in model)
   __init__.py
   csrc/
-    ternary_ops_avx2.cpp   # C++ SIMD pack/unpack/matmul (AVX2)
-    ternary_ops_avx512.cpp# C++ SIMD pack/unpack/matmul (AVX-512)
-    setup.py              # PyTorch extension build
+    ternary_ops_avx2.cpp    # C++ SIMD pack/unpack/matmul (AVX2)
+    ternary_ops_avx512.cpp  # C++ SIMD pack/unpack/matmul (AVX-512)
+    setup.py                # PyTorch extension build
     __init__.py
 
 inference/
-  tetra.h / tetra.cpp     # C++ inference engine (SIMD matmul, KV cache, sampling)
-  export_model.py         # Checkpoint → binary format for C++
-  run_inference.py        # Python wrapper around C++ inference
-  benchmark_ppl.py        # Perplexity measurement
-  verify_export.py        # Weight comparison: PyTorch vs binary
-  build.bat               # MSVC build script
+  tetra.h / tetra.cpp       # C++ inference engine (SIMD matmul, KV cache, sampling)
+  export_model.py           # Checkpoint → binary format for C++
+  run_inference.py          # Python wrapper around C++ inference
+  benchmark_ppl.py          # Perplexity measurement
+  verify_export.py          # Weight comparison: PyTorch vs binary
+  build.bat                 # MSVC build script
 
 tests/
   test_quantization.py    # TernaryQuantizer, Int8Quantizer, pack/unpack
