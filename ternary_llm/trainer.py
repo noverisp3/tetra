@@ -316,6 +316,12 @@ class TernaryTrainer:
         self.train_losses = []
         self.val_losses = []
         self.learning_rates = []
+        self._nan_step_count = 0
+
+        # Timer accumulators (NaN-safe: always init here)
+        self.fwd_time = 0.0
+        self.bwd_time = 0.0
+        self.micro_steps = 0
 
         # Initial memory snapshot
         self.log_mem("init")
@@ -364,9 +370,9 @@ class TernaryTrainer:
         t2 = time.perf_counter()
         self._clear_cache()
 
-        self.fwd_time = getattr(self, 'fwd_time', 0.0) + (t1 - t0)
-        self.bwd_time = getattr(self, 'bwd_time', 0.0) + (t2 - t1)
-        self.micro_steps = getattr(self, 'micro_steps', 0) + 1
+        self.fwd_time += t1 - t0
+        self.bwd_time += t2 - t1
+        self.micro_steps += 1
 
         return raw_loss
 
