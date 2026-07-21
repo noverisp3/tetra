@@ -99,6 +99,18 @@ python build_cpp.py
 
 Includes fused stochastic backward (grad_x + accumulator update in one pass). See `ternary_llm/csrc/ternary_ops_avx2.cpp`.
 
+### Hardware Insight: Why Float SIMD beats LUT on x86 AVX-512
+
+Many ternary frameworks blindly adopt Lookup Tables (LUT) for CPU inference. However, empirical profiling on Intel x86 with AVX-512 reveals a different reality for small-to-medium LLMs:
+
+- **AVX-512 FMA Throughput**: Modern x86 CPUs execute 2 FMAs/cycle with contiguous vector memory streams, fully saturating bandwidth.
+- **LUT Overhead**: LUT introduces an extra $O(\text{groups} \times 16)$ precompute step per token plus scattered memory lookups that degrade cache locality.
+- **Benchmark** (Large Preset — 768 hidden, 84 ternary layers):
+  - Float SIMD FMA (AVX-512): ~50 tok/s
+  - LUT Approach: ~30 tok/s
+
+**Decision**: Tetra uses 100ms one-time FP32 dequantization at load, keeping inference 100% compute-dense via native SIMD dot products while reducing binary complexity.
+
 ## Usage
 
 ```bash
