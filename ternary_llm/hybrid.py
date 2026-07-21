@@ -124,9 +124,7 @@ class HybridTransformerModel(nn.Module):
             x = layer(x)
 
         x = self.norm(x)
-        logits = self.lm_head(x)
-        if activation_dtype is not None:
-            logits = logits.float()
+        logits = self.lm_head(x).float()
         loss = None
         if targets is not None:
             loss = F.cross_entropy(

@@ -197,9 +197,7 @@ class TernaryTransformerModel(nn.Module):
         x = self.norm(x)
 
         # LM head
-        logits = self.lm_head(x)
-        if activation_dtype is not None:
-            logits = logits.float()
+        logits = self.lm_head(x).float()
 
         # Compute loss if targets provided
         loss = None
@@ -322,7 +320,7 @@ class StochasticTransformerModel(nn.Module):
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x).float()
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)

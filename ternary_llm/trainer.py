@@ -353,6 +353,9 @@ class TernaryTrainer:
             _, loss, _ = self.model(x, y, activation_dtype=self.activation_dtype)
         t1 = time.perf_counter()
         raw_loss = loss.item()
+        if not math.isfinite(raw_loss):
+            self.model.zero_grad(set_to_none=True)
+            return raw_loss
         loss = loss / self.config.gradient_accumulation_steps
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
@@ -402,7 +405,10 @@ class TernaryTrainer:
                 break
 
             loss = self.train_step(batch)
-            total_loss += loss
+            if math.isfinite(loss):
+                total_loss += loss
+            else:
+                self._nan_step_count += 1
             micro_count += 1
 
             if micro_count % self.config.gradient_accumulation_steps == 0:
@@ -478,12 +484,16 @@ class TernaryTrainer:
 
                 # Logging
                 if step % self.config.log_interval == 0:
-                    avg_loss = total_loss / self.config.log_interval
+                    n_micro = self.config.gradient_accumulation_steps * self.config.log_interval
+                    n_valid = n_micro - self._nan_step_count
+                    avg_loss = total_loss / max(n_valid, 1) if n_valid > 0 else float("nan")
                     lr = self.optimizer.param_groups[0]["lr"]
-                    self.train_losses.append(avg_loss)
+                    if math.isfinite(avg_loss):
+                        self.train_losses.append(avg_loss)
                     self.learning_rates.append(lr)
                     pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
                     total_loss = 0.0
+                    self._nan_step_count = 0
 
                 # Validation
                 if step % self.config.eval_interval == 0:
@@ -699,6 +709,7 @@ class TernaryTrainer:
         print(f"Max steps: {self.config.max_steps}")
         print(f"LR: {self.config.learning_rate} -> {self.config.min_lr}")
         print("=" * 60)
+        self._nan_step_count = 0
 
         # Validate first batch
         try:
