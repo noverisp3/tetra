@@ -411,7 +411,7 @@ class TernaryTrainer:
                 self._nan_step_count += 1
             micro_count += 1
 
-            if micro_count % self.config.gradient_accumulation_steps == 0:
+            if micro_count > 0 and micro_count % self.config.gradient_accumulation_steps == 0:
                 # Timing breakdown
                 if self.fwd_time > 0:
                     avg_fwd = self.fwd_time / self.micro_steps
