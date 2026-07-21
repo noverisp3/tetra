@@ -67,19 +67,19 @@ class TernarySSMBlock(nn.Module):
         x_conv = self.conv(x_in.transpose(1, 2)).transpose(1, 2)
         x_conv = F.silu(x_conv)
 
-        # SSM scan (per-channel, diagonal, stable recurrence)
-        delta = F.softplus(self.log_delta)  # (inner_dim,)
-        # A_gate = sigmoid(A) ∈ (0, 1), so (1 - Δ·A_gate) ∈ (0, 1)
-        A_gate = torch.sigmoid(self.A_log)  # (inner_dim,)
-
-        bsize, seq_len, inner_dim = x_conv.shape
-        h = torch.zeros(bsize, inner_dim, device=x.device)
-        y = torch.empty(bsize, seq_len, inner_dim, device=x.device)
-        for t in range(seq_len):
-            # h_t = (1 - Δ·A_gate) ⊙ h_{t-1} + Δ·x_t
-            decay = 1 - delta * A_gate
-            h = decay * h + delta * x_conv[:, t]
-            y[:, t] = h
+        # SSM scan via parallel prefix: h_t = decay^t · cumsum(Δ·x_j / decay^j)
+        # No Python loop — O(T) with 4 vectorized ops.
+        inner_dim = x_conv.size(-1)
+        delta = F.softplus(self.log_delta).view(1, inner_dim)
+        # decay close to 1 to avoid underflow in decay^T for long sequences
+        decay = (1 - delta * torch.sigmoid(self.A_log).view(1, inner_dim)).clamp(min=0.98, max=0.9999)
+        T = x_conv.size(1)
+        t_idx = torch.arange(T, device=x.device, dtype=torch.float32).view(T, 1)
+        decay_pow = decay.pow(t_idx)
+        s = delta * x_conv
+        z = s / decay_pow.unsqueeze(0)
+        cum = z.cumsum(dim=1)
+        y = decay_pow.unsqueeze(0) * cum
 
         # Gate: y × SiLU(gate)
         out = y * F.silu(gate)
