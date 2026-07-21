@@ -113,6 +113,7 @@ class HybridTransformerModel(nn.Module):
 
     def forward(self, input_ids, targets=None, past_key_values=None, activation_dtype=None):
         B, T = input_ids.shape
+        input_ids = input_ids.clamp(0, self.token_embedding.num_embeddings - 1)
         pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
         x = self.token_embedding(input_ids) + self.pos_embedding(pos)
         if activation_dtype is not None:

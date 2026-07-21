@@ -177,6 +177,7 @@ class TernaryTransformerModel(nn.Module):
         else:
             pos_offset = past_key_values[0][0].size(-2)
         positions = torch.arange(pos_offset, pos_offset + seq_len, device=input_ids.device).unsqueeze(0)
+        input_ids = input_ids.clamp(0, self.token_embedding.num_embeddings - 1)
         x = self.token_embedding(input_ids) + self.pos_embedding(positions)
         if activation_dtype is not None:
             x = x.to(activation_dtype)

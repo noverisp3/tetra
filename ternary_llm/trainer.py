@@ -687,12 +687,26 @@ class TernaryTrainer:
         print(f"Device: {self.device}")
         print(f"Dtype: {self.config.dtype}")
         print(f"Model params: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"Vocab size: {self.config.vocab_size}")
         print(f"Batch size: {self.config.batch_size}")
         print(f"Grad accum: {self.config.gradient_accumulation_steps}")
         print(f"Effective batch: {self.config.batch_size * self.config.gradient_accumulation_steps}")
         print(f"Max steps: {self.config.max_steps}")
         print(f"LR: {self.config.learning_rate} -> {self.config.min_lr}")
         print("=" * 60)
+
+        # Validate first batch
+        try:
+            sample_batch = next(iter(self.train_loader))
+            x, y = sample_batch
+            max_id = x.max().item()
+            if max_id >= self.config.vocab_size:
+                print(f"  WARNING: Data contains token ID {max_id} >= vocab_size {self.config.vocab_size}!")
+                print(f"  Clamping will be applied. Re-prepare data with current tokenizer to fix.")
+            else:
+                print(f"  Data OK: max token ID = {max_id} < vocab_size = {self.config.vocab_size}")
+        except Exception:
+            pass
 
         step = resume_step
         start_time = time.time()
