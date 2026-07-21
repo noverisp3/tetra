@@ -71,6 +71,8 @@ def main():
                         help="Keep top-k fraction of activations after norm (e.g. 0.2 = 20%%, default: 1.0 = off)")
     parser.add_argument("--flip-every-n-steps", type=int, default=5,
                         help="[Stochastic] Check threshold & flip bits every N optimizer steps (default: 5)")
+    parser.add_argument("--graph", action="store_true",
+                        help="Export training loss plot to checkpoints/loss_plot.png")
     parser.add_argument("--debug", action="store_true",
                         help="Print MEM/TIME diagnostics")
     parser.add_argument("--dtype", type=str, default=None, choices=["float32", "float16", "bfloat16"],
@@ -267,6 +269,35 @@ def main():
         start_step = 0
 
     trainer.train(resume_step=start_step)
+
+    # Export training loss graph
+    if args.graph and trainer.train_losses:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            steps = list(range(1, len(trainer.train_losses) + 1))
+            plt.figure(figsize=(12, 5))
+            plt.subplot(1, 2, 1)
+            plt.plot(steps, trainer.train_losses, color="#4a90d9", linewidth=1.5)
+            plt.xlabel("Step")
+            plt.ylabel("Loss")
+            plt.title("Training Loss")
+            plt.grid(alpha=0.3)
+            if trainer.learning_rates:
+                plt.subplot(1, 2, 2)
+                plt.plot(steps, trainer.learning_rates, color="#e67e22", linewidth=1.5)
+                plt.xlabel("Step")
+                plt.ylabel("LR")
+                plt.title("Learning Rate")
+                plt.grid(alpha=0.3)
+            plt.tight_layout()
+            graph_path = Path(config.save_dir) / "loss_plot.png"
+            plt.savefig(graph_path, dpi=150)
+            plt.close()
+            print(f"  [GRAPH] Saved to {graph_path}")
+        except ImportError:
+            print("  [GRAPH] matplotlib not installed, skipping")
 
     # Generate sample
     print("\n[Sample Generation]")
