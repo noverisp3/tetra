@@ -321,16 +321,15 @@ class StochasticBitFlipLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, = ctx.saved_tensors
+        x = ctx.saved_tensors[0].to(grad_output.dtype)
         scale = ctx.scale
         in_features = x.size(-1)
 
-        # Forward computes: output = F.linear(x, w_raw) * scale
-        # Backward: grad_y_raw = grad_output * scale (2.6M elements vs 500M for w_ternary)
         grad_output_flat = grad_output.reshape(-1, grad_output.size(-1))
         grad_y_raw = grad_output_flat * scale
+        w_raw = ctx.w_raw.to(grad_y_raw.dtype)
 
-        grad_x_flat = torch.mm(grad_y_raw, ctx.w_raw)
+        grad_x_flat = torch.mm(grad_y_raw, w_raw)
         grad_x = grad_x_flat.view(*x.shape[:-1], in_features)
 
         grad_w = torch.mm(grad_y_raw.T, x.reshape(-1, x.size(-1)))
@@ -384,14 +383,15 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x = ctx.saved_tensors[0]
+        x = ctx.saved_tensors[0].to(grad_output.dtype)
         scale = ctx.scale
         in_features = x.size(-1)
 
         grad_output_flat = grad_output.reshape(-1, grad_output.size(-1))
         grad_y_raw = grad_output_flat * scale
+        w_raw = ctx.w_raw.to(grad_y_raw.dtype)
 
-        grad_x_flat = torch.mm(grad_y_raw, ctx.w_raw)
+        grad_x_flat = torch.mm(grad_y_raw, w_raw)
         grad_x = grad_x_flat.view(*x.shape[:-1], in_features)
 
         grad_w = torch.mm(grad_y_raw.T, x.reshape(-1, x.size(-1)))
