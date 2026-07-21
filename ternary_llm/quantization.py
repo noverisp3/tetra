@@ -165,6 +165,7 @@ class FusedTernaryLinear(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         x, w_ternary = ctx.saved_tensors
         w_ternary = w_ternary.to(grad_output.dtype)
+        x = x.to(grad_output.dtype)
         grad_x = F.linear(grad_output, w_ternary.T)
         grad_w = torch.mm(
             grad_output.reshape(-1, grad_output.size(-1)).T,

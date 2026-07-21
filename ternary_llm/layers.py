@@ -21,7 +21,8 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_f = x.float()
         rms = x_f.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x_f * rms).type_as(x) * self.weight
+        out = (x_f * rms) * self.weight
+        return out.to(x.dtype)
 
 
 class TernaryLinear(nn.Module):
