@@ -53,8 +53,12 @@ def main():
                         help="Hybrid mode: model on GPU, optimizer on CPU (avoids DML fallbacks)")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader workers for async prefetch (default: 4)")
-    parser.add_argument("--mode", type=str, default="ste", choices=["ste", "stochastic"],
-                        help="Training mode: STE (latent weights) or Stochastic Bit-Flip (default: ste)")
+    parser.add_argument("--mode", type=str, default="ste", choices=["ste", "stochastic", "hybrid"],
+                        help="Training mode: STE, Stochastic Bit-Flip, or Hybrid SSM-Attention (default: ste)")
+    parser.add_argument("--ssm-every", type=int, default=5,
+                        help="[Hybrid] Place attention every N blocks (default: 5 → 80% SSM, 20% attention)")
+    parser.add_argument("--expand-factor", type=int, default=2,
+                        help="[Hybrid] SSM expansion factor (default: 2)")
     parser.add_argument("--ternary-scale", type=float, default=0.7,
                         help="[STE] Dynamic threshold scale: delta = scale x mean(|W|) (default: 0.7)")
     parser.add_argument("--per-channel", action="store_true",
@@ -162,8 +166,25 @@ def main():
     # Step 3: Create model
     print("\n[3/4] Creating model...")
     is_stochastic = args.mode == "stochastic"
+    is_hybrid = args.mode == "hybrid"
 
-    if is_stochastic:
+    if is_hybrid:
+        from ternary_llm.hybrid import HybridTransformerModel
+        model = HybridTransformerModel(
+            vocab_size=config.vocab_size,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            ffn_dim=config.ffn_dim,
+            max_seq_len=config.max_seq_len,
+            scale=config.ternary_scale,
+            threshold=args.threshold,
+            int8=args.int8,
+            topk=args.topk if args.topk is not None else 1.0,
+            expand_factor=args.expand_factor,
+            ssm_every=args.ssm_every,
+        )
+    elif is_stochastic:
         model = StochasticTransformerModel(
             vocab_size=config.vocab_size,
             hidden_dim=config.hidden_dim,
@@ -190,7 +211,17 @@ def main():
         )
 
     total_params = sum(p.numel() for p in model.parameters())
-    if is_stochastic:
+    if is_hybrid:
+        ternary_params = sum(
+            p.numel() for n, p in model.named_buffers()
+            if "packed_weights" in n
+        ) * 2
+        attn_layers = sum(1 for l in model.layers if l.is_attention)
+        ssm_layers = sum(1 for l in model.layers if not l.is_attention)
+        print(f"  Mode: Hybrid ({ssm_layers}× SSM + {attn_layers}× Attention)")
+        print(f"  Total params: {total_params:,}")
+        print(f"  Ternary params: {ternary_params:,} ({ternary_params / 8 / 1024:.0f} KB packed)")
+    elif is_stochastic:
         ternary_params = sum(
             p.numel() for n, p in model.named_buffers()
             if "packed_weights" in n
