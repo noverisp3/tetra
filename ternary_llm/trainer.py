@@ -269,7 +269,7 @@ class TernaryTrainer:
             print(f"  Hybrid mode: model on {self.device}, optimizer on CPU")
         else:
             # Standard: optimizer on same device as model
-            is_dml = self.device.type == "directml" or str(self.device) == "privateuseone"
+            is_dml = self.device.type == "privateuseone"
             opt_cls = DMLAdamW if is_dml else torch.optim.AdamW
             self.optimizer = opt_cls(
                 model.parameters(),

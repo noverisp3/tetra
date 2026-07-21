@@ -356,11 +356,15 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
 
         # Replace values with int8 matmul result (no grad contribution)
         with torch.no_grad():
+            # C++ extension runs on CPU; move data if needed
+            x_q_cpu = x_q.cpu().contiguous()
+            pw_cpu = packed_w.cpu().contiguous()
             int_out = _ternary_ops.ternary_matmul_int8(
-                x_q.contiguous(), packed_w.contiguous(),
+                x_q_cpu, pw_cpu,
                 w_raw.size(0), w_raw.size(1),
             )
-        out.data = int_out.float() * scale * scale_x
+        # Move int8 result back to original device
+        out.data = int_out.to(x.device, non_blocking=True).float() * scale * scale_x
         return out
 
     @staticmethod

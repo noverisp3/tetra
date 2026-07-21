@@ -320,7 +320,7 @@ class StochasticTransformerModel(nn.Module):
     def generate(self, input_ids, max_new_tokens=100, temperature=1.0, top_k=None):
         for _ in range(max_new_tokens):
             idx = input_ids if input_ids.size(1) <= self.max_seq_len else input_ids[:, -self.max_seq_len:]
-            logits, _ = self(idx)
+            logits, _, _ = self(idx)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
