@@ -6,42 +6,79 @@ import math, os, sys
 # Optional C++ SIMD extension for fast pack/unpack
 _ternary_ops = None
 
-def _load_cpp_extension():
-    """Try to load C++ ternary_ops extension, return False on failure.
+def _try_load_from_cache(name):
+    """Try to import a compiled extension from PyTorch's cache directory by module name."""
+    cache_base = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                              "torch_extensions", "torch_extensions", "Cache")
+    if not os.path.isdir(cache_base):
+        return None
+    for ver_dir in os.listdir(cache_base):
+        pyd_path = os.path.join(cache_base, ver_dir, name, f"{name}.pyd")
+        if os.path.exists(pyd_path):
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(name, pyd_path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+            except Exception:
+                pass
+    return None
 
-    Tries two approaches:
-      1. Direct import from PyTorch extension cache (no compiler needed)
-      2. Fallback: torch.utils.cpp_extension.load() (requires cl.exe in PATH)
+def _load_cpp_extension():
+    """Load C++ ternary_ops extension with CPU-capability dispatch.
+
+    Tries (in order):
+      1. AVX-512: direct cache load or torch.load for ternary_ops_avx512
+      2. AVX2:    direct cache load or torch.load for ternary_ops (baseline)
+      3. Returns False if neither works
     """
     global _ternary_ops
     if _ternary_ops is not None:
         return True
 
-    # Approach 1: direct load from PyTorch's extension cache (no compiler check)
-    cache_base = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                              "torch_extensions", "torch_extensions", "Cache")
-    if os.path.isdir(cache_base):
-        for ver_dir in os.listdir(cache_base):
-            pyd_path = os.path.join(cache_base, ver_dir, "ternary_ops", "ternary_ops.pyd")
-            if os.path.exists(pyd_path):
-                try:
-                    import importlib.util
-                    spec = importlib.util.spec_from_file_location("ternary_ops", pyd_path)
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    _ternary_ops = mod
-                    return True
-                except Exception:
-                    pass
+    csrc = os.path.join(os.path.dirname(__file__), "csrc")
 
-    # Approach 2: try torch's loader (requires cl.exe in PATH)
-    src = os.path.join(os.path.dirname(__file__), "csrc", "ternary_ops.cpp")
-    if not os.path.exists(src):
+    # Attempt 1: AVX-512 variant (best perf)
+    # Check CPU for AVX-512 support via Windows API
+    def _has_avx512():
+        try:
+            if sys.platform == 'win32':
+                import ctypes
+                return ctypes.windll.kernel32.IsProcessorFeaturePresent(0x17) != 0
+        except Exception:
+            pass
+        return False
+
+    if _has_avx512():
+        mod = _try_load_from_cache("ternary_ops_avx512")
+        if mod is not None:
+            _ternary_ops = mod
+            return True
+        avx512_src = os.path.join(csrc, "ternary_ops_avx512.cpp")
+        if os.path.exists(avx512_src):
+            try:
+                from torch.utils.cpp_extension import load
+                _ternary_ops = load(
+                    name="ternary_ops_avx512", sources=[avx512_src],
+                    extra_cflags=["/arch:AVX512"], verbose=False,
+                )
+                return True
+            except Exception:
+                pass
+
+    # Attempt 2: AVX2 variant (fallback)
+    mod = _try_load_from_cache("ternary_ops")
+    if mod is not None:
+        _ternary_ops = mod
+        return True
+    avx2_src = os.path.join(csrc, "ternary_ops_avx2.cpp")
+    if not os.path.exists(avx2_src):
         return False
     try:
         from torch.utils.cpp_extension import load
         _ternary_ops = load(
-            name="ternary_ops", sources=[src],
+            name="ternary_ops", sources=[avx2_src],
             extra_cflags=["/arch:AVX2"], verbose=False,
         )
         return True

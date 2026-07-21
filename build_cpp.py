@@ -1,4 +1,4 @@
-"""Build the C++ ternary_ops extension.
+"""Build C++ ternary_ops extensions for AVX2 and AVX-512.
 
 Requirements: Visual Studio 2022 with MSVC, PyTorch
 Usage: python build_cpp.py
@@ -20,18 +20,43 @@ if os.path.exists(vs_vcvars):
 import torch
 from torch.utils.cpp_extension import load
 
-print("Building ternary_ops...")
-ternary_ops = load(
-    name="ternary_ops",
-    sources=[r"ternary_llm\csrc\ternary_ops.cpp"],
-    extra_cflags=["/arch:AVX2"],
-    verbose=True,
-)
+base_dir = os.path.join(os.path.dirname(__file__), "ternary_llm", "csrc")
 
-# Quick validation
+# Build AVX2 version (baseline, always available)
+print("\nBuilding ternary_ops (AVX2)...")
+ops_avx2 = load(
+    name="ternary_ops",
+    sources=[os.path.join(base_dir, "ternary_ops_avx2.cpp")],
+    extra_cflags=["/arch:AVX2"],
+    verbose=False,
+)
+# Validate
 n = 1000
 w = torch.randint(0, 3, (n,), dtype=torch.uint8).float() - 1.0
-packed = ternary_ops.pack_ternary(w)
-w2 = ternary_ops.unpack_ternary(packed, [n])
-assert (w - w2).abs().max().item() < 1e-5, "pack/unpack failed"
-print("✓ Build OK, validation passed")
+packed = ops_avx2.pack_ternary(w)
+w2 = ops_avx2.unpack_ternary(packed, [n])
+assert (w - w2).abs().max().item() < 1e-5, "AVX2 pack/unpack failed"
+print("  AVX2: OK")
+
+# Build AVX-512 version (loaded at runtime if CPU supports it)
+avx512_src = os.path.join(base_dir, "ternary_ops_avx512.cpp")
+if os.path.exists(avx512_src):
+    print("\nBuilding ternary_ops_avx512...")
+    try:
+        ops_avx512 = load(
+            name="ternary_ops_avx512",
+            sources=[avx512_src],
+            extra_cflags=["/arch:AVX512"],
+            verbose=False,
+        )
+        # Validate
+        packed2 = ops_avx512.pack_ternary(w)
+        w3 = ops_avx512.unpack_ternary(packed2, [n])
+        assert (w - w3).abs().max().item() < 1e-5, "AVX-512 pack/unpack failed"
+        print("  AVX-512: OK")
+    except Exception as e:
+        print(f"  AVX-512: skipped ({e})")
+else:
+    print("\n  AVX-512 source not found, skipping")
+
+print("\nDone.")

@@ -11,10 +11,8 @@
 #include <algorithm>
 #include <immintrin.h>
 
-// ============================================================================
 // Pack: float {-1, 0, +1} → packed uint8 (4 weights/byte)
 // Encoding: -1→0, 0→1, +1→2  (2 bits per weight)
-// ============================================================================
 
 at::Tensor pack_ternary(at::Tensor w) {
     TORCH_CHECK(w.dtype() == torch::kFloat32 || w.dtype() == torch::kFloat16,
@@ -40,9 +38,7 @@ at::Tensor pack_ternary(at::Tensor w) {
     return packed;
 }
 
-// ============================================================================
 // Unpack: packed uint8 → float {-1, 0, +1}
-// ============================================================================
 
 at::Tensor unpack_ternary(at::Tensor packed, std::vector<int64_t> shape) {
     TORCH_CHECK(packed.dtype() == torch::kUInt8, "unpack_ternary: expected uint8 packed input");
@@ -70,12 +66,9 @@ at::Tensor unpack_ternary(at::Tensor packed, std::vector<int64_t> shape) {
     return result.reshape(shape);
 }
 
-// ============================================================================
 // Fused Ternary Matmul: y = x @ (unpack(W) * scale)
 // Unpacks weights on-the-fly, no intermediate float weight tensor
-// x: (batch, seq, in_features), packed: (n_packed,)
-// Returns: (batch, seq, out_features)
-// ============================================================================
+
 at::Tensor ternary_matmul(at::Tensor x, at::Tensor packed_weights,
                           int64_t out_features, int64_t in_features, float scale) {
     TORCH_CHECK(x.dtype() == torch::kFloat32, "ternary_matmul: x must be float32");
@@ -167,13 +160,7 @@ at::Tensor ternary_matmul(at::Tensor x, at::Tensor packed_weights,
     return result;
 }
 
-// ============================================================================
-// Fused Stochastic Backward
-//
-// Returns grad_x and updates accumulator in-place.
-// grad_x = grad_output @ (unpack(W) * scale)^T
-// accumulator += sign(grad_output^T @ x) scaled by 1/scale
-// ============================================================================
+// Fused Stochastic Backward: returns grad_x and updates accumulator in-place
 
 std::vector<at::Tensor> stochastic_backward(
     at::Tensor grad_output,
@@ -246,10 +233,7 @@ std::vector<at::Tensor> stochastic_backward(
     return {grad_x};
 }
 
-// ============================================================================
 // Apply bit flips: check accumulator, flip bits where threshold exceeded
-// Returns number of bits flipped (resets flipped accumulator entries to zero)
-// ============================================================================
 
 int64_t apply_bit_flips(at::Tensor packed_weights, at::Tensor accumulator,
                           float threshold, std::vector<int64_t> shape_w) {
@@ -287,9 +271,7 @@ int64_t apply_bit_flips(at::Tensor packed_weights, at::Tensor accumulator,
     return flips;
 }
 
-// ============================================================================
 // PyTorch bindings
-// ============================================================================
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Tetra ternary operations";

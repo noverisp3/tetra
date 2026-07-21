@@ -97,7 +97,7 @@ python build_cpp.py
 | unpack_ternary | ~6s | 1.2s |
 | ternary_matmul (CPU) | — | 7s (512×2048, AVX2) |
 
-Includes fused stochastic backward (grad_x + accumulator update in one pass). See `ternary_llm/csrc/ternary_ops.cpp`.
+Includes fused stochastic backward (grad_x + accumulator update in one pass). See `ternary_llm/csrc/ternary_ops_avx2.cpp`.
 
 ## Usage
 
@@ -221,7 +221,8 @@ ternary_llm/
   int8.py                 # INT8 fake-quantization (reference, not used in model)
   __init__.py
   csrc/
-    ternary_ops.cpp       # C++ SIMD pack/unpack/matmul (AVX2)
+    ternary_ops_avx2.cpp      # C++ SIMD pack/unpack/matmul (AVX2)
+    ternary_ops_avx512.cpp    # C++ SIMD pack/unpack/matmul (AVX-512)
     setup.py              # PyTorch extension build
     __init__.py
 

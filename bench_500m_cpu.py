@@ -4,7 +4,7 @@ sys.path.insert(0, r'C:\Users\Noveris\Desktop\Oxide')
 
 # Force C++ ext build
 from torch.utils.cpp_extension import load
-load('ternary_ops', ['ternary_llm/csrc/ternary_ops.cpp'],
+load('ternary_ops', ['ternary_llm/csrc/ternary_ops_avx2.cpp'],
      extra_cflags=['/arch:AVX2'], verbose=False)
 
 from ternary_llm.quantization import _has_cpp

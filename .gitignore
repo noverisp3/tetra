@@ -49,3 +49,5 @@ desktop.ini
 # Temporary
 temp_*.py
 debug.txt
+
+train_log.txt

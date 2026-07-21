@@ -11,7 +11,7 @@ setup(
     ext_modules=[
         cpp_extension.CppExtension(
             "ternary_ops",
-            ["csrc/ternary_ops.cpp"],
+            ["csrc/ternary_ops_avx2.cpp"],
             extra_compile_args=["/arch:AVX2"],
         )
     ],
