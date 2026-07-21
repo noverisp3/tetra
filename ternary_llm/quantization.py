@@ -334,9 +334,10 @@ class StochasticBitFlipLinear(torch.autograd.Function):
 class Int8StochasticBitFlipLinear(torch.autograd.Function):
     """Stochastic Bit-Flip with INT8 activations.
 
-    Forward: quantize x → int8, int8 ternary matmul → float32, dequantize.
-    Backward: STE — grad flows through float matmul for values, int8 matmul
-              provides the actual output values.
+    Forward: quantize x → int8, matmul, dequantize.
+    - CPU: uses C++ int8 ternary matmul kernel (no float multiplications).
+    - DML/GPU: pure-PyTorch fallback (dequant+float matmul, same quantization noise).
+    Backward: STE — grad flows through float matmul.
     """
 
     @staticmethod
@@ -349,22 +350,23 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
         ctx.w_raw = w_raw
         ctx.scale = scale
         ctx.accumulator = accumulator
-        ctx.scale_x = scale_x
 
         # Grad carrier: float matmul so grad flows through x
         out = F.linear(x.float(), w_raw.float()) * scale * scale_x
 
         # Replace values with int8 matmul result (no grad contribution)
         with torch.no_grad():
-            # C++ extension runs on CPU; move data if needed
-            x_q_cpu = x_q.cpu().contiguous()
-            pw_cpu = packed_w.cpu().contiguous()
-            int_out = _ternary_ops.ternary_matmul_int8(
-                x_q_cpu, pw_cpu,
-                w_raw.size(0), w_raw.size(1),
-            )
-        # Move int8 result back to original device
-        out.data = int_out.to(x.device, non_blocking=True).float() * scale * scale_x
+            if x.device.type == "cpu" and _ternary_ops is not None:
+                # Real int8 matmul via C++ kernel (fast on CPU)
+                int_out = _ternary_ops.ternary_matmul_int8(
+                    x_q.contiguous(), packed_w.contiguous(),
+                    w_raw.size(0), w_raw.size(1),
+                ).float()
+            else:
+                # Pure-PyTorch fallback: dequant → float matmul
+                # Same quantization noise, no CPU copies on DML
+                int_out = F.linear(x_q.float() * scale_x, w_raw.float()) * scale
+        out.data = int_out.to(x.device)
         return out
 
     @staticmethod
