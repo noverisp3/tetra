@@ -1,8 +1,15 @@
+import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
-from .quantization import FusedTernaryLinear, TernaryQuantizer, StochasticBitFlipLinear, Int8StochasticBitFlipLinear, init_ternary_weight, unpack_ternary_tensor, _ternary_ops
+from .quantization import (
+    FusedTernaryLinear,
+    Int8StochasticBitFlipLinear,
+    StochasticBitFlipLinear,
+    TernaryQuantizer,
+    _ternary_ops,
+    init_ternary_weight,
+    unpack_ternary_tensor,
+)
 
 
 class RMSNorm(nn.Module):

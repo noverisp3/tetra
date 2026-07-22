@@ -1,6 +1,5 @@
 import torch
 import pytest
-import math
 from ternary_llm.quantization import TernaryQuantizer, ternary_quantize
 from ternary_llm.int8 import Int8Quantizer, int8_quantize
 

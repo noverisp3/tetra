@@ -1,7 +1,7 @@
+import os
+import sys
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import math, os, sys
 
 # Optional C++ SIMD extension for fast pack/unpack
 _ternary_ops = None
@@ -121,20 +121,6 @@ class TernaryQuantizer(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
         return grad_output, None
-
-
-class _quantize_ternary:
-    """Ternary quantize with computed threshold Δ = scale × mean(|W|)."""
-
-    @staticmethod
-    def forward(input: torch.Tensor, scale: float = 0.7) -> torch.Tensor:
-        delta = input.abs().mean().clamp(min=1e-6) * scale
-        return (input / delta).clamp(-1, 1).round()
-
-    @staticmethod
-    def per_channel(input: torch.Tensor, scale: float = 0.7) -> torch.Tensor:
-        delta = input.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * scale
-        return (input / delta).clamp(-1, 1).round()
 
 
 class FusedTernaryLinear(torch.autograd.Function):
@@ -285,19 +271,6 @@ def init_ternary_weight(out_features: int, in_features: int, sparsity: float = 0
     packed = (w[:, 0] << 6) | (w[:, 1] << 4) | (w[:, 2] << 2) | w[:, 3]
     return packed.contiguous()
 
-
-# INT8 Autograd Helper
-
-class Int8QuantizeSTE(torch.autograd.Function):
-    """Quantize float → int8 with Straight-Through Estimator for backward."""
-    @staticmethod
-    def forward(ctx, x, scale_x):
-        ctx.scale_x = scale_x
-        return (x / scale_x).round().clamp(-128, 127).to(torch.int8)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.float(), None
 
 class StochasticBitFlipLinear(torch.autograd.Function):
     """Stochastic Bit-Flip for ternary weights.

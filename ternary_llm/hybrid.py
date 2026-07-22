@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-import time
 from .layers import RMSNorm, TopKActivation
 from .attention import StochasticMultiHeadAttention
 from .ssm import TernarySSMBlock
@@ -11,8 +9,8 @@ from .ssm import TernarySSMBlock
 class HybridBlock(nn.Module):
     """Single hybrid block: either SSM or Attention, based on position.
 
-    Cứ `ssm_every` block SSM thì 1 block Attention.
-    Mỗi block có RMSNorm + TopK + SSM|Attn + FFN.
+    Every `ssm_every`-th block is Attention, the rest are SSM.
+    Each block has RMSNorm + TopK + SSM|Attn + FFN.
     """
 
     def __init__(self, hidden_dim, num_heads, ffn_dim, dropout=0.0,
@@ -61,8 +59,8 @@ class HybridBlock(nn.Module):
 class HybridTransformerModel(nn.Module):
     """Hybrid SSM-Attention transformer.
 
-    80% layers là TSSM (Ternary SSM), 20% là Attention.
-    Mặc định: cứ 5 block thì 4 SSM + 1 Attention (ssm_every=5).
+    80% layers are TSSM (Ternary SSM), 20% are Attention.
+    Default: every 5 blocks, 4 SSM + 1 Attention (ssm_every=5).
 
     Args:
         vocab_size: vocabulary size

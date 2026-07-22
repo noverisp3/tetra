@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
-from typing import Optional
+
 from tqdm import tqdm
 
 

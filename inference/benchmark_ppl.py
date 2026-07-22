@@ -10,7 +10,7 @@ Usage:
 """
 import sys
 import math
-import struct
+
 import subprocess
 import argparse
 from pathlib import Path
@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from ternary_llm.transformer import TernaryTransformerModel
 from ternary_llm.data import get_tokenizer_compat, ChunkedDataset

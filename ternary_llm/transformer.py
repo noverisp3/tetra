@@ -1,8 +1,7 @@
+import time
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
-import time
+from .layers import RMSNorm, TopKActivation
 from .layers import RMSNorm, TopKActivation
 from .attention import TernaryMultiHeadAttention
 from .ffn import TernaryFFN

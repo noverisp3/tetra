@@ -17,7 +17,6 @@ import json
 import argparse
 import numpy as np
 from pathlib import Path
-from itertools import cycle
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

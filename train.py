@@ -6,7 +6,9 @@ Usage:
     python train.py --resume                     # Auto-resume from latest checkpoint
     python train.py --resume checkpoints/checkpoint_000500.pt  # Resume from specific
 """
+import json
 import sys
+import time
 import argparse
 from pathlib import Path
 
@@ -129,7 +131,6 @@ def main():
         if not data_cache.exists():
             print(f"  ERROR: {data_cache} not found. Run prepare_data.py first.")
             sys.exit(1)
-        import json
         with open(data_cache / "manifest.json") as f:
             manifest = json.load(f)
         config.vocab_size = manifest["vocab_size"]
@@ -301,7 +302,6 @@ def main():
 
     # Generate sample
     print("\n[Sample Generation]")
-    import time
     enc = get_tokenizer_compat(args.tokenizer_dir)
     prompt = "Hello"
     prompt_ids = enc.encode(prompt)
