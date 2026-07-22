@@ -124,29 +124,40 @@ def export_model(model: TernaryTransformerModel, output_path: str):
             f.write(struct.pack("<f", alpha))
             f.write(pack_ternary(w_ternary))
 
-        # Write fp32 weights (skip lm_head — tied to token_embedding)
+        # Write fp32/int8 weights (skip lm_head — tied to token_embedding)
         for name, param in model.named_parameters():
             is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
             if is_ternary:
                 continue
-            # Skip lm_head — weight is tied to token_embedding
             if name == "lm_head.weight":
                 continue
 
-            w_fp32 = param.data.float().cpu().numpy().flatten()
             ndim = len(param.shape)
             shape = list(param.shape)
-            # Pad shape to 4 dims for uniform loading
             while len(shape) < 4:
                 shape.append(1)
+            padded = shape + [1] * (4 - len(shape))
 
             name_bytes = name.encode("utf-8")
             f.write(struct.pack("<I", len(name_bytes)))
             f.write(name_bytes)
-            padded = shape + [1] * (4 - len(shape))
             f.write(struct.pack("<B", ndim))
-            f.write(struct.pack("<4I", *padded))
-            f.write(w_fp32.tobytes())
+
+            # Embeddings → INT8, norms → FP32
+            is_int8 = name in ("token_embedding.weight", "pos_embedding.weight")
+            if is_int8:
+                f.write(struct.pack("<B", 1))  # dtype=INT8
+                w = param.data.float().cpu().numpy().flatten()
+                scale = np.max(np.abs(w)) / 127.0
+                w_int8 = np.clip(np.round(w / scale), -128, 127).astype(np.int8)
+                f.write(struct.pack("<4I", *padded))
+                f.write(struct.pack("<f", scale))
+                f.write(w_int8.tobytes())
+            else:
+                f.write(struct.pack("<B", 0))  # dtype=FP32
+                w_fp32 = param.data.float().cpu().numpy().flatten()
+                f.write(struct.pack("<4I", *padded))
+                f.write(w_fp32.tobytes())
 
     file_size = Path(output_path).stat().st_size
     print(f"\nExported to {output_path} ({file_size / 1024:.1f} KB)")

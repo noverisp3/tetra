@@ -298,7 +298,7 @@ static Model load_model(const char* path) {
         }
     }
 
-    // Read FP32 weights
+    // Read FP32/INT8 weights
     while (true) {
         uint32_t name_len;
         if (fread(&name_len, 4, 1, f) != 1) break;
@@ -310,6 +310,9 @@ static Model load_model(const char* path) {
         uint8_t ndim;
         fread(&ndim, 1, 1, f);
 
+        uint8_t dtype;
+        fread(&dtype, 1, 1, f);
+
         uint32_t dims[4] = {1,1,1,1};
         fread(dims, 4, 4, f);
 
@@ -320,7 +323,17 @@ static Model load_model(const char* path) {
         FP32Weight fw;
         fw.shape = shape;
         fw.data.resize(n_elements);
-        fread(fw.data.data(), 4, n_elements, f);
+
+        if (dtype == 1) {  // INT8 → dequantize to FP32
+            float scale;
+            fread(&scale, 4, 1, f);
+            std::vector<int8_t> buf(n_elements);
+            fread(buf.data(), 1, n_elements, f);
+            for (int i = 0; i < n_elements; i++)
+                fw.data[i] = (float)buf[i] * scale;
+        } else {  // FP32
+            fread(fw.data.data(), 4, n_elements, f);
+        }
         model.fp32_weights[name] = std::move(fw);
     }
 
