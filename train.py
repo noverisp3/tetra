@@ -301,20 +301,21 @@ def main():
 
     # Generate sample
     print("\n[Sample Generation]")
-    import torch
+    import time
     enc = get_tokenizer_compat(args.tokenizer_dir)
     prompt = "Hello"
     prompt_ids = enc.encode(prompt)
     prompt_tensor = torch.tensor([prompt_ids], device=trainer.device)
     model.eval()
+    gen_cfg = dict(max_new_tokens=200, temperature=0.8, top_k=50)
+    t0 = time.perf_counter()
     with torch.no_grad():
-        output = model.generate(
-            prompt_tensor,
-            max_new_tokens=200,
-            temperature=0.8,
-            top_k=50,
-        )
+        output = model.generate(prompt_tensor, **gen_cfg)
+    gen_time = time.perf_counter() - t0
+    n_prompt = prompt_tensor.size(1)
+    n_gen = output.size(1) - n_prompt
     generated = enc.decode(output[0].tolist())
+    print(f"  Prompt: {n_prompt} tokens → Generated: {n_gen} tokens in {gen_time:.2f}s ({n_gen/gen_time:.1f} tok/s)")
     print(f"\n{generated}\n")
 
 
