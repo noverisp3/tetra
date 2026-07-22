@@ -19,6 +19,9 @@ if "%VC_VARS%"=="" (
     if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" set "VC_VARS=C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
 )
 if "%VC_VARS%"=="" (
+    if exist "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvarsall.bat" set "VC_VARS=C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvarsall.bat"
+)
+if "%VC_VARS%"=="" (
     echo ERROR: Visual Studio not found. Install VS 2022/2019 or set VC_VARS manually.
     exit /b 1
 )

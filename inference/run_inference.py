@@ -50,7 +50,8 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
 
-    generated = ""
+    all_ids = []
+    prev_text = ""
     for line in proc.stdout:
         line = line.strip()
         if not line:
@@ -65,9 +66,11 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
                 continue
             if token_id == EOS_TOKEN:
                 break
-            chunk = enc.decode([token_id])
-            generated += chunk
-            print(chunk, end="", flush=True)
+            all_ids.append(token_id)
+            text = enc.decode(all_ids)
+            new_chunk = text[len(prev_text):]
+            prev_text = text
+            print(new_chunk, end="", flush=True)
         else:
             continue
         break
@@ -81,7 +84,7 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
     print(f"\n{'=' * 60}")
     if stderr:
         print(stderr, file=sys.stderr, end="")
-    return generated
+    return prev_text
 
 
 def python_inference(model_path, prompt_tokens, max_tokens, temperature, top_k=50):
