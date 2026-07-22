@@ -77,6 +77,36 @@ python build_cpp.py
 
 Requires MSVC (Visual Studio 2022). Auto-loaded at runtime; falls back to Python if not built.
 
+## Examples
+
+### Tiny 8.5M on TinyStories
+
+Trained for 5,000 steps on Intel Iris Xe (DirectML) in ~3 hours:
+
+| Metric | Value |
+|--------|-------|
+| **Total params** | 8,523,008 (6.3M ternary + 2.2M FP32) |
+| **Dataset** | TinyStoriesV2-GPT4, 535M tokens, 267K stories |
+| **Tokenizer** | Custom BPE, vocab=8192 |
+| **Mode** | STE (latent weights) |
+| **Batch** | 16 × 4 grad_accum = 64 effective |
+| **Speed** | 2.26s/step |
+| **Final train loss** | 4.3092 |
+| **Final val loss** | 4.3182 |
+| **Loss trend** | 60.96 → 4.31 (converged smoothly) |
+
+<p align="center">
+  <img src="examples/tiny/loss_plot.png" alt="Training Loss Plot" width="85%">
+  <br>
+  <em><b>Figure 1:</b> Convergence curve of Tetra 8.5M (STE) on TinyStories (5,000 steps, Cosine LR Decay with Warmup).</em>
+</p>
+
+Sample output after training:
+> "Hello , Tim to find food the ball like . " I can help he . You mom said . He is . We ' s . You you !" Sue ' s room and a tree away . She is . " Let . He likes . She says . It is . She had and said need the bear and they played too . They were best , Tim and she were very happy on the bird . They went the ground , Tom smiled and laughed away him they could . The cat . The bird ' s a nice . They looked . They played all lived . But then it . <| endoftext |> Once upon a time , there was a little boy named Tim . The truck was very the rock . One day , she saw what . The boat and said , she could , " Thank said , Tim . He found it !" The bird to play with his mom , " Can you something and said , " Maybe to play . The end . She saw a big , he wanted to find to his family the hole"
+
+Limited but coherent — expected for 8.5M params on simple stories.
+
+
 ## Project Structure
 
 ```
@@ -117,32 +147,3 @@ tests/
   test_prototype.py
   test_convergence.py
 ```
-
-## Examples
-
-### Tiny 8.5M on TinyStories
-
-Trained for 5,000 steps on Intel Arc (DirectML) in ~3 hours:
-
-| Metric | Value |
-|--------|-------|
-| **Total params** | 8,523,008 (6.3M ternary + 2.2M FP32) |
-| **Dataset** | TinyStoriesV2-GPT4, 535M tokens, 267K stories |
-| **Tokenizer** | Custom BPE, vocab=8192 |
-| **Mode** | STE (latent weights) |
-| **Batch** | 16 × 4 grad_accum = 64 effective |
-| **Speed** | 2.26s/step |
-| **Final train loss** | 4.3092 |
-| **Final val loss** | 4.3182 |
-| **Loss trend** | 60.96 → 4.31 (converged smoothly) |
-
-<p align="center">
-  <img src="examples/tiny/loss_plot.png" alt="Training Loss Plot" width="85%">
-  <br>
-  <em><b>Figure 1:</b> Convergence curve of Tetra 8.5M (STE) on TinyStories (5,000 steps, Cosine LR Decay with Warmup).</em>
-</p>
-
-Sample output after training:
-> "Hello, Tim to find food the ball like. 'I can help he.' You mom said. He is. We's. You you! Sue's room and a tree away. She is. 'Let.' He likes. She says. It is. She had and said need the bear and they played too. They were best, Tim and she were very happy on the bird."
-
-Limited but coherent — expected for 8.5M params on simple stories.
