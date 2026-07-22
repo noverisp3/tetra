@@ -633,7 +633,7 @@ class TernaryTrainer:
         """
         from .quantization import unpack_ternary
 
-        checkpoint = torch.load(path, map_location="cpu")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         raw_state = checkpoint["model_state_dict"]
         ckpt_mode = checkpoint.get("mode", "ste")
 
