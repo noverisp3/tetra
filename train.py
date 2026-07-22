@@ -5,11 +5,13 @@ Usage:
     python train.py --preset 500m --steps 10000  # Train 500M config
     python train.py --resume                     # Auto-resume from latest checkpoint
     python train.py --resume checkpoints/checkpoint_000500.pt  # Resume from specific
+    python train.py --data-cache tinydata        # Use pre-tokenized .bin cache (tinydata/)
 """
 import json
 import sys
 import time
 import argparse
+import numpy as np
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -184,16 +186,32 @@ def main():
 
     # Step 1: Prepare data
     if args.data_cache:
-        print("\n[1/4] Loading multi-source data...")
         data_cache = Path(args.data_cache)
         if not data_cache.exists():
             print(f"  ERROR: {data_cache} not found. Run prepare_data.py first.")
             sys.exit(1)
-        with open(data_cache / "manifest.json") as f:
-            manifest = json.load(f)
-        config.vocab_size = manifest["vocab_size"]
-        print(f"  Sources: {list(manifest['sources'].keys())}")
-        print(f"  Total tokens: {manifest['total_tokens']:,}")
+        manifest_path = data_cache / "manifest.json"
+        metadata_path = data_cache / "metadata.json"
+        if manifest_path.exists():
+            print("\n[1/4] Loading multi-source data...")
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            config.vocab_size = manifest["vocab_size"]
+            print(f"  Sources: {list(manifest['sources'].keys())}")
+            print(f"  Total tokens: {manifest['total_tokens']:,}")
+            multi_source = True
+        elif metadata_path.exists():
+            print("\n[1/4] Loading cached TinyStories from", data_cache)
+            with open(metadata_path) as f:
+                meta = json.load(f)
+            config.vocab_size = meta["vocab_size"]
+            bin_file = data_cache / "tinystories.bin"
+            tokens = np.memmap(str(bin_file), dtype=np.uint16, mode="r")
+            print(f"  Tokens: {len(tokens):,}")
+            multi_source = False
+        else:
+            print(f"  ERROR: no manifest.json or metadata.json found in {data_cache}")
+            sys.exit(1)
     else:
         print("\n[1/4] Preparing data (TinyStories)...")
         tokens, metadata = download_and_tokenize(
@@ -202,10 +220,11 @@ def main():
             max_stories=args.max_stories,
         )
         config.vocab_size = metadata["vocab_size"]
+        multi_source = False
 
     # Step 2: Create dataloaders
     print("\n[2/4] Creating dataloaders...")
-    if args.data_cache:
+    if multi_source:
         train_loader, val_loader = create_multi_source_dataloaders(
             data_dir=args.data_cache,
             block_size=config.block_size,
