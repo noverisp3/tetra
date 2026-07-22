@@ -41,7 +41,7 @@ def export_graph(trainer, save_dir):
         import matplotlib.pyplot as plt
         import numpy as np
     except ImportError:
-        print("  [GRAPH] matplotlib not installed, skipping")
+        print("  matplotlib not installed, skipping graph")
         return
 
     losses = np.array(trainer.train_losses)
@@ -88,7 +88,7 @@ def export_graph(trainer, save_dir):
     graph_path = Path(save_dir) / "loss_plot.png"
     plt.savefig(graph_path, dpi=150)
     plt.close()
-    print(f"  [GRAPH] Saved to {graph_path}")
+    print(f"  Training graph saved to {graph_path}")
 
 
 def main():
@@ -195,7 +195,7 @@ def main():
         manifest_path = data_cache / "manifest.json"
         metadata_path = data_cache / "metadata.json"
         if manifest_path.exists():
-            print("\n[1/4] Loading multi-source data...")
+            print("\nLoading multi-source data...")
             with open(manifest_path) as f:
                 manifest = json.load(f)
             config.vocab_size = manifest["vocab_size"]
@@ -203,7 +203,7 @@ def main():
             print(f"  Total tokens: {manifest['total_tokens']:,}")
             multi_source = True
         elif metadata_path.exists():
-            print("\n[1/4] Loading cached TinyStories from", data_cache)
+            print(f"\nLoading cached TinyStories from {data_cache}")
             with open(metadata_path) as f:
                 meta = json.load(f)
             config.vocab_size = meta["vocab_size"]
@@ -215,7 +215,7 @@ def main():
             print(f"  ERROR: no manifest.json or metadata.json found in {data_cache}")
             sys.exit(1)
     else:
-        print("\n[1/4] Preparing data (TinyStories)...")
+        print("\nPreparing data (TinyStories)...")
         tokens, metadata = download_and_tokenize(
             cache_dir=config.data_dir,
             tokenizer_dir=args.tokenizer_dir,
@@ -225,7 +225,7 @@ def main():
         multi_source = False
 
     # Step 2: Create dataloaders
-    print("\n[2/4] Creating dataloaders...")
+    print("\nCreating dataloaders...")
     if multi_source:
         train_loader, val_loader = create_multi_source_dataloaders(
             data_dir=args.data_cache,
@@ -246,7 +246,7 @@ def main():
         )
 
     # Step 3: Create model
-    print("\n[3/4] Creating model...")
+    print("\nCreating model...")
     is_stochastic = args.mode == "stochastic"
     is_hybrid = args.mode == "hybrid"
 
@@ -323,7 +323,7 @@ def main():
         print(f"  FP32 params: {total_params - ternary_params:,} ({(total_params - ternary_params) * 4 / 1024:.0f} KB)")
 
     # Step 4: Train
-    print("\n[4/4] Starting training...")
+    print("\nStarting training...")
     trainer = TernaryTrainer(
         model=model,
         config=config,
@@ -351,12 +351,12 @@ def main():
     try:
         trainer.train(resume_step=start_step)
     except KeyboardInterrupt:
-        print("\n\n  [SIGINT] Training interrupted, saving checkpoint...")
+        print("\n\nTraining interrupted, saving checkpoint...")
         step = trainer.scheduler.step_count
         trainer.save_checkpoint(step)
         if args.graph:
             export_graph(trainer, config.save_dir)
-        print("  [SIGINT] Checkpoint saved. Exiting.")
+        print("  Checkpoint saved. Exiting.")
         sys.exit(130)
 
     if args.graph:
@@ -381,7 +381,7 @@ def main():
     n_prompt = prompt_tensor.size(1)
     n_gen = output.size(1) - n_prompt
     generated = enc.decode(output[0].tolist())
-    print(f"  Prompt: {n_prompt} tokens → Generated: {n_gen} tokens in {gen_time:.2f}s ({n_gen/gen_time:.1f} tok/s)")
+    print(f"  Prompt: {n_prompt} tokens -> Generated: {n_gen} tokens in {gen_time:.2f}s ({n_gen/gen_time:.1f} tok/s)")
     print(f"\n{generated}\n")
 
 

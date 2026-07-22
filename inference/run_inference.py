@@ -32,8 +32,7 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
         print("Falling back to Python inference...\n")
         return python_inference(model_path, tokens, max_tokens, temperature, top_k)
 
-    print(f"Prompt: {prompt}")
-    print(f"{'=' * 60}")
+    print(f"Prompt: {prompt}\n")
 
     cmd = [
         str(exe_path), model_path, token_str,
@@ -73,7 +72,7 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
     stderr = proc.stderr.read()
     proc.stderr.close()
 
-    print(f"\n{'=' * 60}")
+    print()
     if stderr:
         print(stderr, file=sys.stderr, end="")
     return prev_text

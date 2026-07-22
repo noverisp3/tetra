@@ -159,7 +159,7 @@ def main():
     if late_loss < early_loss:
         print("\n[PASS] Loss decreased - STE + ternary quantization working!")
     else:
-        print("\n[WARN] Loss did not decrease - may need hyperparameter tuning")
+        print("\nWarning: Loss did not decrease - may need hyperparameter tuning")
 
     print("\n" + "=" * 60)
     print("Prototype test complete!")

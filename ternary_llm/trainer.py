@@ -322,7 +322,7 @@ class TernaryTrainer:
         if not _HAS_PSUTIL:
             return
         ram_gb = psutil.Process().memory_info().rss / 1024**3
-        msg = f"  [MEM] {tag}: RAM={ram_gb:.1f}GB"
+        msg = f"  Memory ({tag}): RAM={ram_gb:.1f}GB"
         if self.device.type == "cuda":
             vram_gb = torch.cuda.memory_allocated() / 1024**3
             msg += f" VRAM={vram_gb:.1f}GB"
@@ -464,7 +464,7 @@ class TernaryTrainer:
                     and step > 0
                     and step % self.config.flip_every_n_steps == 0):
                     if self.config.debug:
-                        tqdm.write(f"  [TIME] opt={opt_time:.1f}s")
+                        tqdm.write(f"  Optimizer step: {opt_time:.1f}s")
                     self.log_mem("before apply_bit_flips")
                     flip_t0 = time.perf_counter()
                     self.model.apply_bit_flips()
@@ -473,7 +473,7 @@ class TernaryTrainer:
                     if self.config.debug:
                         tqdm.write(f"  [TIME] flip={flip_time:.1f}s")
                 elif self.config.debug:
-                    tqdm.write(f"  [TIME] opt={opt_time:.1f}s")
+                    tqdm.write(f"  Optimizer step: {opt_time:.1f}s")
 
                 # LR scheduler
                 self.scheduler.step()
@@ -526,7 +526,7 @@ class TernaryTrainer:
             num_batches += 1
 
         avg_val_loss = total_loss / max(num_batches, 1)
-        print(f"  [VAL] Step {self.scheduler.step_count:5d} | Loss: {avg_val_loss:.4f}")
+        print(f"  Validation: step {self.scheduler.step_count}  loss={avg_val_loss:.4f}")
         return avg_val_loss
 
     def _quantize_optimizer_to_fp16(self, opt_state: dict) -> dict:
@@ -605,14 +605,14 @@ class TernaryTrainer:
         path = Path(self.config.save_dir) / f"checkpoint_{step:06d}.pt"
         torch.save(_to_cpu(checkpoint), path)
         size_mb = path.stat().st_size / 1024 / 1024
-        print(f"  [SAVE] Checkpoint saved to {path} ({size_mb:.0f} MB)")
+        print(f"  Checkpoint saved to {path} ({size_mb:.0f} MB)")
 
         # Cleanup: keep only 3 most recent checkpoints
         checkpoints = sorted(Path(self.config.save_dir).glob("checkpoint_*.pt"))
         while len(checkpoints) > 3:
             oldest = checkpoints.pop(0)
             oldest.unlink()
-            print(f"  [DEL] Removed old checkpoint: {oldest.name}")
+            print(f"  Removed old checkpoint: {oldest.name}")
 
         # Save training history at each checkpoint (crash-safe)
         history = {
@@ -692,15 +692,13 @@ class TernaryTrainer:
         self.train_log_steps = checkpoint.get("train_log_steps", [])
         self.val_losses = checkpoint.get("val_losses", [])
         self.learning_rates = checkpoint.get("learning_rates", [])
-        print(f"  [LOAD] Checkpoint loaded from {path} (step {checkpoint['step']})")
+        print(f"  Checkpoint loaded from {path} (step {checkpoint['step']})")
         print(f"         Restored {len(self.train_losses)} train losses, {len(self.val_losses)} val losses")
         return checkpoint["step"]
 
     def train(self, resume_step: int = 0):
         """Main training loop."""
-        print("=" * 60)
-        print("Ternary LLM Training")
-        print("=" * 60)
+        print("\nTernary LLM Training")
         print(f"Device: {self.device}")
         print(f"Dtype: {self.config.dtype}")
         print(f"Model params: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -710,7 +708,6 @@ class TernaryTrainer:
         print(f"Effective batch: {self.config.batch_size * self.config.gradient_accumulation_steps}")
         print(f"Max steps: {self.config.max_steps}")
         print(f"LR: {self.config.learning_rate} -> {self.config.min_lr}")
-        print("=" * 60)
         self._nan_step_count = 0
 
         # Validate first batch
