@@ -304,6 +304,7 @@ class TernaryTrainer:
 
         # Logging
         self.train_losses = []
+        self.train_log_steps = []  # step number at which each loss was logged
         self.val_losses = []
         self.learning_rates = []
         self._nan_step_count = 0
@@ -487,6 +488,7 @@ class TernaryTrainer:
                     lr = self.optimizer.param_groups[0]["lr"]
                     if math.isfinite(avg_loss):
                         self.train_losses.append(avg_loss)
+                        self.train_log_steps.append(step)
                     self.learning_rates.append(lr)
                     pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
                     total_loss = 0.0
@@ -583,6 +585,7 @@ class TernaryTrainer:
             "optimizer_state_dict": opt_state,
             "config": self.config.__dict__,
             "train_losses": self.train_losses,
+            "train_log_steps": self.train_log_steps,
             "val_losses": self.val_losses,
             "learning_rates": self.learning_rates,
             "optimizer_fp16": True,
@@ -614,6 +617,7 @@ class TernaryTrainer:
         # Save training history at each checkpoint (crash-safe)
         history = {
             "train_losses": self.train_losses,
+            "train_log_steps": self.train_log_steps,
             "val_losses": self.val_losses,
             "learning_rates": self.learning_rates,
         }
@@ -685,6 +689,7 @@ class TernaryTrainer:
             self.model.to(self.device)
         # Restore loss history
         self.train_losses = checkpoint.get("train_losses", [])
+        self.train_log_steps = checkpoint.get("train_log_steps", [])
         self.val_losses = checkpoint.get("val_losses", [])
         self.learning_rates = checkpoint.get("learning_rates", [])
         print(f"  [LOAD] Checkpoint loaded from {path} (step {checkpoint['step']})")
@@ -753,6 +758,7 @@ class TernaryTrainer:
         # Save training history
         history = {
             "train_losses": self.train_losses,
+            "train_log_steps": self.train_log_steps,
             "val_losses": self.val_losses,
             "learning_rates": self.learning_rates,
         }

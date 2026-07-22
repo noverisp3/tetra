@@ -29,6 +29,64 @@ PRESETS = {
 }
 
 
+def export_graph(trainer, save_dir):
+    """Export training loss/learning-rate plot using logged history."""
+    if not trainer.train_losses:
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("  [GRAPH] matplotlib not installed, skipping")
+        return
+
+    steps = trainer.train_log_steps or list(range(1, len(trainer.train_losses) + 1))
+    losses = np.array(trainer.train_losses)
+
+    # EMA smoothing (alpha=0.85)
+    def smooth(y, alpha=0.85):
+        s = np.copy(y)
+        for i in range(1, len(s)):
+            s[i] = alpha * s[i - 1] + (1 - alpha) * s[i]
+        return s
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: Training Loss
+    ax = axes[0]
+    ax.plot(steps, losses, color="#b0c4de", linewidth=1, alpha=0.5, label="Raw")
+    ax.plot(steps, smooth(losses), color="#4a90d9", linewidth=2, label="Smoothed")
+    if trainer.val_losses:
+        val_steps = trainer.train_log_steps or list(range(1, len(trainer.train_losses) + 1))
+        val_idx = np.linspace(0, len(steps) - 1, len(trainer.val_losses), dtype=int)
+        ax.plot(np.array(steps)[val_idx], trainer.val_losses,
+                color="#e74c3c", linewidth=2, marker="o", markersize=4, label="Val")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training & Validation Loss")
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+
+    # Right: Learning Rate
+    ax = axes[1]
+    lr = trainer.learning_rates
+    if lr:
+        lr_steps = steps[:len(lr)] if len(lr) <= len(steps) else list(range(1, len(lr) + 1))
+        ax.plot(lr_steps, lr, color="#e67e22", linewidth=2)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Learning Rate")
+        ax.set_title("Learning Rate Schedule")
+        ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    graph_path = Path(save_dir) / "loss_plot.png"
+    plt.savefig(graph_path, dpi=150)
+    plt.close()
+    print(f"  [GRAPH] Saved to {graph_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Tetra")
     parser.add_argument("--preset", type=str, default=None, choices=["tiny", "medium", "large", "500m"],
@@ -275,37 +333,13 @@ def main():
         print("\n\n  [SIGINT] Training interrupted, saving checkpoint...")
         step = trainer.scheduler.step_count
         trainer.save_checkpoint(step)
+        if args.graph:
+            export_graph(trainer, config.save_dir)
         print("  [SIGINT] Checkpoint saved. Exiting.")
         sys.exit(130)
 
-    # Export training loss graph
-    if args.graph and trainer.train_losses:
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            steps = list(range(1, len(trainer.train_losses) + 1))
-            plt.figure(figsize=(12, 5))
-            plt.subplot(1, 2, 1)
-            plt.plot(steps, trainer.train_losses, color="#4a90d9", linewidth=1.5)
-            plt.xlabel("Step")
-            plt.ylabel("Loss")
-            plt.title("Training Loss")
-            plt.grid(alpha=0.3)
-            if trainer.learning_rates:
-                plt.subplot(1, 2, 2)
-                plt.plot(steps, trainer.learning_rates, color="#e67e22", linewidth=1.5)
-                plt.xlabel("Step")
-                plt.ylabel("LR")
-                plt.title("Learning Rate")
-                plt.grid(alpha=0.3)
-            plt.tight_layout()
-            graph_path = Path(config.save_dir) / "loss_plot.png"
-            plt.savefig(graph_path, dpi=150)
-            plt.close()
-            print(f"  [GRAPH] Saved to {graph_path}")
-        except ImportError:
-            print("  [GRAPH] matplotlib not installed, skipping")
+    if args.graph:
+        export_graph(trainer, config.save_dir)
 
     # Generate sample
     print("\n[Sample Generation]")
