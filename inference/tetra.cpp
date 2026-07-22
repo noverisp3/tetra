@@ -1,12 +1,6 @@
-// Tetra — C++ Inference Runner
-// Loads tetra_model.bin and generates text.
-//
-// Usage:
-//   tetra.exe <model.bin> <token_ids> [max_new_tokens] [temperature] [top_k] [top_p]
+// Usage: tetra.exe <model.bin> <token_ids> [max_new_tokens] [temperature] [top_k] [top_p]
 //   tetra.exe tetra_model.bin "373,378,67,338" 100 0.8 50 0.9
-//
-// Special tokens: 1=BOS, 2=EOS (auto-stops generation on EOS)
-// Streaming: token IDs are printed as generated (stderr for timing)
+// Special tokens: 1=BOS, 2=EOS (auto-stops on EOS)
 
 #include "tetra.h"
 #include <cstdio>
@@ -51,9 +45,6 @@ int main(int argc, char** argv) {
     tetra::KVCache cache;
     cache.init(model.header.num_layers, model.header.max_seq_len, model.header.hidden_dim);
 
-    // Model was trained without BOS — do NOT auto-prepend
-    // User provides raw token IDs directly
-
     fprintf(stderr, "Prompt tokens: ");
     for (int t : tokens) fprintf(stderr, "%d ", t);
     fprintf(stderr, "\n");
@@ -65,7 +56,6 @@ int main(int argc, char** argv) {
     double prefill_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
     fprintf(stderr, "Prefill: %.1f ms (%d tokens)\n", prefill_ms, (int)tokens.size());
 
-    // Generate: feed only newly generated tokens (logits already from prefill for step 0)
     srand((unsigned int)time(NULL));
     auto t4 = std::chrono::high_resolution_clock::now();
     int generated = 0;
@@ -76,16 +66,14 @@ int main(int argc, char** argv) {
             next_token = model.header.vocab_size - 1;
         }
 
-        // Stream: print token ID immediately (one per line for Python bridge)
         printf("%d\n", next_token);
         fflush(stdout);
 
         tokens.push_back(next_token);
         generated++;
 
-        if (next_token == 2) stopped = true;  // EOS = 2
+        if (next_token == 2) stopped = true;
 
-        // Forward only the new token to get logits for next step
         if (!stopped && i < max_new - 1) {
             std::vector<int> single = {next_token};
             logits = tetra::forward(model, single, cache);
@@ -98,7 +86,6 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Generate: %.1f ms (%d tokens, %.1f tok/s)%s\n",
             gen_ms, generated, tok_per_sec, stopped ? " [EOS]" : "");
 
-    // Print all token IDs for Python detokenization
     printf("Output token IDs: ");
     for (size_t i = 0; i < tokens.size(); i++) {
         if (i > 0) printf(",");

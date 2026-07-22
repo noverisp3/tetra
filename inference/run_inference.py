@@ -1,11 +1,4 @@
-"""Tetra Inference Runner — bridges custom BPE tokenizer with C++ engine.
-
-Streams generated text in real-time as tokens arrive from the C++ binary.
-
-Usage:
-    python inference/run_inference.py <model.bin> "Hello"
-    python inference/run_inference.py <model.bin> "Hello" --max-tokens 200 --temp 0.8 --top-k 50 --top-p 0.9
-"""
+"""Tetra Inference Runner."""
 import sys
 import subprocess
 import argparse

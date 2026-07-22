@@ -1,27 +1,9 @@
 #pragma once
-// Tetra — Pure Ternary LLM Inference Engine
-// Ternary weights {-1, 0, +1} with LUT-based integer matmul.
-//
-// Matmul Strategy (T-MAC style):
-//   1. Quantize input activations to int8 (no weight dequantization needed)
-//   2. Precompute LUT per group of 4 activations (256-entry int16 table)
-//   3. Use packed 2-bit ternary weights as direct LUT index → int32 accumulate
-//   4. Single float multiply per output element: out = (float)acc * x_scale * alpha
-//   This eliminates ALL float multiply-adds during matmul — pure integer/bits.
-//
-// SIMD dispatch priority:
-//   AVX10 → AVX-512 → AVX2+FMA → scalar (detected at compile time)
-//   Note: LUT precompute can benefit from SIMD, but lookup phase is pure int.
-//
-// Build:
-//   build.bat          → scalar fallback
-//   build.bat avx2     → AVX2+FMA
-//   build.bat avx512   → AVX-512
-//   build.bat avx10    → AVX10
-//
+// Tetra — C++ inference engine
+// Build: build.bat [avx2|avx10|avx512] (scalar if no arg)
 // Binary Format v2:
-//   Header (64B): magic "TETR", version, model dims, param counts
-//   Ternary weights: name, shape, alpha (absmean), 2-bit packed data
+//   Header (64B): magic, version, dims, param counts
+//   Ternary weights: name, shape, alpha, 2-bit packed data
 //   FP32 weights: embeddings, norms (lm_head tied to embedding)
 
 #include <cstdint>
@@ -50,24 +32,14 @@ namespace tetra {
 
 static constexpr int TETRA_MAX_COLS = 8192;
 
-// Ternary weight format
-// Stores 2-bit packed ternary data + pre-dequantized float weights.
-// Float weights precomputed at load time for fast SIMD dot product.
 struct TernaryWeightXNOR {
-    std::vector<uint8_t> packed;      // 2-bit packed ternary data (4 weights/byte)
-    std::vector<float> floats;        // pre-dequantized {-1, 0, +1} as float
+    std::vector<uint8_t> packed;
+    std::vector<float> floats;
     int rows, cols;
-    float alpha;        // per-matrix absmean scale factor from training
+    float alpha;
 };
 
-
-
-// ── Float SIMD matmul (precomputed weights) ──
-// Weights dequantized to float at load time, reused across all tokens.
-// Uses AVX-512 FMA for max throughput (≈ 890 tok/s on 500m model).
-
 // SIMD dot product: sum(x[i] * w[i]) for i in [0, cols)
-// Detection priority: AVX10 → AVX-512 → AVX2+FMA → scalar
 #if defined(__AVX10_1__) || defined(__AVX10__)
 static inline float dot_product_simd(const float* a, const float* b, int n) {
     __m512 vsum = _mm512_setzero_ps();
@@ -192,7 +164,7 @@ static void ternary_matmul_auto(
     const float* x, const TernaryWeightXNOR& w, float* out,
     float x_absmean, bool decode
 ) {
-    (void)x_absmean;  // unused in float path
+    (void)x_absmean;
     if (decode) ternary_matmul_precomputed_decode(x, w, out);
     else        ternary_matmul_precomputed(x, w, out);
 }
@@ -209,21 +181,13 @@ struct ModelHeader {
     uint64_t ternary_params, fp32_params;
 };
 
-
-
-
-
-
-
 // Decode FP32 matmul with prefetch
 // Used for LM head (vocab projection) during single-token decode.
 static void matmul_fp32_decode(const float* x, const float* w, float* out,
                                 int rows, int cols) {
     for (int r = 0; r < rows; r++) {
-        // Prefetch 3 rows ahead (≈3 × cols × 4 bytes)
-        if (r + 3 < rows) {
+        if (r + 3 < rows)
             TETRA_PREFETCH(w + (r + 3) * cols);
-        }
         out[r] = dot_product_simd(x, w + r * cols, cols);
     }
 }
@@ -304,8 +268,6 @@ static Model load_model(const char* path) {
     fprintf(stderr, "Tetra: %d layers, hidden=%d, heads=%d, ffn=%d, vocab=%d, seq=%d\n",
             h.num_layers, h.hidden_dim, h.num_heads, h.ffn_dim, h.vocab_size, h.max_seq_len);
 
-    // Read ternary weights → convert to XNOR bitmasks
-    // 6 per layer: q_proj, k_proj, v_proj, o_proj, gate_up_proj, down_proj
     for (uint32_t layer = 0; layer < h.num_layers; layer++) {
         for (int t = 0; t < 6; t++) {
             uint32_t name_len;
@@ -317,7 +279,6 @@ static Model load_model(const char* path) {
             fread(&rows, 2, 1, f);
             fread(&cols, 2, 1, f);
 
-            // v2: read per-matrix alpha scale factor
             float alpha = 1.0f;
             if (h.version >= 2) {
                 fread(&alpha, 4, 1, f);
@@ -402,7 +363,6 @@ static std::vector<float> forward(
     int pos = cache.pos;
 
     if (decode) {
-        // ── Decode path (single token) ──
         std::vector<float> x(H), q(H), k(H), v(H);
         std::vector<float> attn_scores(model.header.max_seq_len);
         std::vector<float> attn_out(H);
@@ -481,7 +441,6 @@ static std::vector<float> forward(
         return logits;
     }
 
-    // ── Batch prefill path (seq_len > 1) ──
     std::vector<float> x(seq_len * H);
 
     // Embedding for all positions
@@ -583,15 +542,12 @@ static std::vector<float> forward(
     return logits;
 }
 
-// Sampling matching PyTorch order: temp scale → top-k (set to -inf) → softmax → top-p → sample
 static int sample(const std::vector<float>& logits, float temperature, int top_k, float top_p) {
     int n = (int)logits.size();
     std::vector<float> scaled(n);
 
-    // Step 1: Temperature scaling (matching PyTorch: logits /= temperature)
     for (int i = 0; i < n; i++) scaled[i] = logits[i] / temperature;
 
-    // Step 2: Top-k — set tokens below threshold to -inf (matching PyTorch)
     if (top_k > 0 && top_k < n) {
         std::vector<int> idx(n);
         std::iota(idx.begin(), idx.end(), 0);
@@ -602,7 +558,6 @@ static int sample(const std::vector<float>& logits, float temperature, int top_k
             if (scaled[i] < threshold) scaled[i] = -INFINITY;
     }
 
-    // Step 3: Softmax (matching PyTorch: F.softmax(logits, dim=-1))
     float mx = *std::max_element(scaled.begin(), scaled.end());
     float sum = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -611,7 +566,6 @@ static int sample(const std::vector<float>& logits, float temperature, int top_k
     }
     if (sum > 0) for (int i = 0; i < n; i++) scaled[i] /= sum;
 
-    // Step 4: Top-p (nucleus) — zero out tokens below cumprob threshold
     if (top_p > 0.0f && top_p < 1.0f) {
         std::vector<int> idx(n);
         std::iota(idx.begin(), idx.end(), 0);
@@ -627,7 +581,6 @@ static int sample(const std::vector<float>& logits, float temperature, int top_k
         if (sum > 0) for (int i = 0; i < n; i++) scaled[i] /= sum;
     }
 
-    // Step 5: Sample from probability distribution
     float r = (float)rand() / RAND_MAX;
     float cum = 0.0f;
     for (int i = 0; i < n; i++) { cum += scaled[i]; if (r < cum) return i; }

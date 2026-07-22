@@ -1,44 +1,7 @@
-"""Export Tetra model weights to binary format for C++ inference.
+"""Export model weights to binary format for C++ inference.
 
-Weight encoding (2 bits per ternary weight):
-    00 = -1
-    01 =  0
-    10 = +1
-
-Pack 4 weights per byte, MSB first.
-
-Binary file format (v2):
-    Header (64 bytes):
-        [0:4]   magic: "TETR" (4 bytes)
-        [4:8]   version: uint32 = 2
-        [8:12]  vocab_size: uint32
-        [12:16] hidden_dim: uint32
-        [16:20] num_layers: uint32
-        [20:24] num_heads: uint32
-        [24:28] ffn_dim: uint32
-        [28:32] max_seq_len: uint32
-        [32:40] num_ternary_params: uint64
-        [40:48] num_fp32_params: uint64 (embeddings + lm_head + norms)
-        [48:64] reserved
-
-    Sections (sequential):
-        For each ternary weight:
-            [4 bytes] name_length (uint32)
-            [N bytes] name (utf-8)
-            [4 bytes] rows (uint32)
-            [4 bytes] cols (uint32)
-            [4 bytes] alpha (float32) — absmean scale factor α = mean(|W_latent|)
-            [ceil(rows*cols/4) bytes] packed ternary weights
-
-        For each fp32 weight:
-            [4 bytes] name_length (uint32)
-            [N bytes] name (utf-8)
-            [4 bytes] rows (uint32)
-            [4 bytes] cols (uint32)
-            [rows*cols*4 bytes] fp32 weights (little-endian)
-
-Usage:
-    python inference/export_model.py checkpoints/checkpoint_010000.pt
+2 bits per ternary weight, 4 weights per byte (MSB first).
+Binary format v2: header (64 bytes) + ternary sections + fp32 sections.
 """
 import sys
 import struct
@@ -53,7 +16,6 @@ from ternary_llm.transformer import TernaryTransformerModel
 
 TERNARY_ENCODING = {-1: 0b00, 0: 0b01, 1: 0b10}
 
-# Which parameters are ternary vs fp32
 TERNARY_PARAM_NAMES = [
     "q_proj", "k_proj", "v_proj", "o_proj",   # attention
     "gate_up_proj", "down_proj",               # ffn
@@ -76,7 +38,6 @@ def pack_ternary(weights: torch.Tensor) -> bytes:
     for i in range(n):
         val = int(flat[i])
         if val not in TERNARY_ENCODING:
-            # Clamp to nearest ternary value
             if val < 0:
                 val = -1
             elif val > 0:
@@ -85,7 +46,7 @@ def pack_ternary(weights: torch.Tensor) -> bytes:
                 val = 0
         encoded = TERNARY_ENCODING[val]
         byte_idx = i // 4
-        bit_shift = 6 - (i % 4) * 2  # MSB first
+        bit_shift = 6 - (i % 4) * 2
         packed[byte_idx] |= encoded << bit_shift
 
     return packed.tobytes()
@@ -126,8 +87,8 @@ def export_model(model: TernaryTransformerModel, output_path: str):
 
         header = struct.pack(
             "<4sIIIIIIIQQ16s",
-            b"TETR",              # magic
-            2,                     # version (v2: adds per-matrix alpha scale)
+            b"TETR",
+            2,
             vocab_size,
             hidden_dim,
             num_layers,
@@ -136,7 +97,7 @@ def export_model(model: TernaryTransformerModel, output_path: str):
             max_seq_len,
             ternary_count,
             fp32_count,
-            b"\x00" * 16,         # reserved
+            b"\x00" * 16,
         )
         f.write(header)
 
@@ -151,7 +112,7 @@ def export_model(model: TernaryTransformerModel, output_path: str):
             w_ternary = TernaryQuantizer.apply(param.data)
             w_ternary = w_ternary.to(torch.int8)
 
-            # Compute alpha = mean(|W_latent|) — absmean scale factor
+            # alpha = mean(|W_latent|)
             alpha = param.data.abs().mean().item()
 
             shape = list(w_ternary.shape)
@@ -160,7 +121,7 @@ def export_model(model: TernaryTransformerModel, output_path: str):
             f.write(struct.pack("<I", len(name_bytes)))
             f.write(name_bytes)
             f.write(struct.pack("<HH", shape[0], shape[1]))
-            f.write(struct.pack("<f", alpha))  # v2: per-matrix alpha
+            f.write(struct.pack("<f", alpha))
             f.write(pack_ternary(w_ternary))
 
         # Write fp32 weights (skip lm_head — tied to token_embedding)
@@ -182,7 +143,6 @@ def export_model(model: TernaryTransformerModel, output_path: str):
             name_bytes = name.encode("utf-8")
             f.write(struct.pack("<I", len(name_bytes)))
             f.write(name_bytes)
-            # ndim + shape (up to 4 dims, padded with 1s)
             padded = shape + [1] * (4 - len(shape))
             f.write(struct.pack("<B", ndim))
             f.write(struct.pack("<4I", *padded))
