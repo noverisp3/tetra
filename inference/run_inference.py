@@ -19,12 +19,11 @@ EOS_TOKEN = 2
 
 
 def find_exe() -> Path | None:
-    exe = Path(__file__).parent / "tetra.exe"
-    if exe.exists():
-        return exe
-    exe = Path(__file__).parent / "tetra"
-    if exe.exists():
-        return exe
+    # Try optimized builds first, then scalar fallback
+    for name in ["tetra_avx2.exe", "tetra_avx10.exe", "tetra_avx512.exe", "tetra.exe", "tetra"]:
+        exe = Path(__file__).parent / name
+        if exe.exists():
+            return exe
     return None
 
 
