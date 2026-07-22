@@ -15,6 +15,7 @@ data/*.txt
 data/*.bin
 data/*.json
 data_local/
+tinydata/
 
 # Checkpoints (large, regenerate)
 checkpoints/
