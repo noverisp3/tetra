@@ -102,7 +102,7 @@ Trained for 5,000 steps on Intel Iris Xe (DirectML) in ~3 hours:
 </p>
 
 Sample output (PyTorch generate):
-> "Hello , Tim to find food the ball like . 'I can help he' . You mom said . He is . We's . You you !"
+> "Hello , Tim to find food the ball like . " I can help he . You mom said . He is . We ' s . You you !" Sue ' s room and a tree away . She is . " Let . He likes . She says . It is . She had and said need the bear and they played too . They were best , Tim and she were very happy on the bird . They went the ground , Tom smiled and laughed away him they could . The cat . The bird ' s a nice . They looked . They played all lived . But then it . <| endoftext |> Once upon a time , there was a little boy named Tim . The truck was very the rock . One day , she saw what . The boat and said , she could , " Thank said , Tim . He found it !" The bird to play with his mom , " Can you something and said , " Maybe to play . The end . She saw a big , he wanted to find to his family the hole"
 
 C++ inference (exported binary, AVX2, 438 tok/s):
 > "Once upon a time , there was a little girl named Tim . The moral she saw . The man it to play with it was sad it . The . The little bird his . It was a loud . It was happy and put it . The . The moral to play . She saw a big fish and said , but , 'No will , I't worry's mine to me , but you can , 'I'm't worry.' They all played . Lily and he did not know and ran ."
