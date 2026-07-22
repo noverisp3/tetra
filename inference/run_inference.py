@@ -51,14 +51,12 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
 
     generated = ""
-
     for line in proc.stdout:
         line = line.strip()
         if not line:
             continue
         if line.startswith("Output token IDs:"):
             break
-        # Parse token IDs (supports one-per-line or space-separated)
         parts = line.split()
         for part in parts:
             try:
@@ -75,16 +73,14 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
         break
 
     proc.stdout.close()
-    print()
     proc.wait()
 
     stderr = proc.stderr.read()
     proc.stderr.close()
 
+    print(f"\n{'=' * 60}")
     if stderr:
         print(stderr, file=sys.stderr, end="")
-
-    print(f"{'=' * 60}")
     return generated
 
 
