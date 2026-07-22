@@ -36,7 +36,7 @@ class HybridBlock(nn.Module):
         from .ffn import StochasticFFN
         self.ffn = StochasticFFN(hidden_dim, ffn_dim, dropout, scale, threshold, int8=int8)
 
-    def forward(self, x, mask=None):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         r = x
         x = self.attn_norm(x)
         x = self.attn_topk(x)
@@ -109,7 +109,9 @@ class HybridTransformerModel(nn.Module):
         self.lm_head.weight = self.token_embedding.weight
         return self
 
-    def forward(self, input_ids, targets=None, past_key_values=None, activation_dtype=None):
+    def forward(self, input_ids: torch.Tensor, targets: torch.Tensor | None = None,
+                past_key_values: list | None = None, activation_dtype: torch.dtype | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor | None, None]:
         B, T = input_ids.shape
         input_ids = input_ids.clamp(0, self.token_embedding.num_embeddings - 1)
         pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
@@ -131,7 +133,8 @@ class HybridTransformerModel(nn.Module):
         return logits, loss, None
 
     @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens=100, temperature=1.0, top_k=None):
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 100,
+                 temperature: float = 1.0, top_k: int | None = None) -> torch.Tensor:
         for _ in range(max_new_tokens):
             idx = input_ids if input_ids.size(1) <= self.max_seq_len else input_ids[:, -self.max_seq_len:]
             logits, _, _ = self(idx)

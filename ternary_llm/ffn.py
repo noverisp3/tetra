@@ -64,7 +64,7 @@ class StochasticFFN(nn.Module):
         self.down_proj = StochasticTernaryLinear(ffn_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(x)
         up = self.up_proj(x)
         hidden = F.silu(gate).float() * up.float()

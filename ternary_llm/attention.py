@@ -103,7 +103,7 @@ class StochasticMultiHeadAttention(nn.Module):
         self.o_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8)
         self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, mask=None):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         B, T, C = x.shape
         q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)

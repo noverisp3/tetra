@@ -143,6 +143,44 @@ def main():
                         help="Training dtype: float32 (default), float16, or bfloat16 (CUDA)")
     args = parser.parse_args()
 
+    # Input validation
+    if args.steps is not None and args.steps < 1:
+        print("  ERROR: --steps must be >= 1")
+        sys.exit(1)
+    if args.lr is not None and args.lr <= 0:
+        print("  ERROR: --lr must be positive")
+        sys.exit(1)
+    if args.batch_size is not None and args.batch_size < 1:
+        print("  ERROR: --batch-size must be >= 1")
+        sys.exit(1)
+    if args.grad_accum is not None and args.grad_accum < 1:
+        print("  ERROR: --grad-accum must be >= 1")
+        sys.exit(1)
+    if args.block_size is not None and args.block_size < 16:
+        print("  ERROR: --block-size must be >= 16")
+        sys.exit(1)
+    if args.hidden_dim is not None and args.hidden_dim < 64:
+        print("  ERROR: --hidden-dim must be >= 64")
+        sys.exit(1)
+    if args.num_layers is not None and args.num_layers < 1:
+        print("  ERROR: --num-layers must be >= 1")
+        sys.exit(1)
+    if args.num_heads is not None and args.num_heads < 1:
+        print("  ERROR: --num-heads must be >= 1")
+        sys.exit(1)
+    if args.ffn_dim is not None and args.ffn_dim < 64:
+        print("  ERROR: --ffn-dim must be >= 64")
+        sys.exit(1)
+    if args.ternary_scale is not None and args.ternary_scale <= 0:
+        print("  ERROR: --ternary-scale must be positive")
+        sys.exit(1)
+    if args.topk is not None and not (0 < args.topk <= 1):
+        print("  ERROR: --topk must be in (0, 1]")
+        sys.exit(1)
+    if args.num_workers is not None and args.num_workers < 0:
+        print("  ERROR: --num-workers must be >= 0")
+        sys.exit(1)
+
     config = TrainingConfig()
 
     # Apply preset

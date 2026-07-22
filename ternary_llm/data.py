@@ -1,4 +1,4 @@
-﻿"""Data pipeline for Tetra -- tokenizer, dataset, dataloaders.
+"""Data pipeline for Tetra -- tokenizer, dataset, dataloaders.
 
 Uses a custom BPE tokenizer trained on TinyStories (not GPT-2/tiktoken).
 Tokenizer is stored in tokenizer/tetra_tokenizer.json.
@@ -37,8 +37,8 @@ def get_tokenizer(tokenizer_dir="tokenizer"):
             tok = GPT2Tokenizer.from_pretrained("gpt2")
             _tokenizer_cache = tok
             return tok
-        except Exception:
-            pass
+        except ImportError:
+            print("  Warning: transformers not installed, falling through to custom tokenizer")
 
     raise FileNotFoundError(
         f"Tokenizer not found at {tok_path}.\n"

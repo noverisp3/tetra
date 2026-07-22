@@ -54,7 +54,7 @@ class TernarySSMBlock(nn.Module):
             inner_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, D)
         residual = x
         x = self.norm(x)
