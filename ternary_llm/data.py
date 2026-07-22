@@ -3,6 +3,12 @@
 Uses a custom BPE tokenizer trained on TinyStories (not GPT-2/tiktoken).
 Tokenizer is stored in tokenizer/tetra_tokenizer.json.
 """
+__all__ = [
+    "get_tokenizer", "TokenizerWrapper", "get_tokenizer_compat",
+    "download_and_tokenize", "ChunkedDataset", "create_dataloaders",
+    "MultiSourceChunkedDataset", "create_multi_source_dataloaders",
+]
+
 import json
 import bisect
 import numpy as np
@@ -101,6 +107,17 @@ def get_tokenizer_compat(tokenizer_dir="tokenizer"):
 # Data Download & Tokenize
 
 def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stories=None):
+    """Download TinyStories dataset, tokenize, and cache as .bin + metadata.json.
+
+    Args:
+        cache_dir: Directory for data storage (default: data/)
+        tokenizer_dir: Directory containing tetra_tokenizer.json (default: tokenizer/)
+        max_stories: Limit number of stories to process (default: all)
+
+    Returns:
+        tokens: numpy memmap of uint16 token ids
+        metadata: dict with vocab_size, total_tokens
+    """
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
 
@@ -135,13 +152,19 @@ def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stori
         print("Downloading TinyStoriesV2-GPT4-train.txt...")
         import requests
         url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt"
-        r = requests.get(url, stream=True)
+        r = requests.get(url, stream=True, timeout=(5, 30))
         r.raise_for_status()
+        expected_size = int(r.headers.get("Content-Length", 0))
         txt_path = cache_path / "TinyStoriesV2-GPT4-train.txt"
+        downloaded = 0
         with open(txt_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
-        print(f"  Downloaded to {txt_path} ({txt_path.stat().st_size / 1e6:.0f} MB)")
+                downloaded += len(chunk)
+        actual_mb = txt_path.stat().st_size / 1e6
+        if expected_size and abs(downloaded - expected_size) > 1024:
+            print(f"  Warning: downloaded {downloaded} bytes, expected {expected_size}")
+        print(f"  Downloaded to {txt_path} ({actual_mb:.0f} MB)")
 
     print(f"Reading {txt_path} ({txt_path.stat().st_size / 1e6:.0f} MB)...")
     with open(txt_path, "r", encoding="utf-8") as f:
@@ -183,6 +206,7 @@ def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stori
 # Dataset
 
 class ChunkedDataset(Dataset):
+    """Non-overlapping chunks of tokens for fast shuffling."""
     """Non-overlapping chunks of tokens. Much faster to shuffle than sliding window."""
     def __init__(self, tokens, block_size):
         n = len(tokens)
@@ -207,6 +231,19 @@ class ChunkedDataset(Dataset):
 
 
 def create_dataloaders(tokens, block_size=128, batch_size=8, val_split=0.05, num_workers=0, pin_memory=False):
+    """Create train/validation DataLoaders from token array.
+
+    Args:
+        tokens: uint16 array of token ids
+        block_size: context window per sample
+        batch_size: samples per batch
+        val_split: fraction of tokens for validation
+        num_workers: DataLoader worker count
+        pin_memory: pin memory for GPU transfer
+
+    Returns:
+        train_loader, val_loader
+    """
     split_idx = int(len(tokens) * (1 - val_split))
     train_ds = ChunkedDataset(tokens[:split_idx], block_size)
     val_ds = ChunkedDataset(tokens[split_idx:], block_size)
@@ -227,6 +264,7 @@ def create_dataloaders(tokens, block_size=128, batch_size=8, val_split=0.05, num
 # Multi-Source Dataset
 
 class MultiSourceChunkedDataset(Dataset):
+    """Multi-source chunked dataset with ratio-based sampling."""
     """Reads multiple .bin chunk files from different sources,
     samples according to configured ratios.
 
@@ -337,6 +375,19 @@ class MultiSourceChunkedDataset(Dataset):
 
 
 def create_multi_source_dataloaders(data_dir, block_size=128, batch_size=8, val_split=0.05, num_workers=0, pin_memory=False):
+    """Create train/val dataloaders from multi-source chunks (manifest.json format).
+
+    Args:
+        data_dir: directory with manifest.json and source_*.bin files
+        block_size: context window per sample
+        batch_size: samples per batch
+        val_split: fraction of blocks for validation
+        num_workers: DataLoader worker count
+        pin_memory: pin memory for GPU transfer
+
+    Returns:
+        train_loader, val_loader
+    """
     """Create train/val dataloaders from multi-source chunks."""
     ds = MultiSourceChunkedDataset(data_dir, block_size, val_split=val_split)
     n_val = ds.total_chunks - ds.val_start

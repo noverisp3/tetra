@@ -1,4 +1,8 @@
 import torch
+__all__ = [
+    "TernaryFFN", "StochasticFFN",
+]
+
 import torch.nn as nn
 import torch.nn.functional as F
 from .layers import TernaryLinear

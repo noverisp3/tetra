@@ -4,6 +4,8 @@ Int8Quantizer provides symmetric INT8 fake-quantization with STE backward.
 Moved from quantization.py since it is not called by the model.
 Kept as reference for possible future INT8 activation quantization experiments.
 """
+__all__ = ["Int8Quantizer", "int8_quantize"]
+
 
 import torch
 

@@ -24,7 +24,7 @@ from ternary_llm.data import get_tokenizer_compat
 
 
 # Config
-CHUNK_TOKENS = 25_000_000  # 25M tokens per chunk file
+CHUNK_TOKENS = 25_000_000
 
 SOURCES = {
     "fineweb": {
@@ -183,9 +183,14 @@ def main():
     parser.add_argument("--tokenizer-dir", type=str, default="tokenizer")
     parser.add_argument("--test", action="store_true",
                         help="Quick test: prepare only 1M tokens")
+    parser.add_argument("--chunk-tokens", type=int, default=25_000_000,
+                        help="Tokens per chunk file (default: 25M)")
     parser.add_argument("--sources", nargs="+", default=["fineweb", "cosmopedia", "orca"],
                         help="Which sources to prepare")
     args = parser.parse_args()
+
+    global CHUNK_TOKENS
+    CHUNK_TOKENS = args.chunk_tokens
 
     if args.test:
         args.target_tokens = 1_000_000
