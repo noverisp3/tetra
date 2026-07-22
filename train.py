@@ -269,7 +269,14 @@ def main():
     else:
         start_step = 0
 
-    trainer.train(resume_step=start_step)
+    try:
+        trainer.train(resume_step=start_step)
+    except KeyboardInterrupt:
+        print("\n\n  [SIGINT] Training interrupted, saving checkpoint...")
+        step = trainer.scheduler.step_count
+        trainer.save_checkpoint(step)
+        print("  [SIGINT] Checkpoint saved. Exiting.")
+        sys.exit(130)
 
     # Export training loss graph
     if args.graph and trainer.train_losses:
