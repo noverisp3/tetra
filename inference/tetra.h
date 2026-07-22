@@ -382,7 +382,7 @@ struct KVCache {
     }
 };
 
-// Forward pass
+// Forward pass — supports both decode (single token) and batch prefill (multiple tokens)
 static std::vector<float> forward(
     const Model& model,
     const std::vector<int>& tokens,
@@ -395,130 +395,191 @@ static std::vector<float> forward(
     int FFN = model.header.ffn_dim;
     int V  = model.header.vocab_size;
     int seq_len = (int)tokens.size();
-    bool decode = (seq_len == 1);  // Single-token = decode phase
-
-    std::vector<float> x(H), q(H), k(H), v(H);
-    std::vector<float> attn_scores(model.header.max_seq_len);
-    std::vector<float> attn_out(H);
-    std::vector<float> gate(FFN), up(FFN), hidden(FFN), ffn_out(H);
+    bool decode = (seq_len == 1);
 
     const float* tok_emb = model.fw_ptr("token_embedding.weight");
     const float* pos_emb = model.fw_ptr("pos_embedding.weight");
-
-    // Token + Position Embedding
-    // Use cache.pos for position (not tokens.size()-1) because after prefill,
-    // cache.pos may exceed the tokens vector size.
     int pos = cache.pos;
-    for (int i = 0; i < H; i++) {
-        x[i] = tok_emb[tokens.back() * H + i]
-              + pos_emb[pos * H + i];
-    }
 
-    // Transformer layers
-    for (int l = 0; l < L; l++) {
-        char prefix[64];
-        snprintf(prefix, sizeof(prefix), "layers.%d.", l);
-
-        // Attention (pre-norm)
-        std::vector<float> normed = x;
-        rmsnorm(normed.data(), model.fw_ptr(std::string(prefix) + "attn_norm.weight"), H);
-
-        // Compute absmean of normed input (scale factor for XNOR)
-        float x_scale = absmean(normed.data(), H);
-
-        std::string q_name = std::string(prefix) + "attn.q_proj.latent_weights";
-        std::string k_name = std::string(prefix) + "attn.k_proj.latent_weights";
-        std::string v_name = std::string(prefix) + "attn.v_proj.latent_weights";
-        std::string o_name = std::string(prefix) + "attn.o_proj.latent_weights";
-
-        // XNOR+popcount ternary projections
-        ternary_matmul_auto(normed.data(), model.tw(q_name), q.data(), x_scale, decode);
-        ternary_matmul_auto(normed.data(), model.tw(k_name), k.data(), x_scale, decode);
-        ternary_matmul_auto(normed.data(), model.tw(v_name), v.data(), x_scale, decode);
-
-        // Store K,V in cache
-        for (int i = 0; i < H; i++) {
-            cache.k_cache[l][pos * H + i] = k[i];
-            cache.v_cache[l][pos * H + i] = v[i];
-        }
-
-        // Multi-head attention (causal)
-        for (int head = 0; head < NH; head++) {
-            float scale = 1.0f / sqrtf((float)HD);
-            int actual_len = pos + 1;
-
-            // Attention scores: Q · K for each time step
-            const float* q_head = q.data() + head * HD;
-            for (int t = 0; t < actual_len; t++) {
-                attn_scores[t] = dot_product_simd(
-                    q_head,
-                    cache.k_cache[l].data() + t * H + head * HD,
-                    HD
-                ) * scale;
-            }
-            softmax(attn_scores.data(), actual_len);
-
-            // Attention output: weighted sum of V
-            for (int d = 0; d < HD; d++) {
-                float sum = 0.0f;
-                for (int t = 0; t < actual_len; t++) {
-                    sum += attn_scores[t] * cache.v_cache[l][t * H + head * HD + d];
-                }
-                attn_out[head * HD + d] = sum;
-            }
-        }
-
-        // Output projection
-        std::vector<float> proj_out(H);
-        float o_scale = absmean(attn_out.data(), H);
-        ternary_matmul_auto(attn_out.data(), model.tw(o_name), proj_out.data(), o_scale, decode);
-
-        for (int i = 0; i < H; i++) x[i] += proj_out[i];
-
-        // FFN (pre-norm)
-        std::vector<float> ffn_normed = x;
-        rmsnorm(ffn_normed.data(), model.fw_ptr(std::string(prefix) + "ffn_norm.weight"), H);
-
-        float ffn_scale = absmean(ffn_normed.data(), H);
-
-        std::string fused_name = std::string(prefix) + "ffn.gate_up_proj.latent_weights";
-        std::string down_name = std::string(prefix) + "ffn.down_proj.latent_weights";
-
-        // SwiGLU: fused gate+up projection (output is 2*FFN dim) → chunk
-        std::vector<float> fused(2 * FFN);
-        ternary_matmul_auto(ffn_normed.data(), model.tw(fused_name), fused.data(), ffn_scale, decode);
-        for (int i = 0; i < FFN; i++) {
-            gate[i] = fused[i];
-            up[i] = fused[FFN + i];
-        }
-
-        // SiLU(gate) * up
-        for (int i = 0; i < FFN; i++) hidden[i] = silu(gate[i]) * up[i];
-
-        // Down projection
-        float h_scale = absmean(hidden.data(), FFN);
-        ternary_matmul_auto(hidden.data(), model.tw(down_name), ffn_out.data(), h_scale, decode);
-
-        for (int i = 0; i < H; i++) x[i] += ffn_out[i];
-    }
-
-    // Final norm + LM head (tied to token_embedding)
-    rmsnorm(x.data(), model.fw_ptr("norm.weight"), H);
-
-    std::vector<float> logits(V);
     if (decode) {
-        // Decode: SIMD dot product with prefetch for each vocab entry
+        // ── Decode path (single token) ──
+        std::vector<float> x(H), q(H), k(H), v(H);
+        std::vector<float> attn_scores(model.header.max_seq_len);
+        std::vector<float> attn_out(H);
+        std::vector<float> gate(FFN), up(FFN), hidden(FFN), ffn_out(H);
+
+        for (int i = 0; i < H; i++)
+            x[i] = tok_emb[tokens.back() * H + i] + pos_emb[pos * H + i];
+
+        for (int l = 0; l < L; l++) {
+            char pfx[64];
+            snprintf(pfx, sizeof(pfx), "layers.%d.", l);
+
+            // Attention (pre-norm)
+            std::vector<float> normed = x;
+            rmsnorm(normed.data(), model.fw_ptr(std::string(pfx) + "attn_norm.weight"), H);
+            float x_scale = absmean(normed.data(), H);
+
+            std::string qn = std::string(pfx) + "attn.q_proj.latent_weights";
+            std::string kn = std::string(pfx) + "attn.k_proj.latent_weights";
+            std::string vn = std::string(pfx) + "attn.v_proj.latent_weights";
+            std::string on = std::string(pfx) + "attn.o_proj.latent_weights";
+
+            ternary_matmul_auto(normed.data(), model.tw(qn), q.data(), x_scale, decode);
+            ternary_matmul_auto(normed.data(), model.tw(kn), k.data(), x_scale, decode);
+            ternary_matmul_auto(normed.data(), model.tw(vn), v.data(), x_scale, decode);
+
+            for (int i = 0; i < H; i++) {
+                cache.k_cache[l][pos * H + i] = k[i];
+                cache.v_cache[l][pos * H + i] = v[i];
+            }
+
+            for (int head = 0; head < NH; head++) {
+                float scale = 1.0f / sqrtf((float)HD);
+                int actual_len = pos + 1;
+                const float* q_head = q.data() + head * HD;
+                for (int t = 0; t < actual_len; t++) {
+                    attn_scores[t] = dot_product_simd(q_head,
+                        cache.k_cache[l].data() + t * H + head * HD, HD) * scale;
+                }
+                softmax(attn_scores.data(), actual_len);
+                for (int d = 0; d < HD; d++) {
+                    float sum = 0.0f;
+                    for (int t = 0; t < actual_len; t++)
+                        sum += attn_scores[t] * cache.v_cache[l][t * H + head * HD + d];
+                    attn_out[head * HD + d] = sum;
+                }
+            }
+
+            std::vector<float> proj_out(H);
+            float o_scale = absmean(attn_out.data(), H);
+            ternary_matmul_auto(attn_out.data(), model.tw(on), proj_out.data(), o_scale, decode);
+            for (int i = 0; i < H; i++) x[i] += proj_out[i];
+
+            // FFN (pre-norm)
+            std::vector<float> ffn_normed = x;
+            rmsnorm(ffn_normed.data(), model.fw_ptr(std::string(pfx) + "ffn_norm.weight"), H);
+            float ffn_scale = absmean(ffn_normed.data(), H);
+
+            std::string fused_n = std::string(pfx) + "ffn.gate_up_proj.latent_weights";
+            std::string down_n = std::string(pfx) + "ffn.down_proj.latent_weights";
+
+            std::vector<float> fused(2 * FFN);
+            ternary_matmul_auto(ffn_normed.data(), model.tw(fused_n), fused.data(), ffn_scale, decode);
+            for (int i = 0; i < FFN; i++) { gate[i] = fused[i]; up[i] = fused[FFN + i]; }
+            for (int i = 0; i < FFN; i++) hidden[i] = silu(gate[i]) * up[i];
+
+            float h_scale = absmean(hidden.data(), FFN);
+            ternary_matmul_auto(hidden.data(), model.tw(down_n), ffn_out.data(), h_scale, decode);
+            for (int i = 0; i < H; i++) x[i] += ffn_out[i];
+        }
+
+        rmsnorm(x.data(), model.fw_ptr("norm.weight"), H);
+        std::vector<float> logits(V);
         matmul_fp32_decode(x.data(), tok_emb, logits.data(), V, H);
-    } else {
-        // Prefill: scalar (ok for small seq)
-        for (int vi = 0; vi < V; vi++) {
-            float dot = 0.0f;
-            for (int i = 0; i < H; i++) dot += x[i] * tok_emb[vi * H + i];
-            logits[vi] = dot;
+        cache.pos++;
+        return logits;
+    }
+
+    // ── Batch prefill path (seq_len > 1) ──
+    std::vector<float> x(seq_len * H);
+
+    // Embedding for all positions
+    for (int j = 0; j < seq_len; j++)
+        for (int i = 0; i < H; i++)
+            x[j * H + i] = tok_emb[tokens[j] * H + i] + pos_emb[(pos + j) * H + i];
+
+    std::vector<float> q(seq_len * H), k(seq_len * H), v(seq_len * H);
+    std::vector<float> attn_scores(model.header.max_seq_len);
+    std::vector<float> attn_out(seq_len * H);
+
+    std::vector<float> gate(seq_len * FFN), up(seq_len * FFN);
+    std::vector<float> hidden(seq_len * FFN), ffn_out(seq_len * H);
+
+    for (int l = 0; l < L; l++) {
+        char pfx[64];
+        snprintf(pfx, sizeof(pfx), "layers.%d.", l);
+
+        // Pre-norm + QKV for all positions
+        for (int j = 0; j < seq_len; j++) {
+            float* xj = x.data() + j * H;
+            rmsnorm(xj, model.fw_ptr(std::string(pfx) + "attn_norm.weight"), H);
+            float xs = absmean(xj, H);
+            ternary_matmul_auto(xj, model.tw(std::string(pfx) + "attn.q_proj.latent_weights"), q.data() + j * H, xs, false);
+            ternary_matmul_auto(xj, model.tw(std::string(pfx) + "attn.k_proj.latent_weights"), k.data() + j * H, xs, false);
+            ternary_matmul_auto(xj, model.tw(std::string(pfx) + "attn.v_proj.latent_weights"), v.data() + j * H, xs, false);
+        }
+
+        // Store K, V for all new positions
+        for (int j = 0; j < seq_len; j++)
+            for (int i = 0; i < H; i++) {
+                cache.k_cache[l][(pos + j) * H + i] = k[j * H + i];
+                cache.v_cache[l][(pos + j) * H + i] = v[j * H + i];
+            }
+
+        // Causal multi-head attention for each position
+        for (int j = 0; j < seq_len; j++) {
+            int actual_len = pos + j + 1;
+            for (int head = 0; head < NH; head++) {
+                float scale = 1.0f / sqrtf((float)HD);
+                const float* q_head = q.data() + j * H + head * HD;
+                for (int t = 0; t < actual_len; t++)
+                    attn_scores[t] = dot_product_simd(q_head,
+                        cache.k_cache[l].data() + t * H + head * HD, HD) * scale;
+                softmax(attn_scores.data(), actual_len);
+                for (int d = 0; d < HD; d++) {
+                    float sum = 0.0f;
+                    for (int t = 0; t < actual_len; t++)
+                        sum += attn_scores[t] * cache.v_cache[l][t * H + head * HD + d];
+                    attn_out[j * H + head * HD + d] = sum;
+                }
+            }
+        }
+
+        // Output projection for all positions
+        std::vector<float> proj_out(seq_len * H);
+        for (int j = 0; j < seq_len; j++) {
+            float* xj = x.data() + j * H;
+            float os = absmean(attn_out.data() + j * H, H);
+            ternary_matmul_auto(attn_out.data() + j * H, model.tw(std::string(pfx) + "attn.o_proj.latent_weights"), proj_out.data() + j * H, os, false);
+            for (int i = 0; i < H; i++) xj[i] += proj_out[j * H + i];
+        }
+
+        // FFN for all positions
+        for (int j = 0; j < seq_len; j++) {
+            float* xj = x.data() + j * H;
+            std::vector<float> ffn_normed(H);
+            memcpy(ffn_normed.data(), xj, H * sizeof(float));
+            rmsnorm(ffn_normed.data(), model.fw_ptr(std::string(pfx) + "ffn_norm.weight"), H);
+            float fs = absmean(ffn_normed.data(), H);
+
+            std::string fused_n = std::string(pfx) + "ffn.gate_up_proj.latent_weights";
+            std::string down_n = std::string(pfx) + "ffn.down_proj.latent_weights";
+            std::vector<float> fused(2 * FFN);
+            ternary_matmul_auto(ffn_normed.data(), model.tw(fused_n), fused.data(), fs, false);
+            for (int i = 0; i < FFN; i++) {
+                gate[j * FFN + i] = fused[i];
+                up[j * FFN + i] = fused[FFN + i];
+            }
+            for (int i = 0; i < FFN; i++) hidden[j * FFN + i] = silu(gate[j * FFN + i]) * up[j * FFN + i];
+
+            float hs = absmean(hidden.data() + j * FFN, FFN);
+            ternary_matmul_auto(hidden.data() + j * FFN, model.tw(down_n), ffn_out.data() + j * H, hs, false);
+            for (int i = 0; i < H; i++) xj[i] += ffn_out[j * H + i];
         }
     }
 
-    cache.pos++;
+    // Final norm + LM head (only last position for prefill)
+    int last = seq_len - 1;
+    rmsnorm(x.data() + last * H, model.fw_ptr("norm.weight"), H);
+    std::vector<float> logits(V);
+    for (int vi = 0; vi < V; vi++) {
+        float dot = 0.0f;
+        for (int i = 0; i < H; i++) dot += x[last * H + i] * tok_emb[vi * H + i];
+        logits[vi] = dot;
+    }
+
+    cache.pos += seq_len;
     return logits;
 }
 

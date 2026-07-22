@@ -58,14 +58,9 @@ int main(int argc, char** argv) {
     for (int t : tokens) fprintf(stderr, "%d ", t);
     fprintf(stderr, "\n");
 
-    // Prefill: feed each prompt token one at a time (position comes from cache.pos)
-    // Save logits from the last step — these predict the first new token
+    // Batch prefill: process all prompt tokens in a single forward pass
     auto t2 = std::chrono::high_resolution_clock::now();
-    std::vector<float> logits;
-    for (size_t i = 0; i < tokens.size(); i++) {
-        std::vector<int> single = {tokens[i]};
-        logits = tetra::forward(model, single, cache);
-    }
+    std::vector<float> logits = tetra::forward(model, tokens, cache);
     auto t3 = std::chrono::high_resolution_clock::now();
     double prefill_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
     fprintf(stderr, "Prefill: %.1f ms (%d tokens)\n", prefill_ms, (int)tokens.size());
