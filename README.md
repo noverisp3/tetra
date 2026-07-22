@@ -1,6 +1,8 @@
 # Tetra — Pure Ternary LLM
 
-**Tetra** is a decoder-only transformer trained entirely with **ternary weights** ({-1, 0, +1}). Three training modes:
+**Tetra** is a decoder-only transformer trained entirely with **ternary weights** ({-1, 0, +1}) and exported to a **3.7 MB C++ binary** that runs at **420+ tok/s** on CPU.
+
+Three training modes:
 
 - **STE** (Straight-Through Estimator) — FP32 latent shadow weights quantized on-the-fly via absmean, gradient flows through STE. (BitNet b1.58 approach)
 - **Stochastic Bit-Flip** — no latent weights. Weights stored as packed 2-bit ternary. Gradient sign accumulated in FP32 accumulator; weight flips when |accumulator| > threshold.
@@ -39,7 +41,15 @@ Key design decisions:
 
 ```bash
 # Train tiny on TinyStories (auto-downloads if missing)
-python train.py --preset tiny --steps 5000 --dtype float16
+python train.py --preset tiny --steps 5000 --dtype float16 --graph
+
+# Resume from latest checkpoint + plot full history
+python train.py --preset tiny --steps 10000 --dtype float16 --graph --resume
+
+# Export to C++ binary (3.7 MB) and run inference
+python inference/export_model.py checkpoints/checkpoint_005000.pt inference/tetra_model.bin
+cd inference && build.bat avx2 && cd ..
+python inference/run_inference.py inference/tetra_model.bin "Once upon a time" --max-tokens 50
 
 # Use GPT-2 tokenizer instead of custom BPE
 python train.py --preset tiny --steps 5000 --dtype float16 --tokenizer-dir gpt2
@@ -67,15 +77,38 @@ On CUDA, GradScaler is active for float16. Attention q/k/v and FFN SwiGLU hidden
 - **Multi-source** (FineWeb 50% + Cosmopedia 30% + Orca 20%): ~1B tokens, GPT-2 tokenizer. For 500M+ models.
 - **Tokenizer**: Custom BPE (vocab=8192, trained on TinyStories) by default. GPT-2 (vocab=50257) via `--tokenizer-dir gpt2`.
 
-## C++ Extension
+## C++ Inference Engine
 
-SIMD-accelerated pack/unpack:
+Pure C++17 inference engine (`inference/tetra.h`, no dependencies):
+
+| Feature | Detail |
+|---------|--------|
+| **File size** | 3.7 MB (ternary weights 2-bit packed, embeddings INT8 quantized) |
+| **Speed** | 420+ tok/s (AVX2, CPU), 370+ tok/s (scalar) |
+| **Prefill** | Batch prefill — all prompt tokens in one forward pass |
+| **Sampling** | Top-k + top-p + temperature, matches PyTorch order |
+| **Build** | `build.bat avx2` (auto-detects VS via vswhere) |
+
+### Export & Run
 
 ```bash
-python build_cpp.py
+python inference/export_model.py checkpoints/checkpoint_*.pt inference/tetra_model.bin
+cd inference && build.bat avx2
+# Direct: provide token IDs
+tetra_avx2.exe tetra_model.bin "373,378,67,338" 100 0.8 50 0.9
+# Or via Python with tokenizer
+python run_inference.py tetra_model.bin "Once upon a time" --max-tokens 100
 ```
 
-Requires MSVC (Visual Studio 2022). Auto-loaded at runtime; falls back to Python if not built.
+### Binary Format (v3)
+
+| Section | Encoding |
+|---------|----------|
+| Header (64B) | magic `TETR`, version, dims, param counts |
+| Ternary weights | name, shape, alpha, 2-bit packed (4 weights/byte) |
+| FP32/INT8 weights | name, shape, dtype byte: `0`=FP32, `1`=INT8 + scale |
+| Embeddings | INT8 (token 8K×256→2.0 MB, pos 512×256→0.13 MB) |
+| Norms | FP32 (tiny, ~12 KB) |
 
 ## Examples
 
@@ -86,6 +119,8 @@ Trained for 5,000 steps on Intel Iris Xe (DirectML) in ~3 hours:
 | Metric | Value |
 |--------|-------|
 | **Total params** | 8,523,008 (6.3M ternary + 2.2M FP32) |
+| **Exported binary** | **3.7 MB** (INT8 embedding + 2-bit ternary weights) |
+| **C++ inference** | **420+ tok/s** (AVX2) / 370+ tok/s (scalar) |
 | **Dataset** | TinyStoriesV2-GPT4, 535M tokens, 267K stories |
 | **Tokenizer** | Custom BPE, vocab=8192 |
 | **Mode** | STE (latent weights) |
@@ -98,16 +133,13 @@ Trained for 5,000 steps on Intel Iris Xe (DirectML) in ~3 hours:
 <p align="center">
   <img src="examples/tiny/loss_plot.png" alt="Training Loss Plot" width="85%">
   <br>
-  <em><b>Figure 1:</b> Convergence curve of Tetra 8.5M (STE) on TinyStories (5,000 steps, Cosine LR Decay with Warmup).</em>
+  <em><b>Figure 1:</b> Convergence curve of Tetra 8.5M (STE) on TinyStories (5,000 steps, Cosine LR Decay with Warmup). Plot includes raw + EMA-smoothed train loss and validation loss.</em>
 </p>
 
-Sample output (PyTorch generate):
-> "Hello , Tim to find food the ball like . " I can help he . You mom said . He is . We ' s . You you !" Sue ' s room and a tree away . She is . " Let . He likes . She says . It is . She had and said need the bear and they played too . They were best , Tim and she were very happy on the bird . They went the ground , Tom smiled and laughed away him they could . The cat . The bird ' s a nice . They looked . They played all lived . But then it . <| endoftext |> Once upon a time , there was a little boy named Tim . The truck was very the rock . One day , she saw what . The boat and said , she could , " Thank said , Tim . He found it !" The bird to play with his mom , " Can you something and said , " Maybe to play . The end . She saw a big , he wanted to find to his family the hole"
+Sample output (C++ inference, AVX2, 3.7 MB binary):
+> "a small . He looked . They all . They all day of the bird . She was very happy was very happy and the dog of . They all day long and the big dog and gave . She put the big hole and laughed had not and Lily"
 
-C++ inference (exported binary, AVX2, 438 tok/s):
-> "Once upon a time , there was a little girl named Tim . The moral she saw . The man it to play with it was sad it . The . The little bird his . It was a loud . It was happy and put it . The . The moral to play . She saw a big fish and said , but , 'No will , I't worry's mine to me , but you can , 'I'm't worry.' They all played . Lily and he did not know and ran ."
-
-Limited but recognizable — expected for 8.5M ternary params on simple stories.
+Limited but recognizable — expected for 8.5M ternary params on simple stories. Training to 20k–30k steps on TinyStoriesV2 significantly improves coherence.
 
 
 ## Project Structure
@@ -137,11 +169,12 @@ ternary_llm/
     setup.py                # PyTorch extension build
 
 inference/
-  tetra.h / tetra.cpp       # C++ inference engine
-  export_model.py           # Checkpoint → binary format
+  tetra.h                   # C++ inference engine (RMSNorm, SiLU, softmax, sampling, forward)
+  tetra.cpp                 # CLI entry point, generation loop
+  export_model.py           # Checkpoint → binary format (v3, INT8 embedding)
   run_inference.py          # Python wrapper around C++ inference
   benchmark_ppl.py          # Perplexity measurement
-  build.bat                 # MSVC build script
+  build.bat                 # MSVC build script (auto-detects VS via vswhere)
 
 tests/
   test_quantization.py
