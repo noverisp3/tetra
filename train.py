@@ -20,7 +20,7 @@ from ternary_llm.data import (
 from ternary_llm.trainer import TernaryTrainer, TrainingConfig
 
 PRESETS = {
-    "tiny":   dict(hidden_dim=128, num_layers=4,  num_heads=4,  ffn_dim=512),
+    "tiny":   dict(hidden_dim=256, num_layers=6,  num_heads=8,  ffn_dim=1024),
     "medium": dict(hidden_dim=512, num_layers=12, num_heads=8,  ffn_dim=2048),
     "large":  dict(hidden_dim=768, num_layers=12, num_heads=12, ffn_dim=2048),
     "500m":   dict(hidden_dim=2560, num_layers=6,  num_heads=40, ffn_dim=6826),
