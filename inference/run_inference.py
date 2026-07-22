@@ -75,14 +75,16 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
         break
 
     proc.stdout.close()
-    stderr = proc.stderr.read()
-    proc.stderr.close()
+    print()
     proc.wait()
 
-    if stderr:
-        print(stderr, file=sys.stderr)
+    stderr = proc.stderr.read()
+    proc.stderr.close()
 
-    print(f"\n{'=' * 60}")
+    if stderr:
+        print(stderr, file=sys.stderr, end="")
+
+    print(f"{'=' * 60}")
     return generated
 
 
