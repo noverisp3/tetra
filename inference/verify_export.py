@@ -39,7 +39,7 @@ def load_binary_model(path: str) -> dict:
         print(f"Header: v{version}, vocab={vocab_size}, hidden={hidden_dim}, layers={num_layers}, heads={num_heads}, ffn={ffn_dim}, seq={max_seq_len}")
 
         # Ternary weights
-        for _ in range(7 * num_layers):  # q,k,v,o + gate,up,down per layer
+        for _ in range(6 * num_layers):  # q,k,v,o,gate_up,down per layer
             name_len = struct.unpack("<I", f.read(4))[0]
             name = f.read(name_len).decode("utf-8")
             rows, cols = struct.unpack("<HH", f.read(4))

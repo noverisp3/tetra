@@ -305,8 +305,9 @@ static Model load_model(const char* path) {
             h.num_layers, h.hidden_dim, h.num_heads, h.ffn_dim, h.vocab_size, h.max_seq_len);
 
     // Read ternary weights → convert to XNOR bitmasks
+    // 6 per layer: q_proj, k_proj, v_proj, o_proj, gate_up_proj, down_proj
     for (uint32_t layer = 0; layer < h.num_layers; layer++) {
-        for (int t = 0; t < 7; t++) {
+        for (int t = 0; t < 6; t++) {
             uint32_t name_len;
             fread(&name_len, 4, 1, f);
             std::string name(name_len, '\0');
@@ -480,13 +481,16 @@ static std::vector<float> forward(
 
         float ffn_scale = absmean(ffn_normed.data(), H);
 
-        std::string gate_name = std::string(prefix) + "ffn.gate_proj.latent_weights";
-        std::string up_name   = std::string(prefix) + "ffn.up_proj.latent_weights";
+        std::string fused_name = std::string(prefix) + "ffn.gate_up_proj.latent_weights";
         std::string down_name = std::string(prefix) + "ffn.down_proj.latent_weights";
 
-        // SwiGLU: gate and up projections
-        ternary_matmul_auto(ffn_normed.data(), model.tw(gate_name), gate.data(), ffn_scale, decode);
-        ternary_matmul_auto(ffn_normed.data(), model.tw(up_name), up.data(), ffn_scale, decode);
+        // SwiGLU: fused gate+up projection (output is 2*FFN dim) → chunk
+        std::vector<float> fused(2 * FFN);
+        ternary_matmul_auto(ffn_normed.data(), model.tw(fused_name), fused.data(), ffn_scale, decode);
+        for (int i = 0; i < FFN; i++) {
+            gate[i] = fused[i];
+            up[i] = fused[FFN + i];
+        }
 
         // SiLU(gate) * up
         for (int i = 0; i < FFN; i++) hidden[i] = silu(gate[i]) * up[i];
