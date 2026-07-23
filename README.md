@@ -183,3 +183,7 @@ tests/
   test_prototype.py
   test_convergence.py
 ```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
