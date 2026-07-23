@@ -108,11 +108,11 @@ _has_cpp = _load_cpp_extension()
 class TernaryQuantizer(torch.autograd.Function):
     """Ternary quantization {-1, 0, +1} with Straight-Through Estimator.
 
-    Dynamic threshold: Δ = scale × mean(|W|), default scale=0.7.
+    Dynamic threshold: Δ = scale x mean(|W|), default scale=0.7.
     Lower scale increases entropy (fewer zeros in ternary matrix),
-    preventing model collapse (all weights → 0).
+    preventing model collapse (all weights -> 0).
 
-    Forward:  clamp(W/Δ, -1, 1) → round → {-1, 0, +1}
+    Forward:  clamp(W/Δ, -1, 1) -> round -> {-1, 0, +1}
     Backward: STE passes grad straight through
     """
 
@@ -132,10 +132,10 @@ class TernaryQuantizer(torch.autograd.Function):
 class FusedTernaryLinear(torch.autograd.Function):
     """Fused ternary quantization + linear matmul.
 
-    Dynamic threshold: Δ = scale × mean(|W|), default scale=0.7.
-    Per-channel: Δ_i = scale × mean(|W[i,:]|).
+    Dynamic threshold: Δ = scale x mean(|W|), default scale=0.7.
+    Per-channel: Δ_i = scale x mean(|W[i,:]|).
 
-    Forward:  clamp(W/Δ, -1, 1) → round → matmul(x, W_ternary)
+    Forward:  clamp(W/Δ, -1, 1) -> round -> matmul(x, W_ternary)
     Backward: grad_x = grad @ W_ternary.T, grad_W = x^T @ grad (STE)
 
     Saves ternary weights to avoid recomputing abs()
@@ -215,10 +215,10 @@ def unpack_ternary(packed: bytes, shape: tuple, device: str = "cpu") -> torch.Te
 # Fast Tensor Pack/Unpack for Stochastic Bit-Flip
 
 def pack_ternary_tensor(w: torch.Tensor) -> torch.Tensor:
-    """Pack ternary float tensor {-1, 0, +1} → uint8 tensor (4 weights/byte)."""
+    """Pack ternary float tensor {-1, 0, +1} -> uint8 tensor (4 weights/byte)."""
     if _has_cpp and w.is_cpu and w.dtype in (torch.float32, torch.float16):
         return _ternary_ops.pack_ternary(w.contiguous())
-    w_u8 = (w + 1).to(torch.uint8)  # -1→0, 0→1, +1→2
+    w_u8 = (w + 1).to(torch.uint8)  # -1->0, 0->1, +1->2
     flat = w_u8.flatten()
     n = flat.size(0)
     padded = (n + 3) // 4 * 4
@@ -230,7 +230,7 @@ def pack_ternary_tensor(w: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple) -> torch.Tensor:
-    """Unpack uint8 tensor → float tensor {-1, 0, +1}.
+    """Unpack uint8 tensor -> float tensor {-1, 0, +1}.
 
     Uses C++ SIMD unpack on CPU when available (fastest path),
     falls back to Python element-wise ops on the original device.
@@ -257,7 +257,7 @@ def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple) -> torch.Tensor:
 def init_ternary_weight(out_features: int, in_features: int, sparsity: float = 0.5) -> torch.Tensor:
     """Initialize packed ternary weights with given sparsity.
 
-    sparsity=0.5 → 50% zeros, 25% +1, 25% -1 (kaiming-like).
+    sparsity=0.5 -> 50% zeros, 25% +1, 25% -1 (kaiming-like).
     Returns flat uint8 packed tensor.
     """
     n = out_features * in_features
@@ -281,7 +281,7 @@ def init_ternary_weight(out_features: int, in_features: int, sparsity: float = 0
 class StochasticBitFlipLinear(torch.autograd.Function):
     """Stochastic Bit-Flip for ternary weights.
 
-    Forward: unpack 2-bit → ternary float → scale → matmul
+    Forward: unpack 2-bit -> ternary float -> scale -> matmul
     Backward: accumulate gradient into accumulator (bit flip deferred
               to model.apply_bit_flips() called every N steps)
     """
@@ -325,7 +325,7 @@ class StochasticBitFlipLinear(torch.autograd.Function):
 class Int8StochasticBitFlipLinear(torch.autograd.Function):
     """Stochastic Bit-Flip with INT8 activations.
 
-    Forward: quantize x → int8, matmul, dequantize.
+    Forward: quantize x -> int8, matmul, dequantize.
     - CPU: uses C++ int8 ternary matmul kernel (no float multiplications).
     - DML/GPU: pure-PyTorch fallback (dequant+float matmul, same quantization noise).
     Backward: STE — grad flows through float matmul.
@@ -354,7 +354,7 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
                     w_raw.size(0), w_raw.size(1),
                 ).float()
             else:
-                # Pure-PyTorch fallback: dequant → float matmul
+                # Pure-PyTorch fallback: dequant -> float matmul
                 # Same quantization noise, no CPU copies on DML
                 int_out = F.linear(x_q.float() * scale_x, w_raw.float()) * scale
         out.data = int_out.to(x.device)

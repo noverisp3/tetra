@@ -17,6 +17,16 @@
 #include <cstdio>
 #include <cstdlib>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -256,9 +266,97 @@ static float absmean(const float* x, int n) {
     return sum / n;
 }
 
+// MappedFile: cross-platform memory-mapped file
+struct MappedFile {
+#ifdef _WIN32
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMap = nullptr;
+#else
+    int fd = -1;
+#endif
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+
+    bool open(const char* path) {
+#ifdef _WIN32
+        hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER li;
+        GetFileSizeEx(hFile, &li);
+        size = (size_t)li.QuadPart;
+        hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (!hMap) { CloseHandle(hFile); return false; }
+        data = (const uint8_t*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if (!data) { CloseHandle(hMap); CloseHandle(hFile); return false; }
+#else
+        fd = ::open(path, O_RDONLY);
+        if (fd < 0) return false;
+        struct stat st;
+        fstat(fd, &st);
+        size = st.st_size;
+        data = (const uint8_t*)mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+        if (data == MAP_FAILED) { ::close(fd); return false; }
+#endif
+        return true;
+    }
+
+    void close() {
+#ifdef _WIN32
+        if (data) UnmapViewOfFile(data);
+        if (hMap) CloseHandle(hMap);
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+#else
+        if (data) munmap((void*)data, size);
+        if (fd >= 0) ::close(fd);
+#endif
+        data = nullptr;
+    }
+
+    ~MappedFile() { close(); }
+    MappedFile() = default;
+    MappedFile(const MappedFile&) = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+    MappedFile(MappedFile&& other) noexcept { *this = std::move(other); }
+    MappedFile& operator=(MappedFile&& other) noexcept {
+        close();
+        data = other.data; other.data = nullptr;
+        size = other.size; other.size = 0;
+#ifdef _WIN32
+        hFile = other.hFile; other.hFile = INVALID_HANDLE_VALUE;
+        hMap = other.hMap; other.hMap = NULL;
+#else
+        fd = other.fd; other.fd = -1;
+#endif
+        return *this;
+    }
+};
+
+// Cursor-based reader over mmap region
+struct Reader {
+    const uint8_t* pos;
+    const uint8_t* end;
+    Reader(const uint8_t* p, const uint8_t* e) : pos(p), end(e) {}
+    template<typename T> void read(T& val) {
+        if (pos + sizeof(T) > end) { fprintf(stderr, "Read past end\n"); exit(1); }
+        memcpy(&val, pos, sizeof(T)); pos += sizeof(T);
+    }
+    void read_bytes(void* buf, size_t n) {
+        if (pos + n > end) { fprintf(stderr, "Read past end\n"); exit(1); }
+        memcpy(buf, pos, n); pos += n;
+    }
+    std::string read_str(size_t len) {
+        std::string s(len, '\0');
+        read_bytes(&s[0], len);
+        return s;
+    }
+    void skip(size_t n) { pos += n; }
+};
+
 // Model
 struct Model {
     ModelHeader header;
+    MappedFile mapped;
     std::unordered_map<std::string, TernaryWeightXNOR> ternary_weights;
     std::unordered_map<std::string, FP32Weight> fp32_weights;
 
@@ -274,7 +372,7 @@ struct Model {
     const int8_t* int8_ptr(const std::string& name) const {
         return fp32_weights.at(name).int8_data.data();
     }
-    float int8_scale(const std::string& name) const {
+    float int8_scale_val(const std::string& name) const {
         return fp32_weights.at(name).int8_scale;
     }
     int head_dim() const { return header.hidden_dim / header.num_heads; }
@@ -282,11 +380,13 @@ struct Model {
 
 static Model load_model(const char* path) {
     Model model;
-    FILE* f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "Cannot open %s\n", path); exit(1); }
+    if (!model.mapped.open(path)) {
+        fprintf(stderr, "Cannot open %s\n", path); exit(1);
+    }
+    Reader r(model.mapped.data, model.mapped.data + model.mapped.size);
 
     uint8_t header_buf[64];
-    fread(header_buf, 1, 64, f);
+    r.read_bytes(header_buf, 64);
     auto& h = model.header;
     memcpy(h.magic, header_buf, 4);
     memcpy(&h.version,        header_buf + 4,  4);
@@ -305,22 +405,19 @@ static Model load_model(const char* path) {
     for (uint32_t layer = 0; layer < h.num_layers; layer++) {
         for (int t = 0; t < 6; t++) {
             uint32_t name_len;
-            fread(&name_len, 4, 1, f);
-            std::string name(name_len, '\0');
-            fread(&name[0], 1, name_len, f);
+            r.read(name_len);
+            std::string name = r.read_str(name_len);
 
             uint16_t rows, cols;
-            fread(&rows, 2, 1, f);
-            fread(&cols, 2, 1, f);
+            r.read(rows);
+            r.read(cols);
 
             float alpha = 1.0f;
-            if (h.version >= 2) {
-                fread(&alpha, 4, 1, f);
-            }
+            if (h.version >= 2) r.read(alpha);
 
             int packed_size = (rows * cols + 3) / 4;
             std::vector<uint8_t> packed(packed_size);
-            fread(packed.data(), 1, packed_size, f);
+            r.read_bytes(packed.data(), packed_size);
 
             TernaryWeightXNOR w;
             w.rows = rows;
@@ -333,47 +430,43 @@ static Model load_model(const char* path) {
     }
 
     // Read FP32/INT8 weights
-    while (true) {
+    while (r.pos < r.end - 4) {
         uint32_t name_len;
-        if (fread(&name_len, 4, 1, f) != 1) break;
+        r.read(name_len);
         if (name_len > 1024) break;
 
-        std::string name(name_len, '\0');
-        fread(&name[0], 1, name_len, f);
+        std::string name = r.read_str(name_len);
 
-        uint8_t ndim;
-        fread(&ndim, 1, 1, f);
-
-        uint8_t dtype;
-        fread(&dtype, 1, 1, f);
+        uint8_t ndim, dtype;
+        r.read(ndim);
+        r.read(dtype);
 
         uint32_t dims[4] = {1,1,1,1};
-        fread(dims, 4, 4, f);
+        r.read_bytes(dims, 16);
 
         int n_elements = 1;
         std::vector<int> shape(ndim);
-        for (int i = 0; i < ndim; i++) { shape[i] = dims[i]; n_elements *= dims[i]; }
+        for (int i = 0; i < ndim; i++) { shape[i] = (int)dims[i]; n_elements *= dims[i]; }
 
         FP32Weight fw;
         fw.shape = shape;
         fw.data.resize(n_elements);
 
-        if (dtype == 1) {  // INT8 → dequantize to FP32, keep raw INT8 for LM head
+        if (dtype == 1) {  // INT8 -> dequantize to FP32, keep raw INT8 for LM head
             float scale;
-            fread(&scale, 4, 1, f);
-            std::vector<int8_t> buf(n_elements);
-            fread(buf.data(), 1, n_elements, f);
-            for (int i = 0; i < n_elements; i++)
-                fw.data[i] = (float)buf[i] * scale;
-            fw.int8_data = std::move(buf);
+            r.read(scale);
             fw.int8_scale = scale;
+            const int8_t* src = (const int8_t*)r.pos;
+            for (int i = 0; i < n_elements; i++)
+                fw.data[i] = (float)src[i] * scale;
+            fw.int8_data.assign(src, src + n_elements);
+            r.skip(n_elements);
         } else {  // FP32
-            fread(fw.data.data(), 4, n_elements, f);
+            r.read_bytes(fw.data.data(), 4 * n_elements);
         }
         model.fp32_weights[name] = std::move(fw);
     }
 
-    fclose(f);
     fprintf(stderr, "Loaded %zu ternary + %zu fp32 tensors\n",
             model.ternary_weights.size(), model.fp32_weights.size());
     return model;

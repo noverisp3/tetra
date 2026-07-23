@@ -10,9 +10,9 @@ class TernarySSMBlock(nn.Module):
     """Ternary State Space Model block (simplified Mamba).
 
     Architecture:
-        x → RMSNorm → TernaryLinear(expand 2×) → split x, gate
-        x → Conv1d → SiLU → SSM scan
-        gate → SiLU → multiply → TernaryLinear(project back)
+        x -> RMSNorm -> TernaryLinear(expand 2x) -> split x, gate
+        x -> Conv1d -> SiLU -> SSM scan
+        gate -> SiLU -> multiply -> TernaryLinear(project back)
 
     SSM recurrence (diagonal, per-channel):
         h_t = (1 - Δ·A) ⊙ h_{t-1} + Δ·B·x_t
@@ -37,7 +37,7 @@ class TernarySSMBlock(nn.Module):
 
         self.norm = RMSNorm(hidden_dim)
 
-        # Fused input projection: hidden_dim → 2 × inner_dim (x, gate)
+        # Fused input projection: hidden_dim -> 2 x inner_dim (x, gate)
         self.x_proj = StochasticTernaryLinear(
             hidden_dim, 2 * inner_dim, scale=scale, threshold=threshold, int8=int8
         )
@@ -61,11 +61,11 @@ class TernarySSMBlock(nn.Module):
         residual = x
         x = self.norm(x)
 
-        # Fused projection → split
-        fused = self.x_proj(x)  # (B, T, 2×inner)
+        # Fused projection -> split
+        fused = self.x_proj(x)  # (B, T, 2xinner)
         x_in, gate = fused.chunk(2, dim=-1)
 
-        # Conv1d: (B, T, C) → (B, C, T) → Conv → (B, C, T) → (B, T, C)
+        # Conv1d: (B, T, C) -> (B, C, T) -> Conv -> (B, C, T) -> (B, T, C)
         x_conv = self.conv(x_in.transpose(1, 2)).transpose(1, 2)
         x_conv = F.silu(x_conv)
 
@@ -83,7 +83,7 @@ class TernarySSMBlock(nn.Module):
         cum = z.cumsum(dim=1)
         y = decay_pow.unsqueeze(0) * cum
 
-        # Gate: y × SiLU(gate)
+        # Gate: y x SiLU(gate)
         out = y * F.silu(gate)
         return self.out_proj(out) + residual
 

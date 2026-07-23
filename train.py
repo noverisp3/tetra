@@ -121,7 +121,7 @@ def main():
     parser.add_argument("--mode", type=str, default="ste", choices=["ste", "stochastic", "hybrid"],
                         help="Training mode: STE, Stochastic Bit-Flip, or Hybrid SSM-Attention (default: ste)")
     parser.add_argument("--ssm-every", type=int, default=5,
-                        help="[Hybrid] Place attention every N blocks (default: 5 → 80% SSM, 20% attention)")
+                        help="[Hybrid] Place attention every N blocks (default: 5 -> 80% SSM, 20% attention)")
     parser.add_argument("--expand-factor", type=int, default=2,
                         help="[Hybrid] SSM expansion factor (default: 2)")
     parser.add_argument("--ternary-scale", type=float, default=0.7,

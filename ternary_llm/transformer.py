@@ -15,8 +15,8 @@ class TernaryTransformerBlock(nn.Module):
     """Single transformer decoder block with ternary weights.
 
     Architecture (Pre-Norm, following BitNet b1.58):
-        x → RMSNorm → MultiHeadAttention → Residual Add
-          → RMSNorm → FFN → Residual Add
+        x -> RMSNorm -> MultiHeadAttention -> Residual Add
+          -> RMSNorm -> FFN -> Residual Add
 
     Args:
         hidden_dim: model dimension

@@ -143,7 +143,7 @@ def export_model(model: TernaryTransformerModel, output_path: str):
             f.write(name_bytes)
             f.write(struct.pack("<B", ndim))
 
-            # Embeddings → INT8, norms → FP32
+            # Embeddings -> INT8, norms -> FP32
             is_int8 = name in ("token_embedding.weight", "pos_embedding.weight")
             if is_int8:
                 f.write(struct.pack("<B", 1))  # dtype=INT8

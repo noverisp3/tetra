@@ -43,7 +43,7 @@ class TernaryFFN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Fused gate+up: one matmul → chunk
+        # Fused gate+up: one matmul -> chunk
         fused_out = self.gate_up_proj(x)
         gate, up = fused_out.chunk(2, dim=-1)
 

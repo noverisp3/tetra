@@ -21,7 +21,7 @@ def create_synthetic_data(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create simple sequential pattern data.
 
-    Pattern: token i → token (i+1) % vocab_size
+    Pattern: token i -> token (i+1) % vocab_size
     """
     data = torch.zeros(num_samples, seq_len + 1, dtype=torch.long)
     for i in range(num_samples):

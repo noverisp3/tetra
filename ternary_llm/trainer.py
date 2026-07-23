@@ -160,7 +160,7 @@ class TrainingConfig:
     flip_every_n_steps: int = 5  # check threshold & flip bits every N optimizer steps
 
     # Quantization (STE)
-    ternary_scale: float = 0.7  # Δ = scale × mean(|W|), lower → more {-1,+1}, higher → more 0
+    ternary_scale: float = 0.7  # Δ = scale x mean(|W|), lower -> more {-1,+1}, higher -> more 0
     per_channel: bool = False    # Per-channel vs per-tensor threshold
 
     # Data
@@ -565,7 +565,7 @@ class TernaryTrainer:
     def save_checkpoint(self, step: int):
         """Save model checkpoint and keep only the 3 most recent.
 
-        STE mode: latent weights → FP16, optimizer states → FP16.
+        STE mode: latent weights -> FP16, optimizer states -> FP16.
         Stochastic mode: packed ternary + accumulators saved directly.
         """
         is_stochastic = self.config.mode == "stochastic"
@@ -647,7 +647,7 @@ class TernaryTrainer:
         ckpt_mode = checkpoint.get("mode", "ste")
 
         if ckpt_mode == "stochastic":
-            # Stochastic: FP16 accumulators → FP32, packed weights stay uint8
+            # Stochastic: FP16 accumulators -> FP32, packed weights stay uint8
             state_dict = {}
             for k, v in raw_state.items():
                 if isinstance(v, torch.Tensor) and v.dtype == torch.float16:
@@ -655,14 +655,14 @@ class TernaryTrainer:
                 else:
                     state_dict[k] = v
         elif checkpoint.get("latent_fp16", False):
-            # STE new format: FP16 latent weights → FP32
+            # STE new format: FP16 latent weights -> FP32
             state_dict = {}
             for k, v in raw_state.items():
                 if isinstance(v, torch.Tensor) and v.dtype == torch.float16:
                     state_dict[k] = v.float()
                 else:
                     state_dict[k] = v
-        # Old format: packed ternary → unpack (legacy compatibility)
+        # Old format: packed ternary -> unpack (legacy compatibility)
         elif checkpoint.get("ternary_packed", False):
             state_dict = {}
             for k, v in raw_state.items():
