@@ -172,6 +172,8 @@ static void ternary_matmul_auto(
 struct FP32Weight {
     std::vector<float> data;
     std::vector<int> shape;
+    std::vector<int8_t> int8_data;  // raw INT8 (for LM head speed)
+    float int8_scale = 0.0f;
 };
 
 struct ModelHeader {
@@ -182,13 +184,39 @@ struct ModelHeader {
 };
 
 // Decode FP32 matmul with prefetch
-// Used for LM head (vocab projection) during single-token decode.
 static void matmul_fp32_decode(const float* x, const float* w, float* out,
                                 int rows, int cols) {
     for (int r = 0; r < rows; r++) {
         if (r + 3 < rows)
             TETRA_PREFETCH(w + (r + 3) * cols);
         out[r] = dot_product_simd(x, w + r * cols, cols);
+    }
+}
+
+// INT8 matmul for LM head: reads 4x less memory bandwidth
+static void matmul_int8_decode(const float* x, const int8_t* w, float* out,
+                                int rows, int cols, float scale) {
+    for (int r = 0; r < rows; r++) {
+        float sum = 0.0f;
+        int c = 0;
+#if defined(__AVX2__)
+        __m256 vsum = _mm256_setzero_ps();
+        for (; c + 8 <= cols; c += 8) {
+            __m256i vi8 = _mm256_loadu_si256((const __m256i*)(w + r * cols + c));
+            __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_castsi256_si128(vi8)));
+            __m256 vx = _mm256_loadu_ps(x + c);
+            vsum = _mm256_fmadd_ps(vx, vf, vsum);
+        }
+        __m128 hi = _mm256_extractf128_ps(vsum, 1);
+        __m128 lo = _mm256_castps256_ps128(vsum);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        sum = _mm_cvtss_f32(s);
+#endif
+        for (; c < cols; c++)
+            sum += x[c] * (float)w[r * cols + c];
+        out[r] = sum * scale;
     }
 }
 
@@ -242,6 +270,12 @@ struct Model {
     }
     const float* fw_ptr(const std::string& name) const {
         return fp32_weights.at(name).data.data();
+    }
+    const int8_t* int8_ptr(const std::string& name) const {
+        return fp32_weights.at(name).int8_data.data();
+    }
+    float int8_scale(const std::string& name) const {
+        return fp32_weights.at(name).int8_scale;
     }
     int head_dim() const { return header.hidden_dim / header.num_heads; }
 };
@@ -324,13 +358,15 @@ static Model load_model(const char* path) {
         fw.shape = shape;
         fw.data.resize(n_elements);
 
-        if (dtype == 1) {  // INT8 → dequantize to FP32
+        if (dtype == 1) {  // INT8 → dequantize to FP32, keep raw INT8 for LM head
             float scale;
             fread(&scale, 4, 1, f);
             std::vector<int8_t> buf(n_elements);
             fread(buf.data(), 1, n_elements, f);
             for (int i = 0; i < n_elements; i++)
                 fw.data[i] = (float)buf[i] * scale;
+            fw.int8_data = std::move(buf);
+            fw.int8_scale = scale;
         } else {  // FP32
             fread(fw.data.data(), 4, n_elements, f);
         }
@@ -449,7 +485,14 @@ static std::vector<float> forward(
 
         rmsnorm(x.data(), model.fw_ptr("norm.weight"), H);
         std::vector<float> logits(V);
-        matmul_fp32_decode(x.data(), tok_emb, logits.data(), V, H);
+        {
+            const auto& emb = model.fp32_weights.at("token_embedding.weight");
+            if (!emb.int8_data.empty()) {
+                matmul_int8_decode(x.data(), emb.int8_data.data(), logits.data(), V, H, emb.int8_scale);
+            } else {
+                matmul_fp32_decode(x.data(), tok_emb, logits.data(), V, H);
+            }
+        }
         cache.pos++;
         return logits;
     }
@@ -545,10 +588,17 @@ static std::vector<float> forward(
     int last = seq_len - 1;
     rmsnorm(x.data() + last * H, model.fw_ptr("norm.weight"), H);
     std::vector<float> logits(V);
-    for (int vi = 0; vi < V; vi++) {
-        float dot = 0.0f;
-        for (int i = 0; i < H; i++) dot += x[last * H + i] * tok_emb[vi * H + i];
-        logits[vi] = dot;
+    {
+        const auto& emb = model.fp32_weights.at("token_embedding.weight");
+        if (!emb.int8_data.empty()) {
+            matmul_int8_decode(x.data() + last * H, emb.int8_data.data(), logits.data(), V, H, emb.int8_scale);
+        } else {
+            for (int vi = 0; vi < V; vi++) {
+                float dot = 0.0f;
+                for (int i = 0; i < H; i++) dot += x[last * H + i] * tok_emb[vi * H + i];
+                logits[vi] = dot;
+            }
+        }
     }
 
     cache.pos += seq_len;
