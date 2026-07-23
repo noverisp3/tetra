@@ -112,7 +112,7 @@ python run_inference.py tetra_model.bin "Once upon a time" --max-tokens 100
 
 ## Examples
 
-### Tiny 8.5M on TinyStories
+### Tiny 8.5M on TinyStories (STE)
 
 Trained for 15,000 steps on Intel Iris Xe (DirectML) in ~9.5 hours:
 
@@ -131,7 +131,7 @@ Trained for 15,000 steps on Intel Iris Xe (DirectML) in ~9.5 hours:
 | **Loss trend** | 61.02 → 3.75 (converged smoothly) |
 
 <p align="center">
-  <img src="examples/tiny/loss_plot.png" alt="Training Loss Plot" width="85%">
+  <img src="examples/tiny/loss_plot_STE.png" alt="Training Loss Plot" width="85%">
   <br>
   <em><b>Figure 1:</b> Convergence curve of Tetra 8.5M (STE) on TinyStories (15,000 steps, Cosine LR Decay with Warmup). Plot includes raw + EMA-smoothed train loss and validation loss.</em>
 </p>
@@ -140,6 +140,45 @@ C++ inference (exported binary, AVX2, 3.7 MB, 424 tok/s):
 > "Once upon a time to play a little girl named Lily. She was very much. Mia saw a big, she was so happy and a new little boy to make her toys, 'Don's time for you?' Lily said, 'I don'm sorry the toy car.' Mia did not listen the girl smiled and said, 'No, we should. I have fun worry. I want to be careful.' Lily said, you are going. 'Thank, you can help me and they are nice.'"
 
 Limited but coherent — expected for 8.5M ternary params trained for 15k steps on TinyStories. Training to 30k–50k steps would further improve narrative quality.
+
+> **Reproduce this run:**
+> ```bash
+> python train.py --preset tiny --steps 15000 --dtype float16 --graph --data-cache tinydata --hybrid --mode ste
+> ```
+
+### Tiny 5.3M on TinyStories (SBF)
+
+Trained for 15,000 steps on Intel Iris Xe (DirectML) in ~9.4 hours:
+
+| Metric | Value |
+|--------|-------|
+| **Total params** | 5,377,280 (3.14M ternary + 2.2M FP32) |
+| **Exported binary** | **3.6 MB** (INT8 embedding + 2-bit ternary weights, 384 KB ternary) |
+| **C++ inference** | **454 tok/s** (AVX2) / 366 tok/s (scalar) |
+| **Dataset** | TinyStoriesV2-GPT4, 535M tokens, 80K stories |
+| **Tokenizer** | Custom BPE, vocab=8192 |
+| **Mode** | Stochastic Bit-Flip (no latent FP32 weights) |
+| **Batch** | 16 × 4 grad_accum = 64 effective |
+| **Speed** | 2.15s/step |
+| **Final train loss** | 5.8681 |
+| **Final val loss** | 5.8168 |
+| **Loss trend** | 61.02 → 5.81 (hit 3.14M capacity ceiling) |
+
+<p align="center">
+  <img src="examples/tiny/loss_plot_SBF.png" alt="Training Loss Plot" width="85%">
+  <br>
+  <em><b>Figure 2:</b> Convergence curve of Tetra 5.3M (SBF) on TinyStories (15,000 steps, Cosine LR Decay with Warmup). Plot includes raw + EMA-smoothed train loss and validation loss.</em>
+</p>
+
+C++ inference (exported binary, AVX2, 3.6 MB, 454 tok/s):
+> "Hello . to Tim the . One saw time . " , her and the had day . , day , . the Tim , saw the , it friends . the the day endoftext that ." Tim little . and the there . a I , . , she the but to One the time the " to Once a a to little The friends a very a endoftext that was He was . was a a . . . a it to to and He and . " was play . " it " not The . a , , happy and She . It on . , Tim . was to the a , They , had Lily to The the . . big the " |> with the was They to and a . the the the little One . the a day and , endoftext to She he to a It and day One to , . . . and a the there It on a Tim her the , time , , and ' to happy ' . , The , not , said . to to day the the , . They " friends"
+
+Limited due to ultra-compact 3.14M ternary weight capacity (384 KB memory footprint) without latent shadow weights. Demonstrates memory-efficient training behavior under tight capacity constraints.
+
+> **Reproduce this run:**
+> ```bash
+> python train.py --preset tiny --steps 15000 --dtype float16 --graph --data-cache tinydata --hybrid --mode stochastic
+> ```
 
 
 ## Project Structure
