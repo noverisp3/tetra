@@ -610,14 +610,16 @@ static std::vector<float> forward(
         char pfx[64];
         snprintf(pfx, sizeof(pfx), "layers.%d.", l);
 
-        // Pre-norm + QKV for all positions
+        // Pre-norm + QKV for all positions (save original x for residual)
         for (int j = 0; j < seq_len; j++) {
             float* xj = x.data() + j * H;
-            rmsnorm(xj, model.fw_ptr(std::string(pfx) + "attn_norm.weight"), H);
-            float xs = absmean(xj, H);
-            ternary_matmul_auto(xj, model.tw(std::string(pfx) + "attn.q_proj.latent_weights"), q.data() + j * H, xs, false);
-            ternary_matmul_auto(xj, model.tw(std::string(pfx) + "attn.k_proj.latent_weights"), k.data() + j * H, xs, false);
-            ternary_matmul_auto(xj, model.tw(std::string(pfx) + "attn.v_proj.latent_weights"), v.data() + j * H, xs, false);
+            std::vector<float> normed(H);
+            memcpy(normed.data(), xj, H * sizeof(float));
+            rmsnorm(normed.data(), model.fw_ptr(std::string(pfx) + "attn_norm.weight"), H);
+            float xs = absmean(normed.data(), H);
+            ternary_matmul_auto(normed.data(), model.tw(std::string(pfx) + "attn.q_proj.latent_weights"), q.data() + j * H, xs, false);
+            ternary_matmul_auto(normed.data(), model.tw(std::string(pfx) + "attn.k_proj.latent_weights"), k.data() + j * H, xs, false);
+            ternary_matmul_auto(normed.data(), model.tw(std::string(pfx) + "attn.v_proj.latent_weights"), v.data() + j * H, xs, false);
         }
 
         // Store K, V for all new positions

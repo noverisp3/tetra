@@ -28,6 +28,7 @@ static std::vector<int> parse_tokens(const char* str) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <model.bin> <token_ids> [max_new_tokens] [temperature] [top_k] [top_p]\n", argv[0]);
+        fprintf(stderr, "  max_new_tokens=0: dump logits (no generation)\n");
         fprintf(stderr, "  Special tokens: 1=BOS, 2=EOS (auto-stops on EOS)\n");
         return 1;
     }
@@ -58,6 +59,17 @@ int main(int argc, char** argv) {
     auto t3 = std::chrono::high_resolution_clock::now();
     double prefill_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
     fprintf(stderr, "Prefill: %.1f ms (%d tokens)\n", prefill_ms, (int)tokens.size());
+
+    // Dump logits mode: when max_new == 0, output logits to stdout and exit
+    if (max_new == 0) {
+        for (size_t i = 0; i < logits.size(); i++) {
+            if (i > 0) printf(" ");
+            printf("%.8f", logits[i]);
+        }
+        printf("\n");
+        fflush(stdout);
+        return 0;
+    }
 
     auto t4 = std::chrono::high_resolution_clock::now();
     int generated = 0;
