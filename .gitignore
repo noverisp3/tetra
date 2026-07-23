@@ -52,3 +52,5 @@ temp_*.py
 debug.txt
 
 train_log.txt
+inference/*.txt
+inference/*.log
