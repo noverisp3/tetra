@@ -72,7 +72,6 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
     stderr = proc.stderr.read()
     proc.stderr.close()
 
-    print()
     if stderr:
         print(stderr, file=sys.stderr, end="")
     return prev_text

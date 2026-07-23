@@ -12,6 +12,7 @@ import sys
 import time
 import argparse
 import numpy as np
+import torch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -401,7 +402,7 @@ def main():
         export_graph(trainer, config.save_dir)
 
     # Generate sample
-    print("\n[Sample Generation]")
+    print("\nSample generation:")
     enc = get_tokenizer_compat(args.tokenizer_dir)
     prompt = "Hello"
     prompt_ids = enc.encode(prompt)

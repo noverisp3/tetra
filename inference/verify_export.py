@@ -33,10 +33,12 @@ def load_binary_model(path: str) -> dict:
     with open(path, "rb") as f:
         # Header (64 bytes)
         header = f.read(64)
-        magic, version, vocab_size, hidden_dim, num_layers, num_heads, ffn_dim, max_seq_len, ternary_count, fp32_count = \
+        magic, version, vocab_size, hidden_dim, num_layers, num_heads, ffn_dim, \
+        max_seq_len, ternary_count, fp32_count = \
             struct.unpack("<4sIIIIIIIQQ", header[:48])
         assert magic == b"TETR", f"Bad magic: {magic}"
-        print(f"Header: v{version}, vocab={vocab_size}, hidden={hidden_dim}, layers={num_layers}, heads={num_heads}, ffn={ffn_dim}, seq={max_seq_len}")
+        print(f"Header: v{version} vocab={vocab_size} hidden={hidden_dim} "
+          f"layers={num_layers} heads={num_heads} ffn={ffn_dim} seq={max_seq_len}")
 
         # Ternary weights
         for _ in range(6 * num_layers):  # q,k,v,o,gate_up,down per layer
@@ -105,8 +107,8 @@ def compare(pytorch_model, binary_weights):
 
 
 def main():
-    ckpt_path = sys.argv[1] if len(sys.argv) > 1 else "checkpoints_local/checkpoint_000200.pt"
-    bin_path = sys.argv[2] if len(sys.argv) > 2 else "inference/tetra_model.bin"
+    ckpt_path = sys.argv[1] if len(sys.argv) > 1 else None
+    bin_path = sys.argv[2] if len(sys.argv) > 2 else "tetra_model.bin"
 
     print("Loading PyTorch model...")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)

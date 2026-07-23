@@ -153,7 +153,7 @@ def main():
     early_loss = sum(losses[:5]) / 5
     late_loss = sum(losses[-5:]) / 5
     if late_loss < early_loss:
-        print("\n[PASS] Loss decreased - STE + ternary quantization working!")
+        print("\nPASS: Loss decreased - STE + ternary quantization working!")
     else:
         print("\nWarning: Loss did not decrease - may need hyperparameter tuning")
 

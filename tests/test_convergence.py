@@ -27,10 +27,12 @@ def run(label, model, loader):
     delta = losses[-1] - losses[0]
     print(f"{label}: start={losses[0]:.2f} best={best:.2f} end={losses[-1]:.2f} delta={delta:+.2f}")
 
-print("=" * 55)
 loader = DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=0)
 run("STE", TernaryTransformerModel(vocab, 128, 2, 4, 512, max_seq_len=seq, ternary_scale=1.0), loader)
 
 for th in [2, 5, 10, 20, 50]:
     loader = DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=0)
-    run(f"Stochastic(th={th})", StochasticTransformerModel(vocab, 128, 2, 4, 512, max_seq_len=seq, threshold=float(th)), loader)
+    run(f"Stochastic(th={th})",
+        StochasticTransformerModel(vocab, 128, 2, 4, 512,
+                             max_seq_len=seq, threshold=float(th)),
+        loader)

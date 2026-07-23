@@ -53,7 +53,7 @@ def compute_ppl_pytorch(model, tokens, block_size=128, max_batches=200):
 
 def main():
     parser = argparse.ArgumentParser(description="Tetra Perplexity Benchmark")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_010000.pt")
+    parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--tokenizer-dir", type=str, default="tokenizer")
     parser.add_argument("--block-size", type=int, default=128)

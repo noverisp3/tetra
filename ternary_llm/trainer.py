@@ -197,7 +197,8 @@ class CosineScheduler:
         if step < self.warmup_steps:
             return step / max(1, self.warmup_steps)
         progress = (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
-        return self.min_lr / self.base_lrs[0] + 0.5 * (1 - self.min_lr / self.base_lrs[0]) * (1 + math.cos(math.pi * progress))
+        decay = 0.5 * (1 - self.min_lr / self.base_lrs[0]) * (1 + math.cos(math.pi * progress))
+        return self.min_lr / self.base_lrs[0] + decay
 
 
 class TernaryTrainer:
@@ -295,7 +296,11 @@ class TernaryTrainer:
         self.autocast_dtype = None    # autocast dtype (unused, kept for compat)
         self.scaler = None
         if config.dtype in ("float16", "bfloat16"):
-            bf16_ok = config.dtype == "bfloat16" and self.device.type == "cuda" and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            bf16_ok = (
+            config.dtype == "bfloat16"
+            and self.device.type == "cuda"
+            and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+        )
             self.activation_dtype = torch.bfloat16 if bf16_ok else torch.float16
             if self.activation_dtype == torch.float16 and self.device.type == "cuda":
                 self.scaler = torch.amp.GradScaler("cuda")
@@ -417,12 +422,12 @@ class TernaryTrainer:
                     avg_bwd = self.bwd_time / self.micro_steps
                     if self.config.debug:
                         tqdm.write(
-                            f"  [TIME] fwd={avg_fwd:.1f}s | bwd={avg_bwd:.1f}s | total={avg_fwd+avg_bwd:.1f}s"
+                            f"  Timing: fwd={avg_fwd:.1f}s | bwd={avg_bwd:.1f}s | total={avg_fwd+avg_bwd:.1f}s"
                         )
                         # Per-layer timing (last micro-batch)
                         if hasattr(self.model, '_layer_times') and self.model._layer_times:
                             lt = self.model._layer_times
-                            tqdm.write(f"  [TIME] layers: " + " | ".join(
+                            tqdm.write(f"  Layer timing: " + " | ".join(
                                 f"L{i}={lt[i]:.3f}s" for i in range(len(lt))
                             ))
                 self.fwd_time = 0.0
@@ -475,7 +480,7 @@ class TernaryTrainer:
                     flip_time = time.perf_counter() - flip_t0
                     self.log_mem("after apply_bit_flips")
                     if self.config.debug:
-                        tqdm.write(f"  [TIME] flip={flip_time:.1f}s")
+                        tqdm.write(f"  Bit-flip time: {flip_time:.1f}s")
                 elif self.config.debug:
                     tqdm.write(f"  Optimizer step: {opt_time:.1f}s")
 

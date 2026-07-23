@@ -1,4 +1,4 @@
-﻿"""Data pipeline for Tetra -- tokenizer, dataset, dataloaders.
+"""Data pipeline for Tetra -- tokenizer, dataset, dataloaders.
 
 Uses a custom BPE tokenizer trained on TinyStories (not GPT-2/tiktoken).
 Tokenizer is stored in tokenizer/tetra_tokenizer.json.
@@ -374,7 +374,10 @@ class MultiSourceChunkedDataset(Dataset):
         return x, y
 
 
-def create_multi_source_dataloaders(data_dir, block_size=128, batch_size=8, val_split=0.05, num_workers=0, pin_memory=False):
+def create_multi_source_dataloaders(
+    data_dir, block_size=128, batch_size=8, val_split=0.05,
+    num_workers=0, pin_memory=False,
+):
     """Create train/val dataloaders from multi-source chunks (manifest.json format).
 
     Args:

@@ -113,7 +113,10 @@ class StochasticMultiHeadAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         dp = self.attn_dropout.p if self.training else 0.0
-        out = F.scaled_dot_product_attention(q.float(), k.float(), v.float(), dropout_p=dp, is_causal=(mask is None)).to(x.dtype)
+        out = F.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(),
+            dropout_p=dp, is_causal=(mask is None)
+        ).to(x.dtype)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(out)
 
