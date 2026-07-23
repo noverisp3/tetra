@@ -61,6 +61,10 @@ int main(int argc, char** argv) {
     int generated = 0;
     bool stopped = false;
     for (int i = 0; i < max_new && !stopped; i++) {
+        if (cache.pos >= model.header.max_seq_len) {
+            fprintf(stderr, " [truncated at max_seq_len=%d]\n", model.header.max_seq_len);
+            break;
+        }
         int next_token = tetra::sample(logits, temp, top_k, top_p);
         if (next_token >= (int)model.header.vocab_size) {
             next_token = model.header.vocab_size - 1;
