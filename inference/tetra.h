@@ -258,7 +258,7 @@ static void softmax(float* x, int n) {
     float mx = *std::max_element(x, x + n);
     float sum = 0.0f;
     for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); sum += x[i]; }
-    for (int i = 0; i < n; i++) x[i] /= sum;
+    if (sum > 0.0f) for (int i = 0; i < n; i++) x[i] /= sum;
 }
 
 // Mean absolute value (for XNOR scale factor)
