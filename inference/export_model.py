@@ -124,7 +124,7 @@ def export_model(model: TernaryTransformerModel, output_path: str):
             f.write(struct.pack("<f", alpha))
             f.write(pack_ternary(w_ternary))
 
-        # Write fp32/int8 weights (skip lm_head — tied to token_embedding)
+        # Write fp32/int8 weights (skip lm_head - tied to token_embedding)
         for name, param in model.named_parameters():
             is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
             if is_ternary:
@@ -136,7 +136,6 @@ def export_model(model: TernaryTransformerModel, output_path: str):
             shape = list(param.shape)
             while len(shape) < 4:
                 shape.append(1)
-            padded = shape + [1] * (4 - len(shape))
 
             name_bytes = name.encode("utf-8")
             f.write(struct.pack("<I", len(name_bytes)))
@@ -150,13 +149,13 @@ def export_model(model: TernaryTransformerModel, output_path: str):
                 w = param.data.float().cpu().numpy().flatten()
                 scale = np.max(np.abs(w)) / 127.0
                 w_int8 = np.clip(np.round(w / scale), -128, 127).astype(np.int8)
-                f.write(struct.pack("<4I", *padded))
+                f.write(struct.pack("<4I", *shape))
                 f.write(struct.pack("<f", scale))
                 f.write(w_int8.tobytes())
             else:
                 f.write(struct.pack("<B", 0))  # dtype=FP32
                 w_fp32 = param.data.float().cpu().numpy().flatten()
-                f.write(struct.pack("<4I", *padded))
+                f.write(struct.pack("<4I", *shape))
                 f.write(w_fp32.tobytes())
 
     file_size = Path(output_path).stat().st_size

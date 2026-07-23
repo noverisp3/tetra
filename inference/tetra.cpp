@@ -10,14 +10,17 @@
 #include <string>
 #include <sstream>
 #include <chrono>
-#include <ctime>
 
 static std::vector<int> parse_tokens(const char* str) {
     std::vector<int> tokens;
     std::stringstream ss(str);
     std::string item;
     while (std::getline(ss, item, ',')) {
-        tokens.push_back(std::stoi(item));
+        try {
+            tokens.push_back(std::stoi(item));
+        } catch (...) {
+            fprintf(stderr, "Warning: skipping invalid token '%s'\n", item.c_str());
+        }
     }
     return tokens;
 }
@@ -56,7 +59,6 @@ int main(int argc, char** argv) {
     double prefill_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
     fprintf(stderr, "Prefill: %.1f ms (%d tokens)\n", prefill_ms, (int)tokens.size());
 
-    srand((unsigned int)time(NULL));
     auto t4 = std::chrono::high_resolution_clock::now();
     int generated = 0;
     bool stopped = false;

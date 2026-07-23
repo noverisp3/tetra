@@ -6,6 +6,7 @@ __all__ = [
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .layers import RMSNorm, TopKActivation
 from .attention import TernaryMultiHeadAttention
 from .ffn import TernaryFFN
@@ -268,18 +269,21 @@ class StochasticTransformerBlock(nn.Module):
         self.ffn_topk = TopKActivation(topk)
         self.ffn = StochasticFFN(hidden_dim, ffn_dim, dropout, scale, threshold, int8=int8)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None,
+                past_kv: tuple[torch.Tensor, torch.Tensor] | None = None
+                ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         r = x
         x = self.attn_norm(x)
         x = self.attn_topk(x)
-        x = self.attn(x, mask=mask)
+        past_k, past_v = past_kv if past_kv is not None else (None, None)
+        x, k, v = self.attn(x, mask=mask, past_k=past_k, past_v=past_v)
         x = x + r
         r = x
         x = self.ffn_norm(x)
         x = self.ffn_topk(x)
         x = self.ffn(x)
         x = x + r
-        return x
+        return x, (k, v)
 
     @torch.no_grad()
     def apply_bit_flips(self) -> None:
@@ -290,7 +294,7 @@ class StochasticTransformerBlock(nn.Module):
 class StochasticTransformerModel(nn.Module):
     """Full transformer with Stochastic Bit-Flip (packed 2-bit weights, accumulator flip).
 
-    No optimizer for ternary weights — gradient auto-accumulates into
+    No optimizer for ternary weights - gradient auto-accumulates into
     accumulator and flips when threshold exceeded.
     """
 
@@ -317,26 +321,41 @@ class StochasticTransformerModel(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, targets: torch.Tensor | None = None,
                 past_key_values: list | None = None, activation_dtype: torch.dtype | None = None
-                ) -> tuple[torch.Tensor, torch.Tensor | None, None]:
+                ) -> tuple[torch.Tensor, torch.Tensor | None, list[tuple[torch.Tensor, torch.Tensor]] | None]:
         B, T = input_ids.shape
-        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
-        x = self.token_embedding(input_ids) + self.pos_embedding(pos)
+        if past_key_values is None:
+            pos_offset = 0
+        else:
+            pos_offset = past_key_values[0][0].size(-2)
+        positions = torch.arange(pos_offset, pos_offset + T, device=input_ids.device).unsqueeze(0)
+        input_ids = input_ids.clamp(0, self.token_embedding.num_embeddings - 1)
+        x = self.token_embedding(input_ids) + self.pos_embedding(positions)
+        if activation_dtype is not None:
+            x = x.to(activation_dtype)
         x = self.dropout(x)
-        for layer in self.layers:
-            x = layer(x)
+        new_key_values = []
+        for i, layer in enumerate(self.layers):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            x, kv = layer(x, past_kv=past_kv)
+            new_key_values.append(kv)
         x = self.norm(x)
         logits = self.lm_head(x).float()
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
-        return logits, loss, None
+        return logits, loss, new_key_values
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 100,
                  temperature: float = 1.0, top_k: int | None = None) -> torch.Tensor:
-        for _ in range(max_new_tokens):
-            idx = input_ids if input_ids.size(1) <= self.max_seq_len else input_ids[:, -self.max_seq_len:]
-            logits, _, _ = self(idx)
+        past_key_values = None
+        for step in range(max_new_tokens):
+            if step == 0:
+                idx_cond = input_ids if input_ids.size(1) <= self.max_seq_len else input_ids[:, -self.max_seq_len:]
+                logits, _, past_key_values = self(idx_cond, past_key_values=None)
+            else:
+                last_token = input_ids[:, -1:]
+                logits, _, past_key_values = self(last_token, past_key_values=past_key_values)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))

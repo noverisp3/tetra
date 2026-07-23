@@ -139,7 +139,7 @@ class FusedTernaryLinear(torch.autograd.Function):
     Backward: grad_x = grad @ W_ternary.T, grad_W = x^T @ grad (STE)
 
     Saves ternary weights to avoid recomputing abs()
-    in backward — avoids OOM on memory-constrained devices.
+    in backward - avoids OOM on memory-constrained devices.
     """
 
     @staticmethod
@@ -328,7 +328,7 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
     Forward: quantize x -> int8, matmul, dequantize.
     - CPU: uses C++ int8 ternary matmul kernel (no float multiplications).
     - DML/GPU: pure-PyTorch fallback (dequant+float matmul, same quantization noise).
-    Backward: STE — grad flows through float matmul.
+    Backward: STE - grad flows through float matmul.
     """
 
     @staticmethod

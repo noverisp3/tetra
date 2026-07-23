@@ -69,7 +69,7 @@ def load_binary_model(path: str) -> dict:
             weights[name] = arr
             total_fp32_tensors += 1
 
-        print(f"Loaded {len(weights)} tensors ({7*num_layers} ternary, {total_fp32_tensors} fp32)")
+        print(f"Loaded {len(weights)} tensors ({6*num_layers} ternary, {total_fp32_tensors} fp32)")
     return weights
 
 

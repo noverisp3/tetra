@@ -1,18 +1,46 @@
 """Benchmark AVX2 vs AVX-512 for ternary ops."""
-import sys, os, time
+import sys, os, time, subprocess
 
-# Activate VS 2022 dev environment
-vs_vcvars = r"C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvars64.bat"
-if os.path.exists(vs_vcvars):
-    import subprocess
-    result = subprocess.run(
-        f'cmd /c "call \"{vs_vcvars}\" >nul 2>nul && set"',
-        capture_output=True, text=True, shell=True
-    )
-    for line in result.stdout.splitlines():
-        if '=' in line:
-            k, v = line.split('=', 1)
-            os.environ[k] = v
+# Activate VS dev environment (search multiple locations)
+_vcvars_paths = [
+    os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+                 "Microsoft Visual Studio", "2022", "Community", "VC",
+                 "Auxiliary", "Build", "vcvars64.bat"),
+    os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"),
+                 "Microsoft Visual Studio", "2022", "Community", "VC",
+                 "Auxiliary", "Build", "vcvars64.bat"),
+    os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+                 "Microsoft Visual Studio", "2022", "Professional", "VC",
+                 "Auxiliary", "Build", "vcvars64.bat"),
+    os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"),
+                 "Microsoft Visual Studio", "2022", "Professional", "VC",
+                 "Auxiliary", "Build", "vcvars64.bat"),
+]
+_vcvars = next((p for p in _vcvars_paths if os.path.exists(p)), None)
+if _vcvars is None:
+    try:
+        vswhere = subprocess.run(["vswhere", "-latest", "-property", "installationPath"],
+                                 capture_output=True, text=True)
+        if vswhere.returncode == 0:
+            vs_path = vswhere.stdout.strip()
+            candidate = os.path.join(vs_path, "VC", "Auxiliary", "Build", "vcvars64.bat")
+            if os.path.exists(candidate):
+                _vcvars = candidate
+    except FileNotFoundError:
+        pass
+
+if _vcvars is None:
+    print("ERROR: Visual Studio not found.")
+    sys.exit(1)
+
+result = subprocess.run(
+    f'cmd /c "call \"{_vcvars}\" >nul 2>nul && set"',
+    capture_output=True, text=True, shell=True
+)
+for line in result.stdout.splitlines():
+    if '=' in line:
+        k, v = line.split('=', 1)
+        os.environ[k] = v
 
 import torch
 from torch.utils.cpp_extension import load

@@ -11,8 +11,8 @@
 #include <algorithm>
 #include <immintrin.h>
 
-// Pack: float {-1, 0, +1} → packed uint8 (4 weights/byte)
-// Encoding: -1→0, 0→1, +1→2  (2 bits per weight)
+// Pack: float {-1, 0, +1} -> packed uint8 (4 weights/byte)
+// Encoding: -1->0, 0->1, +1->2  (2 bits per weight)
 
 at::Tensor pack_ternary(at::Tensor w) {
     TORCH_CHECK(w.dtype() == torch::kFloat32 || w.dtype() == torch::kFloat16,
@@ -38,7 +38,7 @@ at::Tensor pack_ternary(at::Tensor w) {
     return packed;
 }
 
-// Unpack: packed uint8 → float {-1, 0, +1}
+// Unpack: packed uint8 -> float {-1, 0, +1}
 
 at::Tensor unpack_ternary(at::Tensor packed, std::vector<int64_t> shape) {
     TORCH_CHECK(packed.dtype() == torch::kUInt8, "unpack_ternary: expected uint8 packed input");
@@ -247,7 +247,7 @@ int64_t apply_bit_flips(at::Tensor packed_weights, at::Tensor accumulator,
     auto* packed = packed_weights.data_ptr<uint8_t>();
     const auto* acc = accumulator.data_ptr<float>();
 
-    // Unpack → flip → repack
+    // Unpack -> flip -> repack
     auto w = unpack_ternary(packed_weights, shape_w);
     auto* w_data = w.data_ptr<float>();
 
@@ -271,7 +271,7 @@ int64_t apply_bit_flips(at::Tensor packed_weights, at::Tensor accumulator,
     return flips;
 }
 
-// INT8 ternary matmul: int8 activations × packed ternary weights → float32 output
+// INT8 ternary matmul: int8 activations x packed ternary weights -> float32 output
 // Pure integer in forward: conditional add/sub, int32 accumulation, final float scale
 // Returns float32 for seamless integration with float norms/attention
 
@@ -350,5 +350,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("apply_bit_flips", &apply_bit_flips,
           "Check accumulators and flip bits where threshold exceeded");
     m.def("ternary_matmul_int8", &ternary_matmul_int8,
-          "INT8 ternary matmul: int8 activations × packed ternary → int32 accum → float");
+          "INT8 ternary matmul: int8 activations x packed ternary -> int32 accum -> float");
 }

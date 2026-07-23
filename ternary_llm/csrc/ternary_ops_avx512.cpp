@@ -1,4 +1,4 @@
-// Ternary Operations for Tetra LLM — AVX-512 variant
+// Ternary Operations for Tetra LLM - AVX-512 variant
 // Uses 512-bit SIMD (16 float32/instruction) for 2x throughput vs AVX2
 // Compiled separately with /arch:AVX512, loaded at runtime if CPU supports it
 
@@ -12,7 +12,7 @@
 // Pack 16 ternary floats at once using AVX-512
 static void pack_16_floats(const float* data, uint8_t* out, int64_t base, int64_t n) {
     __m512 v = _mm512_loadu_ps(data + base);
-    // Compare thresholds: val >= 0.5f → +1=3 (but actually 2), val <= -0.5f → -1=0, else 0=1
+    // Compare thresholds: val >= 0.5f -> +1=3 (but actually 2), val <= -0.5f -> -1=0, else 0=1
     // We'll generate uint8 indices then combine
     // Actually, just use the scalar approach for correctness (pack is not hot path)
     for (int i = 0; i < 16 && base + i < n; i++) {
@@ -176,7 +176,7 @@ at::Tensor ternary_matmul_avx512(at::Tensor x, at::Tensor packed_weights,
     return result;
 }
 
-// INT8 ternary matmul: int8 activations × packed ternary → float32 output
+// INT8 ternary matmul: int8 activations x packed ternary -> float32 output
 // (scalar implementation, AVX-512 optimization can be added later)
 
 at::Tensor ternary_matmul_int8_avx512(at::Tensor x_int8, at::Tensor packed_weights,

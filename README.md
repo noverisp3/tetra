@@ -1,4 +1,4 @@
-# Tetra — Pure Ternary LLM
+# Tetra - Pure Ternary LLM
 
 **Tetra** is a decoder-only transformer trained entirely with **ternary weights** ({-1, 0, +1}) and exported to a **3.7 MB C++ binary** that runs at **420+ tok/s** on CPU.
 

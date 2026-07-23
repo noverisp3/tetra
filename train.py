@@ -339,7 +339,7 @@ def main():
         ) * 2
         attn_layers = sum(1 for l in model.layers if l.is_attention)
         ssm_layers = sum(1 for l in model.layers if not l.is_attention)
-        print(f"Mode: Hybrid ({ssm_layers}× SSM + {attn_layers}× Attention)")
+        print(f"Mode: Hybrid ({ssm_layers}x SSM + {attn_layers}x Attention)")
         print(f"Total params: {total_params:,}")
         print(f"Ternary params: {ternary_params:,} ({ternary_params / 8 / 1024:.0f} KB packed)")
     elif is_stochastic:

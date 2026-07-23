@@ -70,7 +70,7 @@ class TernarySSMBlock(nn.Module):
         x_conv = F.silu(x_conv)
 
         # SSM scan via parallel prefix: h_t = decay^t · cumsum(Δ·x_j / decay^j)
-        # No Python loop — O(T) with 4 vectorized ops.
+        # No Python loop - O(T) with 4 vectorized ops.
         inner_dim = x_conv.size(-1)
         delta = F.softplus(self.log_delta).view(1, inner_dim)
         # decay close to 1 to avoid underflow in decay^T for long sequences

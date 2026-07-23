@@ -107,18 +107,24 @@ class StochasticMultiHeadAttention(nn.Module):
         self.o_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8)
         self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None,
+                past_k: torch.Tensor | None = None, past_v: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, C = x.shape
         q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        if past_k is not None:
+            k = torch.cat([past_k, k], dim=-2)
+            v = torch.cat([past_v, v], dim=-2)
         dp = self.attn_dropout.p if self.training else 0.0
+        is_causal = (mask is None) and (past_k is None)
         out = F.scaled_dot_product_attention(
             q.float(), k.float(), v.float(),
-            dropout_p=dp, is_causal=(mask is None)
+            dropout_p=dp, is_causal=is_causal
         ).to(x.dtype)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.o_proj(out)
+        return self.o_proj(out), k, v
 
     @torch.no_grad()
     def apply_bit_flips(self) -> None:

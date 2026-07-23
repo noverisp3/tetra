@@ -1,5 +1,5 @@
 #pragma once
-// Tetra — C++ inference engine
+// Tetra - C++ inference engine
 // Build: build.bat [avx2|avx10|avx512] (scalar if no arg)
 // Binary Format v2:
 //   Header (64B): magic, version, dims, param counts
@@ -13,6 +13,7 @@
 #include <string>
 #include <unordered_map>
 #include <algorithm>
+#include <random>
 #include <numeric>
 #include <cstdio>
 #include <cstdlib>
@@ -125,7 +126,7 @@ static inline float dot_product_simd(const float* a, const float* b, int n) {
 #define TETRA_PREFETCH(addr) __builtin_prefetch(addr, 0, 3)
 #endif
 
-// Dequantize one row of 2-bit packed ternary → float array
+// Dequantize one row of 2-bit packed ternary -> float array
 static inline void dequantize_row(const uint8_t* packed, int row_offset, int cols, float* out) {
     static const float lut[4] = {-1.0f, 0.0f, 1.0f, 0.0f};
     int c = 0, num_bytes = (cols + 3) / 4;
@@ -140,9 +141,10 @@ static inline void dequantize_row(const uint8_t* packed, int row_offset, int col
 
 // Precompute: dequantize all weights to float at load time
 static void precompute_floats(TernaryWeightXNOR& w) {
+    int row_bytes = (w.cols + 3) / 4;
     w.floats.resize(w.rows * w.cols);
     for (int r = 0; r < w.rows; r++) {
-        dequantize_row(w.packed.data(), r * w.cols / 4, w.cols, w.floats.data() + r * w.cols);
+        dequantize_row(w.packed.data(), r * row_bytes, w.cols, w.floats.data() + r * w.cols);
     }
 }
 
@@ -485,7 +487,7 @@ struct KVCache {
     }
 };
 
-// Forward pass — supports both decode (single token) and batch prefill (multiple tokens)
+// Forward pass - supports both decode (single token) and batch prefill (multiple tokens)
 static std::vector<float> forward(
     const Model& model,
     const std::vector<int>& tokens,
@@ -698,6 +700,11 @@ static std::vector<float> forward(
     return logits;
 }
 
+static std::mt19937& rng() {
+    static thread_local std::mt19937 gen((std::random_device())());
+    return gen;
+}
+
 static int sample(const std::vector<float>& logits, float temperature, int top_k, float top_p) {
     int n = (int)logits.size();
     std::vector<float> scaled(n);
@@ -737,7 +744,7 @@ static int sample(const std::vector<float>& logits, float temperature, int top_k
         if (sum > 0) for (int i = 0; i < n; i++) scaled[i] /= sum;
     }
 
-    float r = (float)rand() / RAND_MAX;
+    float r = std::uniform_real_distribution<float>(0.0f, 1.0f)(rng());
     float cum = 0.0f;
     for (int i = 0; i < n; i++) { cum += scaled[i]; if (r < cum) return i; }
     return n - 1;

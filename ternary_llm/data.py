@@ -29,14 +29,14 @@ def get_tokenizer(tokenizer_dir="tokenizer"):
     if _tokenizer_cache is not None:
         return _tokenizer_cache
 
-    # Custom BPE (default) — simpler, smaller vocab, no transformers dependency
+    # Custom BPE (default) - simpler, smaller vocab, no transformers dependency
     from tokenizers import Tokenizer
     tok_path = Path(tokenizer_dir) / "tetra_tokenizer.json"
     if tok_path.exists():
         _tokenizer_cache = Tokenizer.from_file(str(tok_path))
         return _tokenizer_cache
 
-    # GPT-2 (transformers) — only if explicitly named "gpt2"
+    # GPT-2 (transformers) - only if explicitly named "gpt2"
     if tokenizer_dir == "gpt2":
         try:
             from transformers import GPT2Tokenizer
@@ -207,7 +207,6 @@ def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stori
 
 class ChunkedDataset(Dataset):
     """Non-overlapping chunks of tokens for fast shuffling."""
-    """Non-overlapping chunks of tokens. Much faster to shuffle than sliding window."""
     def __init__(self, tokens, block_size):
         n = len(tokens)
         # Reserve 1 for y offset: max valid start_idx = n - block_size - 1
