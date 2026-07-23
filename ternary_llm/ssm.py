@@ -42,9 +42,10 @@ class TernarySSMBlock(nn.Module):
             hidden_dim, 2 * inner_dim, scale=scale, threshold=threshold, int8=int8
         )
 
-        # Conv1d for local context (depthwise, same-length)
+        # Conv1d for local context (depthwise, same-length, no bias)
+        # Use fp32 forward to avoid DirectML depthwise conv1d fp16 issues
         self.conv = nn.Conv1d(
-            inner_dim, inner_dim, kernel_size=3, padding=1, groups=inner_dim
+            inner_dim, inner_dim, kernel_size=3, padding=1, groups=inner_dim, bias=False
         )
 
         # SSM parameters (per-channel)
@@ -65,15 +66,19 @@ class TernarySSMBlock(nn.Module):
         fused = self.x_proj(x)  # (B, T, 2xinner)
         x_in, gate = fused.chunk(2, dim=-1)
 
-        # Conv1d: (B, T, C) -> (B, C, T) -> Conv -> (B, C, T) -> (B, T, C)
-        x_conv = self.conv(x_in.transpose(1, 2)).transpose(1, 2)
+        # Conv1d in fp32 (DirectML depthwise conv1d may not support fp16)
+        dt = x_in.dtype
+        x_conv = F.conv1d(
+            x_in.transpose(1, 2).float(),
+            self.conv.weight.float(), None,
+            padding=1, groups=self.conv.groups
+        ).transpose(1, 2)
         x_conv = F.silu(x_conv)
 
         # SSM scan via parallel prefix: h_t = decay^t · cumsum(Δ·x_j / decay^j)
-        # No Python loop - O(T) with 4 vectorized ops.
+        # All SSM ops in fp32 for numerical stability
         inner_dim = x_conv.size(-1)
         delta = F.softplus(self.log_delta).view(1, inner_dim)
-        # decay close to 1 to avoid underflow in decay^T for long sequences
         decay = (1 - delta * torch.sigmoid(self.A_log).view(1, inner_dim)).clamp(min=0.98, max=0.9999)
         T = x_conv.size(1)
         t_idx = torch.arange(T, device=x.device, dtype=torch.float32).view(T, 1)
@@ -83,8 +88,8 @@ class TernarySSMBlock(nn.Module):
         cum = z.cumsum(dim=1)
         y = decay_pow.unsqueeze(0) * cum
 
-        # Gate: y x SiLU(gate)
-        out = y * F.silu(gate)
+        # Gate: y x SiLU(gate), cast to activation dtype before out_proj
+        out = (y * F.silu(gate.float())).to(dt)
         return self.out_proj(out) + residual
 
     @torch.no_grad()

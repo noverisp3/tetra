@@ -44,7 +44,7 @@ class HybridBlock(nn.Module):
         r = x
         x = self.attn_norm(x)
         x = self.attn_topk(x)
-        x = self.mix(x, mask=mask) if self.is_attention else self.mix(x)
+        x = self.mix(x, mask=mask)[0] if self.is_attention else self.mix(x)
         x = x + r
         r = x
         x = self.ffn_norm(x)
