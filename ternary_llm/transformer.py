@@ -2,6 +2,7 @@ import time
 __all__ = [
     "TernaryTransformerBlock", "TernaryTransformerModel",
     "StochasticTransformerBlock", "StochasticTransformerModel",
+    "StochasticMLABlock", "StochasticMLAModel",
 ]
 
 import torch
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 from .layers import RMSNorm, TopKActivation
 from .attention import TernaryMultiHeadAttention
 from .ffn import TernaryFFN
+from .mla import StochasticMLAAttention
 
 
 class TernaryTransformerBlock(nn.Module):
@@ -377,5 +379,126 @@ class StochasticTransformerModel(nn.Module):
 
     @torch.no_grad()
     def apply_bit_flips(self) -> None:
+        for layer in self.layers:
+            layer.apply_bit_flips()
+
+
+class StochasticMLABlock(nn.Module):
+    def __init__(self, hidden_dim, num_heads, ffn_dim, dropout=0.0, scale=1.0, threshold=None,
+                 int8=False, topk=1.0, per_channel=False, group_size=0, kv_latent_dim=None, rope_per_head=None):
+        super().__init__()
+        from .ffn import StochasticFFN
+        self.attn_norm = RMSNorm(hidden_dim)
+        self.attn_topk = TopKActivation(topk)
+        self.attn = StochasticMLAAttention(
+            hidden_dim, num_heads, dropout, scale, threshold,
+            int8=int8, per_channel=per_channel, group_size=group_size,
+            kv_latent_dim=kv_latent_dim, rope_per_head=rope_per_head,
+        )
+        self.ffn_norm = RMSNorm(hidden_dim)
+        self.ffn_topk = TopKActivation(topk)
+        self.ffn = StochasticFFN(hidden_dim, ffn_dim, dropout, scale, threshold,
+                                 int8=int8, per_channel=per_channel, group_size=group_size)
+
+    def forward(self, x, mask=None, past_kv=None):
+        r = x
+        x = self.attn_norm(x)
+        x = self.attn_topk(x)
+        x, kv_latent, k_rope = self.attn(x, mask=mask, past_kv=past_kv)
+        x = x + r
+        r = x
+        x = self.ffn_norm(x)
+        x = self.ffn_topk(x)
+        x = self.ffn(x)
+        x = x + r
+        return x, (kv_latent, k_rope)
+
+    @torch.no_grad()
+    def set_thresholds(self, threshold):
+        self.attn.set_thresholds(threshold)
+        self.ffn.set_thresholds(threshold)
+
+    @torch.no_grad()
+    def apply_bit_flips(self):
+        self.attn.apply_bit_flips()
+        self.ffn.apply_bit_flips()
+
+
+class StochasticMLAModel(nn.Module):
+    def __init__(self, vocab_size, hidden_dim, num_layers, num_heads, ffn_dim,
+                 max_seq_len=2048, dropout=0.0, scale=1.0, threshold=None, int8=False,
+                 topk=1.0, per_channel=False, group_size=0, kv_latent_dim=None, rope_per_head=None):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.max_seq_len = max_seq_len
+        self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.layers = nn.ModuleList([
+            StochasticMLABlock(
+                hidden_dim, num_heads, ffn_dim, dropout, scale, threshold,
+                int8=int8, topk=topk, per_channel=per_channel, group_size=group_size,
+                kv_latent_dim=kv_latent_dim, rope_per_head=rope_per_head,
+            )
+            for _ in range(num_layers)
+        ])
+        self.norm = RMSNorm(hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+        self.lm_head.weight = self.token_embedding.weight
+        self.dropout = nn.Dropout(dropout)
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.lm_head.weight = self.token_embedding.weight
+        return self
+
+    def forward(self, input_ids, targets=None, past_key_values=None, activation_dtype=None):
+        B, T = input_ids.shape
+        if past_key_values is None:
+            pos_offset = 0
+        else:
+            pos_offset = past_key_values[0][0].size(-2)
+        positions = torch.arange(pos_offset, pos_offset + T, device=input_ids.device).unsqueeze(0)
+        input_ids = input_ids.clamp(0, self.token_embedding.num_embeddings - 1)
+        x = self.token_embedding(input_ids)
+        if activation_dtype is not None:
+            x = x.to(activation_dtype)
+        x = self.dropout(x)
+        new_key_values = []
+        for i, layer in enumerate(self.layers):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            x, kv = layer(x, past_kv=past_kv)
+            new_key_values.append(kv)
+        x = self.norm(x)
+        logits = self.lm_head(x).float()
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+        return logits, loss, new_key_values
+
+    @torch.no_grad()
+    def generate(self, input_ids, max_new_tokens=100, temperature=1.0, top_k=None):
+        past_key_values = None
+        for step in range(max_new_tokens):
+            if step == 0:
+                idx_cond = input_ids if input_ids.size(1) <= self.max_seq_len else input_ids[:, -self.max_seq_len:]
+                logits, _, past_key_values = self(idx_cond, past_key_values=None)
+            else:
+                last_token = input_ids[:, -1:]
+                logits, _, past_key_values = self(last_token, past_key_values=past_key_values)
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = float("-inf")
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1).clamp(0, self.token_embedding.num_embeddings - 1)
+            input_ids = torch.cat([input_ids, next_id], dim=1)
+        return input_ids
+
+    @torch.no_grad()
+    def set_thresholds(self, threshold):
+        for layer in self.layers:
+            layer.set_thresholds(threshold)
+
+    @torch.no_grad()
+    def apply_bit_flips(self):
         for layer in self.layers:
             layer.apply_bit_flips()

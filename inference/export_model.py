@@ -285,8 +285,26 @@ def main():
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     config = ckpt["config"]
     mode = config.get("mode", "ste")
+    mla = config.get("mla", False)
 
-    if mode == "stochastic":
+    if mode == "stochastic" and mla:
+        from ternary_llm.transformer import StochasticMLAModel
+        model = StochasticMLAModel(
+            vocab_size=config["vocab_size"],
+            hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"],
+            num_heads=config["num_heads"],
+            ffn_dim=config["ffn_dim"],
+            max_seq_len=config["max_seq_len"],
+            scale=config.get("ternary_scale", 1.0),
+            threshold=config.get("threshold", None),
+            int8=config.get("int8", False),
+            topk=config.get("topk", 1.0),
+            group_size=config.get("group_size", 0),
+            kv_latent_dim=config.get("kv_latent_dim", None),
+            rope_per_head=config.get("rope_per_head", None),
+        )
+    elif mode == "stochastic":
         model = StochasticTransformerModel(
             vocab_size=config["vocab_size"],
             hidden_dim=config["hidden_dim"],

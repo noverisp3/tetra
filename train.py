@@ -121,7 +121,7 @@ def main():
     parser.add_argument("--mode", type=str, default="ste", choices=["ste", "stochastic", "hybrid"],
                         help="Training mode: STE, Stochastic Bit-Flip, or Hybrid SSM-Attention (default: ste)")
     parser.add_argument("--ssm-every", type=int, default=5,
-                        help="[Hybrid] Place attention every N blocks (default: 5 -> 80% SSM, 20% attention)")
+                        help="[Hybrid] Place attention every N blocks (default: 5 -> 80%% SSM, 20%% attention)")
     parser.add_argument("--expand-factor", type=int, default=2,
                         help="[Hybrid] SSM expansion factor (default: 2)")
     parser.add_argument("--ternary-scale", type=float, default=0.7,
@@ -146,6 +146,12 @@ def main():
                         help="Print MEM/TIME diagnostics")
     parser.add_argument("--dtype", type=str, default=None, choices=["float32", "float16", "bfloat16"],
                         help="Training dtype: float32 (default), float16, or bfloat16 (CUDA)")
+    parser.add_argument("--mla", action="store_true",
+                        help="Use Multi-head Latent Attention (MLA) with compressed KV cache")
+    parser.add_argument("--kv-latent-dim", type=int, default=None,
+                        help="MLA KV latent dimension (default: 2 * head_dim)")
+    parser.add_argument("--rope-per-head", type=int, default=None,
+                        help="MLA RoPE dimension per head (default: max(4, head_dim//4))")
     args = parser.parse_args()
 
     # Input validation
@@ -314,20 +320,39 @@ def main():
             ssm_every=args.ssm_every,
         )
     elif is_stochastic:
-        model = StochasticTransformerModel(
-            vocab_size=config.vocab_size,
-            hidden_dim=config.hidden_dim,
-            num_layers=config.num_layers,
-            num_heads=config.num_heads,
-            ffn_dim=config.ffn_dim,
-            max_seq_len=config.max_seq_len,
-            scale=config.ternary_scale,
-            threshold=args.threshold,
-            int8=args.int8,
-            topk=args.topk if args.topk is not None else 1.0,
-            per_channel=config.per_channel,
-            group_size=config.group_size,
-        )
+        if args.mla:
+            from ternary_llm.transformer import StochasticMLAModel
+            model = StochasticMLAModel(
+                vocab_size=config.vocab_size,
+                hidden_dim=config.hidden_dim,
+                num_layers=config.num_layers,
+                num_heads=config.num_heads,
+                ffn_dim=config.ffn_dim,
+                max_seq_len=config.max_seq_len,
+                scale=config.ternary_scale,
+                threshold=args.threshold,
+                int8=args.int8,
+                topk=args.topk if args.topk is not None else 1.0,
+                per_channel=config.per_channel,
+                group_size=config.group_size,
+                kv_latent_dim=args.kv_latent_dim,
+                rope_per_head=args.rope_per_head,
+            )
+        else:
+            model = StochasticTransformerModel(
+                vocab_size=config.vocab_size,
+                hidden_dim=config.hidden_dim,
+                num_layers=config.num_layers,
+                num_heads=config.num_heads,
+                ffn_dim=config.ffn_dim,
+                max_seq_len=config.max_seq_len,
+                scale=config.ternary_scale,
+                threshold=args.threshold,
+                int8=args.int8,
+                topk=args.topk if args.topk is not None else 1.0,
+                per_channel=config.per_channel,
+                group_size=config.group_size,
+            )
     else:
         model = TernaryTransformerModel(
             vocab_size=config.vocab_size,
