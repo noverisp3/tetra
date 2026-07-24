@@ -4,7 +4,7 @@
 
 <h1 align="center">Tetra - Pure Ternary LLM</h1>
 
-**Tetra** is a decoder-only transformer trained entirely with **ternary weights** ({-1, 0, +1}) and exported to a **3.6 MB C++ binary** that runs at **450+ tok/s** on CPU.
+**Tetra** is a decoder-only transformer trained entirely with **ternary weights** ({-1, 0, +1}) and exported to a **3.6 MB C++ binary** that runs at **300+ tok/s** on CPU (AVX2).
 
 Three training modes:
 
@@ -88,7 +88,7 @@ Pure C++17 inference engine (`inference/tetra.h`, no dependencies):
 | Feature | Detail |
 |---------|--------|
 | **File size** | 3.6 MB (ternary weights 2-bit packed, embeddings INT8 quantized) |
-| **Speed** | 450+ tok/s (AVX2, CPU), 360+ tok/s (scalar) |
+| **Speed** | 300+ tok/s (AVX2, CPU), 80+ tok/s (scalar) |
 | **Prefill** | Parallel batch prefill — all prompt tokens in one forward pass (OpenMP) |
 | **Sampling** | Top-k + top-p + temperature + repetition penalty, matches PyTorch order |
 | **Build** | `build.bat avx2` (auto-detects VS via vswhere, enables `/openmp`) |
@@ -134,7 +134,7 @@ Trained for 15,000 steps on Intel Iris Xe (DirectML) in ~9.5 hours:
 |--------|-------|
 | **Total params** | 8,523,008 (6.3M ternary + 2.2M FP32) |
 | **Exported binary** | **3.7 MB** (INT8 embedding + 2-bit ternary weights) |
-| **C++ inference** | **424 tok/s** (AVX2) / 370+ tok/s (scalar) |
+| **C++ inference** | **300 tok/s** (AVX2) / 80 tok/s (scalar) |
 | **Dataset** | TinyStoriesV2-GPT4, 535M tokens, 80K stories |
 | **Tokenizer** | Custom BPE, vocab=8192 |
 | **Mode** | STE (latent weights) |
@@ -150,7 +150,7 @@ Trained for 15,000 steps on Intel Iris Xe (DirectML) in ~9.5 hours:
   <em><b>Figure 1:</b> Convergence curve of Tetra 8.5M (STE) on TinyStories (15,000 steps, Cosine LR Decay with Warmup). Plot includes raw + EMA-smoothed train loss and validation loss.</em>
 </p>
 
-C++ inference (exported binary, AVX2, 3.7 MB, 424 tok/s):
+C++ inference (exported binary, AVX2, 3.7 MB, 300 tok/s):
 > "Once upon a time to play a little girl named Lily. She was very much. Mia saw a big, she was so happy and a new little boy to make her toys, 'Don's time for you?' Lily said, 'I don'm sorry the toy car.' Mia did not listen the girl smiled and said, 'No, we should. I have fun worry. I want to be careful.' Lily said, you are going. 'Thank, you can help me and they are nice.'"
 
 Limited but coherent — expected for 8.5M ternary params trained for 15k steps on TinyStories. Training to 30k–50k steps would further improve narrative quality.
@@ -168,7 +168,7 @@ Trained for 15,000 steps on Intel Iris Xe (DirectML) in ~9.4 hours:
 |--------|-------|
 | **Total params** | 5,377,280 (3.14M ternary + 2.2M FP32) |
 | **Exported binary** | **3.6 MB** (INT8 embedding + 2-bit ternary weights, 384 KB ternary) |
-| **C++ inference** | **454 tok/s** (AVX2) / 366 tok/s (scalar) |
+| **C++ inference** | **300 tok/s** (AVX2) / 80 tok/s (scalar) |
 | **Dataset** | TinyStoriesV2-GPT4, 535M tokens, 80K stories |
 | **Tokenizer** | Custom BPE, vocab=8192 |
 | **Mode** | Stochastic Bit-Flip (no latent FP32 weights) |
@@ -184,7 +184,7 @@ Trained for 15,000 steps on Intel Iris Xe (DirectML) in ~9.4 hours:
   <em><b>Figure 2:</b> Convergence curve of Tetra 5.3M (SBF) on TinyStories (15,000 steps, Cosine LR Decay with Warmup). Plot includes raw + EMA-smoothed train loss and validation loss.</em>
 </p>
 
-C++ inference (exported binary, AVX2, 3.6 MB, 454 tok/s):
+C++ inference (exported binary, AVX2, 3.6 MB, 300 tok/s):
 > "Hello . to Tim the . One saw time . " , her and the had day . , day , . the Tim , saw the , it friends . the the day endoftext that ." Tim little . and the there . a I , . , she the but to One the time the " to Once a a to little The friends a very a endoftext that was He was . was a a . . . a it to to and He and . " was play . " it " not The . a , , happy and She . It on . , Tim . was to the a , They , had Lily to The the . . big the " |> with the was They to and a . the the the little One . the a day and , endoftext to She he to a It and day One to , . . . and a the there It on a Tim her the , time , , and ' to happy ' . , The , not , said . to to day the the , . They " friends"
 
 Limited due to ultra-compact 3.14M ternary weight capacity (384 KB memory footprint) without latent shadow weights. Demonstrates memory-efficient training behavior under tight capacity constraints.
