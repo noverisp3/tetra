@@ -306,8 +306,12 @@ class TernaryTrainer:
             and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
         )
             self.activation_dtype = torch.bfloat16 if bf16_ok else torch.float16
-            if self.activation_dtype == torch.float16 and self.device.type == "cuda":
+            if self.activation_dtype == torch.float16 and self.device.type == "cuda" \
+               and config.mode != "stochastic":
                 self.scaler = torch.amp.GradScaler("cuda")
+            if self.activation_dtype == torch.float16 and self.device.type == "cuda" \
+               and config.mode == "stochastic":
+                print("  (GradScaler disabled for stochastic mode)")
             print(f"Activations: {str(self.activation_dtype).split('.')[-1]}")
         else:
             print(f"Full precision: float32")
