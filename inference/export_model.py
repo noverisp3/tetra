@@ -1,7 +1,7 @@
 """Export model weights to binary format for C++ inference.
 
 2 bits per ternary weight, 4 weights per byte (MSB first).
-Binary format v2: header (64 bytes) + ternary sections + fp32 sections.
+Binary format v4: header (64 bytes) + ternary sections + fp32 sections.
 """
 import sys
 import struct
@@ -125,7 +125,7 @@ def export_model(model, output_path, mode="ste", scale=1.0):
         header = struct.pack(
             "<4sIIIIIIIQQ16s",
             b"TETR",
-            3,
+            4,
             vocab_size,
             hidden_dim,
             num_layers,
@@ -139,16 +139,19 @@ def export_model(model, output_path, mode="ste", scale=1.0):
         f.write(header)
 
         def write_ternary_entry(tensor, new_name, mod=None, alphas=None):
-            """Write a ternary weight with v3 per-channel alpha support."""
+            """Write a ternary weight with v4 per-group alpha support."""
             nb = new_name.encode("utf-8")
             f.write(struct.pack("<I", len(nb))); f.write(nb)
             f.write(struct.pack("<HH", tensor.shape[0], tensor.shape[1]))
+            group_size = getattr(mod, 'group_size', 0) if mod is not None else 0
+            f.write(struct.pack("<H", group_size))
             if alphas is not None:
-                a = alphas.float().cpu().numpy() if hasattr(alphas, 'cpu') else np.array(alphas, dtype=np.float32)
+                a = alphas.detach().float().cpu().numpy() if hasattr(alphas, 'cpu') else np.array(alphas, dtype=np.float32)
+                a = a.flatten()
                 f.write(struct.pack("<H", len(a)))
                 f.write(a.tobytes())
             elif mod is not None and hasattr(mod, 'alphas') and mod.alphas is not None:
-                a = mod.alphas.float().cpu().numpy()
+                a = mod.alphas.detach().float().cpu().numpy().flatten()
                 f.write(struct.pack("<H", len(a)))
                 f.write(a.tobytes())
             else:
@@ -181,7 +184,7 @@ def export_model(model, output_path, mode="ste", scale=1.0):
                     new_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
                     gate_mod = get_stochastic_module(model, name)
                     up_mod = get_stochastic_module(model, up_name)
-                    if gate_mod.per_channel:
+                    if gate_mod.alphas is not None:
                         combined = torch.cat([gate_mod.alphas, up_mod.alphas])
                         write_ternary_entry(fused, new_name, alphas=combined)
                     else:
@@ -295,6 +298,7 @@ def main():
             threshold=config.get("threshold", None),
             int8=config.get("int8", False),
             topk=config.get("topk", 1.0),
+            group_size=config.get("group_size", 0),
         )
     else:
         model = TernaryTransformerModel(

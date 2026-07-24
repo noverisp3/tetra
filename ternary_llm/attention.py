@@ -94,17 +94,17 @@ class TernaryMultiHeadAttention(nn.Module):
 class StochasticMultiHeadAttention(nn.Module):
     """Multi-Head Attention with Stochastic Bit-Flip."""
 
-    def __init__(self, hidden_dim, num_heads, dropout=0.0, scale=1.0, threshold=None, int8=False, per_channel=False):
+    def __init__(self, hidden_dim, num_heads, dropout=0.0, scale=1.0, threshold=None, int8=False, per_channel=False, group_size=0):
         super().__init__()
         assert hidden_dim % num_heads == 0
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
         from .layers import StochasticTernaryLinear
-        self.q_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel)
-        self.k_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel)
-        self.v_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel)
-        self.o_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel)
+        self.q_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel, group_size=group_size)
+        self.k_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel, group_size=group_size)
+        self.v_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel, group_size=group_size)
+        self.o_proj = StochasticTernaryLinear(hidden_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel, group_size=group_size)
         self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None,

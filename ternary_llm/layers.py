@@ -108,6 +108,9 @@ class StochasticTernaryLinear(nn.Module):
         scale: ternary weight scale factor (default: 1.0)
         threshold: flip threshold (default: 20.0 / scale, auto-computed)
         per_channel: per-output-channel alphas (default: False)
+        group_size: block size for per-group alpha (0=disabled, >0 enables per-group).
+                    When group_size > 0, num_groups = ceil(in_features / group_size).
+                    Overrides per_channel. (default: 0)
     """
 
     def __init__(
@@ -119,13 +122,14 @@ class StochasticTernaryLinear(nn.Module):
         threshold: float | None = None,
         int8: bool = False,
         per_channel: bool = False,
+        group_size: int = 0,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.scale = scale
         self.int8 = int8
-        self.per_channel = per_channel
+        self.per_channel = per_channel or (group_size > 0)
         # Integer threshold (20). Accumulator adds ±1 per step, threshold=20 means
         # flip after ~20 gradient steps. This replaces threshold = 20/scale from
         # the scaled-accumulator approach, avoiding /scale on every backward pass.
@@ -138,10 +142,18 @@ class StochasticTernaryLinear(nn.Module):
         # Gradient accumulator (FP32)
         self.register_buffer('accumulator', torch.zeros(out_features, in_features))
 
-        # Per-channel scaling alphas (FP32, trainable)
-        if per_channel:
+        # Per-group / per-channel scaling alphas (FP32, trainable)
+        if group_size > 0:
+            self.group_size = group_size
+            self.num_groups = (in_features + group_size - 1) // group_size
+            self.alphas = nn.Parameter(torch.full((out_features, self.num_groups), scale))
+        elif per_channel:
+            self.group_size = 0
+            self.num_groups = 1
             self.alphas = nn.Parameter(torch.full((out_features,), scale))
         else:
+            self.group_size = 0
+            self.num_groups = 0
             self.register_parameter("alphas", None)
 
         # Cached unpacked weights (recomputed after apply_bit_flips)
@@ -166,7 +178,8 @@ class StochasticTernaryLinear(nn.Module):
         else:
             output = StochasticBitFlipLinear.apply(
                 x, self.packed_weights, self._w_raw_cache,
-                self.scale, self.accumulator, self.threshold, self.alphas
+                self.scale, self.accumulator, self.threshold,
+                self.alphas, self.group_size
             )
 
         if self.bias is not None:

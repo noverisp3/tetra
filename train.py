@@ -128,6 +128,8 @@ def main():
                         help="[STE] Dynamic threshold scale: delta = scale x mean(|W|) (default: 0.7)")
     parser.add_argument("--per-channel", action="store_true",
                         help="[STE] Per-channel quantization threshold (instead of per-tensor)")
+    parser.add_argument("--group-size", type=int, default=0,
+                        help="[Stochastic] Block size for per-group scaling alphas (default: 0 = off)")
     parser.add_argument("--threshold", type=float, default=None,
                         help="[Stochastic] Bit-flip threshold (default: 20.0 / scale, auto-computed)")
     parser.add_argument("--threshold-decay-to", type=float, default=None,
@@ -221,6 +223,7 @@ def main():
     config.mode = args.mode
     config.ternary_scale = args.ternary_scale
     config.per_channel = args.per_channel
+    config.group_size = args.group_size
     config.flip_every_n_steps = args.flip_every_n_steps
     config.threshold = args.threshold if args.threshold is not None else 20.0
     if args.threshold_decay_to is not None:
@@ -322,6 +325,8 @@ def main():
             threshold=args.threshold,
             int8=args.int8,
             topk=args.topk if args.topk is not None else 1.0,
+            per_channel=config.per_channel,
+            group_size=config.group_size,
         )
     else:
         model = TernaryTransformerModel(

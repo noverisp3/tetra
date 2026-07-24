@@ -281,51 +281,84 @@ def init_ternary_weight(out_features: int, in_features: int, sparsity: float = 0
 class StochasticBitFlipLinear(torch.autograd.Function):
     """Stochastic Bit-Flip for ternary weights.
 
-    Forward: unpack 2-bit -> ternary float -> scale -> matmul
+    Forward: ternary matmul with per-group alphas -> output.
     Backward: accumulate gradient into accumulator (bit flip deferred
               to model.apply_bit_flips() called every N steps)
     """
 
     @staticmethod
-    def forward(ctx, x, packed_flat, w_raw, scale, accumulator, threshold, alphas=None):
+    def forward(ctx, x, packed_flat, w_raw, scale, accumulator, threshold, alphas=None, group_size=0):
         """Forward with pre-unpacked w_raw (cached by module, avoids 1.2s unpack/step).
 
         w_raw: float tensor of shape (out_features, in_features), values in {-1, 0, +1}.
-        alphas: per-channel scaling (out_features,) or None.
+        alphas: per-group (out_features, num_groups) or per-channel (out_features,) or None.
+        group_size: block size (0=per-channel/scalar).
         """
         ctx.save_for_backward(x)
         ctx.w_raw = w_raw
         ctx.scale = scale
         ctx.accumulator = accumulator
-        out = F.linear(x, w_raw)
-        if alphas is not None:
+        ctx.group_size = group_size
+
+        if alphas is not None and group_size > 0:
             ctx.alphas = alphas
-            return out * alphas.unsqueeze(0)
-        return out * scale
+            in_features = x.size(-1)
+            num_groups = (in_features + group_size - 1) // group_size
+            ctx.num_groups = num_groups
+            out_features = w_raw.size(0)
+            out = torch.zeros(*x.shape[:-1], out_features, dtype=x.dtype, device=x.device)
+            for g in range(num_groups):
+                start = g * group_size
+                end = min(start + group_size, in_features)
+                x_g = x[..., start:end]
+                w_g = w_raw[:, start:end]
+                out = out + F.linear(x_g, w_g) * alphas[:, g].unsqueeze(0)
+            return out
+        elif alphas is not None:
+            ctx.alphas = alphas
+            return F.linear(x, w_raw) * alphas.unsqueeze(0)
+        return F.linear(x, w_raw) * scale
 
     @staticmethod
     def backward(ctx, grad_output):
         x = ctx.saved_tensors[0].to(grad_output.dtype)
         scale = ctx.scale
         in_features = x.size(-1)
+        out_features = grad_output.size(-1)
 
-        grad_output_flat = grad_output.reshape(-1, grad_output.size(-1))
+        grad_output_flat = grad_output.reshape(-1, out_features)
         w_raw = ctx.w_raw.to(grad_output.dtype)
 
-        if hasattr(ctx, 'alphas') and ctx.alphas is not None:
-            # Per-channel: grad into w_raw is scaled per-channel by alphas
-            grad_y_scaled = grad_output_flat * ctx.alphas.unsqueeze(0)
-            grad_alpha = (grad_output_flat * F.linear(x, w_raw)).sum(dim=0)
-            grad_x_flat = torch.mm(grad_y_scaled, w_raw)
-            grad_w = torch.mm(grad_y_scaled.T, x.reshape(-1, in_features))
+        if ctx.group_size > 0:
+            num_groups = ctx.num_groups
+            alphas = ctx.alphas
+            bsz = x.shape[:-1]
+            grad_x = torch.zeros(*bsz, in_features, dtype=x.dtype, device=x.device)
+            grad_alpha = torch.zeros(out_features, num_groups, device=x.device)
+            grad_w = torch.zeros(out_features, in_features, device=x.device)
+            for g in range(num_groups):
+                start = g * ctx.group_size
+                end = min(start + ctx.group_size, in_features)
+                x_g = x[..., start:end]
+                w_g = w_raw[:, start:end]
+                alpha_g = alphas[:, g]
+                x_g_flat = x_g.reshape(-1, x_g.size(-1))
+                grad_y_scaled = grad_output_flat * alpha_g.unsqueeze(0)
+                grad_x_g = torch.mm(grad_y_scaled, w_g).view(*bsz, -1)
+                grad_x[..., start:end] = grad_x_g
+                grad_w[:, start:end] = torch.mm(grad_y_scaled.T, x_g_flat)
+                grad_alpha[:, g] = (grad_output_flat * F.linear(x_g_flat, w_g)).sum(dim=0)
             grad_alpha = grad_alpha.detach()
+        elif hasattr(ctx, 'alphas') and ctx.alphas is not None:
+            grad_y_scaled = grad_output_flat * ctx.alphas.unsqueeze(0)
+            grad_alpha = (grad_output_flat * F.linear(x, w_raw)).sum(dim=0).detach()
+            grad_x = torch.mm(grad_y_scaled, w_raw).view(*x.shape[:-1], in_features)
+            grad_w = torch.mm(grad_y_scaled.T, x.reshape(-1, in_features))
         else:
             grad_y_raw = grad_output_flat * scale
-            grad_x_flat = torch.mm(grad_y_raw, w_raw)
+            grad_x = torch.mm(grad_y_raw, w_raw).view(*x.shape[:-1], in_features)
             grad_w = torch.mm(grad_y_raw.T, x.reshape(-1, in_features))
             grad_alpha = None
-
-        grad_x = grad_x_flat.view(*x.shape[:-1], in_features)
 
         with torch.no_grad():
             grad_w.sign_().neg_()
@@ -333,7 +366,7 @@ class StochasticBitFlipLinear(torch.autograd.Function):
 
         del grad_w, grad_output_flat
 
-        return grad_x, None, None, None, None, None, grad_alpha
+        return grad_x, None, None, None, None, None, grad_alpha, None
 
 
 class Int8StochasticBitFlipLinear(torch.autograd.Function):

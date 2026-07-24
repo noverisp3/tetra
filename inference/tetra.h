@@ -50,8 +50,9 @@ struct TernaryWeightXNOR {
     std::vector<uint8_t> packed;
     std::vector<float> floats;
     int rows, cols;
-    float alpha;
-    std::vector<float> alphas;  // per-channel alphas (v3, empty = scalar alpha)
+    int group_size;            // 0 = scalar/per-channel, >0 = per-group block
+    float alpha;               // scalar alpha (default 1.0)
+    std::vector<float> alphas; // flat array: per-group = rows*num_groups, per-channel = rows, empty = scalar
 };
 
 // SIMD dot product: sum(x[i] * w[i]) for i in [0, cols)
@@ -156,13 +157,28 @@ static void precompute_floats(TernaryWeightXNOR& w) {
 static void ternary_matmul_precomputed(
     const float* x, const TernaryWeightXNOR& w, float* out
 ) {
-    const bool per_channel = !w.alphas.empty();
-    const float alpha0 = w.alpha;
-    const float* alphas = per_channel ? w.alphas.data() : nullptr;
+    const int rows = w.rows;
+    const int cols = w.cols;
     const float* data = w.floats.data();
-    for (int r = 0; r < w.rows; r++) {
-        float a = per_channel ? alphas[r] : alpha0;
-        out[r] = dot_product_simd(x, data + r * w.cols, w.cols) * a;
+    if (w.group_size > 0) {
+        int num_groups = (cols + w.group_size - 1) / w.group_size;
+        for (int r = 0; r < rows; r++) {
+            float sum = 0;
+            for (int g = 0; g < num_groups; g++) {
+                int offset = g * w.group_size;
+                int gs = (std::min)(w.group_size, cols - offset);
+                sum += w.alphas[r * num_groups + g] * dot_product_simd(x + offset, data + r * cols + offset, gs);
+            }
+            out[r] = sum;
+        }
+    } else if (!w.alphas.empty()) {
+        for (int r = 0; r < rows; r++) {
+            out[r] = dot_product_simd(x, data + r * cols, cols) * w.alphas[r];
+        }
+    } else {
+        for (int r = 0; r < rows; r++) {
+            out[r] = dot_product_simd(x, data + r * cols, cols) * w.alpha;
+        }
     }
 }
 
@@ -172,14 +188,29 @@ static void ternary_matmul_precomputed_decode(
 ) {
     const int rows = w.rows;
     const int cols = w.cols;
-    const bool per_channel = !w.alphas.empty();
-    const float alpha0 = w.alpha;
-    const float* alphas = per_channel ? w.alphas.data() : nullptr;
     const float* data = w.floats.data();
-    for (int r = 0; r < rows; r++) {
-        if (r + 2 < rows) TETRA_PREFETCH(data + (r + 2) * cols);
-        float a = per_channel ? alphas[r] : alpha0;
-        out[r] = dot_product_simd(x, data + r * cols, cols) * a;
+    if (w.group_size > 0) {
+        int num_groups = (cols + w.group_size - 1) / w.group_size;
+        for (int r = 0; r < rows; r++) {
+            if (r + 2 < rows) TETRA_PREFETCH(data + (r + 2) * cols);
+            float sum = 0;
+            for (int g = 0; g < num_groups; g++) {
+                int offset = g * w.group_size;
+                int gs = (std::min)(w.group_size, cols - offset);
+                sum += w.alphas[r * num_groups + g] * dot_product_simd(x + offset, data + r * cols + offset, gs);
+            }
+            out[r] = sum;
+        }
+    } else if (!w.alphas.empty()) {
+        for (int r = 0; r < rows; r++) {
+            if (r + 2 < rows) TETRA_PREFETCH(data + (r + 2) * cols);
+            out[r] = dot_product_simd(x, data + r * cols, cols) * w.alphas[r];
+        }
+    } else {
+        for (int r = 0; r < rows; r++) {
+            if (r + 2 < rows) TETRA_PREFETCH(data + (r + 2) * cols);
+            out[r] = dot_product_simd(x, data + r * cols, cols) * w.alpha;
+        }
     }
 }
 
@@ -427,8 +458,18 @@ static Model load_model(const char* path) {
             r.read(cols);
 
             float alpha = 1.0f;
+            int group_size = 0;
             std::vector<float> alphas;
-            if (h.version >= 3) {
+            if (h.version >= 4) {
+                uint16_t gs, num_alphas;
+                r.read(gs);
+                r.read(num_alphas);
+                group_size = gs;
+                if (num_alphas > 0) {
+                    alphas.resize(num_alphas);
+                    r.read_bytes(alphas.data(), num_alphas * sizeof(float));
+                }
+            } else if (h.version >= 3) {
                 uint16_t num_alphas;
                 r.read(num_alphas);
                 if (num_alphas > 0) {
@@ -446,6 +487,7 @@ static Model load_model(const char* path) {
             TernaryWeightXNOR w;
             w.rows = rows;
             w.cols = cols;
+            w.group_size = group_size;
             w.alpha = alpha;
             w.alphas = std::move(alphas);
             w.packed = std::move(packed);
