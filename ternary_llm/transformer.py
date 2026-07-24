@@ -258,16 +258,16 @@ class TernaryTransformerModel(nn.Module):
 class StochasticTransformerBlock(nn.Module):
     """Transformer block with Stochastic Bit-Flip layers."""
 
-    def __init__(self, hidden_dim, num_heads, ffn_dim, dropout=0.0, scale=1.0, threshold=None, int8=False, topk=1.0):
+    def __init__(self, hidden_dim, num_heads, ffn_dim, dropout=0.0, scale=1.0, threshold=None, int8=False, topk=1.0, per_channel=False):
         super().__init__()
         from .attention import StochasticMultiHeadAttention
         from .ffn import StochasticFFN
         self.attn_norm = RMSNorm(hidden_dim)
         self.attn_topk = TopKActivation(topk)
-        self.attn = StochasticMultiHeadAttention(hidden_dim, num_heads, dropout, scale, threshold, int8=int8)
+        self.attn = StochasticMultiHeadAttention(hidden_dim, num_heads, dropout, scale, threshold, int8=int8, per_channel=per_channel)
         self.ffn_norm = RMSNorm(hidden_dim)
         self.ffn_topk = TopKActivation(topk)
-        self.ffn = StochasticFFN(hidden_dim, ffn_dim, dropout, scale, threshold, int8=int8)
+        self.ffn = StochasticFFN(hidden_dim, ffn_dim, dropout, scale, threshold, int8=int8, per_channel=per_channel)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None,
                 past_kv: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -304,14 +304,14 @@ class StochasticTransformerModel(nn.Module):
     """
 
     def __init__(self, vocab_size, hidden_dim, num_layers, num_heads, ffn_dim,
-                 max_seq_len=2048, dropout=0.0, scale=1.0, threshold=None, int8=False, topk=1.0):
+                 max_seq_len=2048, dropout=0.0, scale=1.0, threshold=None, int8=False, topk=1.0, per_channel=False):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, hidden_dim)
         self.layers = nn.ModuleList([
-            StochasticTransformerBlock(hidden_dim, num_heads, ffn_dim, dropout, scale, threshold, int8=int8, topk=topk)
+            StochasticTransformerBlock(hidden_dim, num_heads, ffn_dim, dropout, scale, threshold, int8=int8, topk=topk, per_channel=per_channel)
             for _ in range(num_layers)
         ])
         self.norm = RMSNorm(hidden_dim)

@@ -81,14 +81,20 @@ def count_params(model) -> tuple[int, int]:
     return ternary_count, fp32_count
 
 
-def get_stochastic_shape(model, buf_name: str) -> tuple:
-    """Get (out_features, in_features) from the StochasticTernaryLinear module."""
-    buf_name = buf_name.replace(".packed_weights", "")
-    parts = buf_name.split(".")
+def get_stochastic_module(model, buf_name: str):
+    """Get the StochasticTernaryLinear module from a packed_weights buffer name."""
+    name = buf_name.replace(".packed_weights", "")
+    parts = name.split(".")
     layer = model.layers[int(parts[1])]
     sub = layer
     for p in parts[2:]:
         sub = getattr(sub, p)
+    return sub
+
+
+def get_stochastic_shape(model, buf_name: str) -> tuple:
+    """Get (out_features, in_features) from the StochasticTernaryLinear module."""
+    sub = get_stochastic_module(model, buf_name)
     return (sub.out_features, sub.in_features)
 
 
@@ -119,7 +125,7 @@ def export_model(model, output_path, mode="ste", scale=1.0):
         header = struct.pack(
             "<4sIIIIIIIQQ16s",
             b"TETR",
-            2,
+            3,
             vocab_size,
             hidden_dim,
             num_layers,
@@ -131,6 +137,23 @@ def export_model(model, output_path, mode="ste", scale=1.0):
             b"\x00" * 16,
         )
         f.write(header)
+
+        def write_ternary_entry(tensor, new_name, mod=None, alphas=None):
+            """Write a ternary weight with v3 per-channel alpha support."""
+            nb = new_name.encode("utf-8")
+            f.write(struct.pack("<I", len(nb))); f.write(nb)
+            f.write(struct.pack("<HH", tensor.shape[0], tensor.shape[1]))
+            if alphas is not None:
+                a = alphas.float().cpu().numpy() if hasattr(alphas, 'cpu') else np.array(alphas, dtype=np.float32)
+                f.write(struct.pack("<H", len(a)))
+                f.write(a.tobytes())
+            elif mod is not None and hasattr(mod, 'alphas') and mod.alphas is not None:
+                a = mod.alphas.float().cpu().numpy()
+                f.write(struct.pack("<H", len(a)))
+                f.write(a.tobytes())
+            else:
+                f.write(struct.pack("<H", 0))
+            f.write(pack_ternary(tensor))
 
         if mode == "stochastic":
             from ternary_llm.quantization import unpack_ternary_tensor as _unpack
@@ -156,24 +179,21 @@ def export_model(model, output_path, mode="ste", scale=1.0):
                     up_w = _unpack(buffers[up_name], s)
                     fused = torch.cat([gate_w, up_w], dim=0).to(torch.int8)
                     new_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
-                    alpha = scale
-                    nb = new_name.encode("utf-8")
-                    f.write(struct.pack("<I", len(nb))); f.write(nb)
-                    f.write(struct.pack("<HH", fused.shape[0], fused.shape[1]))
-                    f.write(struct.pack("<f", alpha))
-                    f.write(pack_ternary(fused))
+                    gate_mod = get_stochastic_module(model, name)
+                    up_mod = get_stochastic_module(model, up_name)
+                    if gate_mod.per_channel:
+                        combined = torch.cat([gate_mod.alphas, up_mod.alphas])
+                        write_ternary_entry(fused, new_name, alphas=combined)
+                    else:
+                        write_ternary_entry(fused, new_name)
                 elif "up_proj" in name:
                     continue
                 else:
                     s = get_stochastic_shape(model, name)
                     w = _unpack(buf, s).to(torch.int8)
                     new_name = prefix + ".latent_weights"
-                    alpha = scale
-                    nb = new_name.encode("utf-8")
-                    f.write(struct.pack("<I", len(nb))); f.write(nb)
-                    f.write(struct.pack("<HH", s[0], s[1]))
-                    f.write(struct.pack("<f", alpha))
-                    f.write(pack_ternary(w))
+                    mod = get_stochastic_module(model, name)
+                    write_ternary_entry(w, new_name, mod)
 
             # --- Write fp32/int8 weights (stochastic) ---
             for name, param in model.named_parameters():
@@ -213,15 +233,7 @@ def export_model(model, output_path, mode="ste", scale=1.0):
                 from ternary_llm.quantization import TernaryQuantizer
                 w_ternary = TernaryQuantizer.apply(param.data)
                 w_ternary = w_ternary.to(torch.int8)
-                alpha = 1.0
-                shape = list(w_ternary.shape)
-                name_bytes = name.encode("utf-8")
-
-                f.write(struct.pack("<I", len(name_bytes)))
-                f.write(name_bytes)
-                f.write(struct.pack("<HH", shape[0], shape[1]))
-                f.write(struct.pack("<f", alpha))
-                f.write(pack_ternary(w_ternary))
+                write_ternary_entry(w_ternary, name)
 
             for name, param in model.named_parameters():
                 is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)

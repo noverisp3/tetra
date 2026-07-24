@@ -60,12 +60,12 @@ class TernaryFFN(nn.Module):
 class StochasticFFN(nn.Module):
     """FFN with Stochastic Bit-Flip (no latent weights, packed 2-bit)."""
 
-    def __init__(self, hidden_dim, ffn_dim, dropout=0.0, scale=1.0, threshold=None, int8=False):
+    def __init__(self, hidden_dim, ffn_dim, dropout=0.0, scale=1.0, threshold=None, int8=False, per_channel=False):
         super().__init__()
         from .layers import StochasticTernaryLinear
-        self.gate_proj = StochasticTernaryLinear(hidden_dim, ffn_dim, scale=scale, threshold=threshold, int8=int8)
-        self.up_proj = StochasticTernaryLinear(hidden_dim, ffn_dim, scale=scale, threshold=threshold, int8=int8)
-        self.down_proj = StochasticTernaryLinear(ffn_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8)
+        self.gate_proj = StochasticTernaryLinear(hidden_dim, ffn_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel)
+        self.up_proj = StochasticTernaryLinear(hidden_dim, ffn_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel)
+        self.down_proj = StochasticTernaryLinear(ffn_dim, hidden_dim, scale=scale, threshold=threshold, int8=int8, per_channel=per_channel)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

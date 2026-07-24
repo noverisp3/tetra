@@ -107,6 +107,7 @@ class StochasticTernaryLinear(nn.Module):
         bias: whether to use bias
         scale: ternary weight scale factor (default: 1.0)
         threshold: flip threshold (default: 20.0 / scale, auto-computed)
+        per_channel: per-output-channel alphas (default: False)
     """
 
     def __init__(
@@ -117,12 +118,14 @@ class StochasticTernaryLinear(nn.Module):
         scale: float = 1.0,
         threshold: float | None = None,
         int8: bool = False,
+        per_channel: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.scale = scale
         self.int8 = int8
+        self.per_channel = per_channel
         # Integer threshold (20). Accumulator adds ±1 per step, threshold=20 means
         # flip after ~20 gradient steps. This replaces threshold = 20/scale from
         # the scaled-accumulator approach, avoiding /scale on every backward pass.
@@ -134,6 +137,12 @@ class StochasticTernaryLinear(nn.Module):
 
         # Gradient accumulator (FP32)
         self.register_buffer('accumulator', torch.zeros(out_features, in_features))
+
+        # Per-channel scaling alphas (FP32, trainable)
+        if per_channel:
+            self.alphas = nn.Parameter(torch.full((out_features,), scale))
+        else:
+            self.register_parameter("alphas", None)
 
         # Cached unpacked weights (recomputed after apply_bit_flips)
         self._w_raw_cache = None
@@ -157,7 +166,7 @@ class StochasticTernaryLinear(nn.Module):
         else:
             output = StochasticBitFlipLinear.apply(
                 x, self.packed_weights, self._w_raw_cache,
-                self.scale, self.accumulator, self.threshold
+                self.scale, self.accumulator, self.threshold, self.alphas
             )
 
         if self.bias is not None:

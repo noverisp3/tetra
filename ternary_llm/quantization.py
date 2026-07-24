@@ -287,16 +287,21 @@ class StochasticBitFlipLinear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, packed_flat, w_raw, scale, accumulator, threshold):
+    def forward(ctx, x, packed_flat, w_raw, scale, accumulator, threshold, alphas=None):
         """Forward with pre-unpacked w_raw (cached by module, avoids 1.2s unpack/step).
 
         w_raw: float tensor of shape (out_features, in_features), values in {-1, 0, +1}.
+        alphas: per-channel scaling (out_features,) or None.
         """
         ctx.save_for_backward(x)
         ctx.w_raw = w_raw
         ctx.scale = scale
         ctx.accumulator = accumulator
-        return F.linear(x, w_raw) * scale
+        out = F.linear(x, w_raw)
+        if alphas is not None:
+            ctx.alphas = alphas
+            return out * alphas.unsqueeze(0)
+        return out * scale
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -305,21 +310,30 @@ class StochasticBitFlipLinear(torch.autograd.Function):
         in_features = x.size(-1)
 
         grad_output_flat = grad_output.reshape(-1, grad_output.size(-1))
-        grad_y_raw = grad_output_flat * scale
-        w_raw = ctx.w_raw.to(grad_y_raw.dtype)
+        w_raw = ctx.w_raw.to(grad_output.dtype)
 
-        grad_x_flat = torch.mm(grad_y_raw, w_raw)
+        if hasattr(ctx, 'alphas') and ctx.alphas is not None:
+            # Per-channel: grad into w_raw is scaled per-channel by alphas
+            grad_y_scaled = grad_output_flat * ctx.alphas.unsqueeze(0)
+            grad_alpha = (grad_output_flat * F.linear(x, w_raw)).sum(dim=0)
+            grad_x_flat = torch.mm(grad_y_scaled, w_raw)
+            grad_w = torch.mm(grad_y_scaled.T, x.reshape(-1, in_features))
+            grad_alpha = grad_alpha.detach()
+        else:
+            grad_y_raw = grad_output_flat * scale
+            grad_x_flat = torch.mm(grad_y_raw, w_raw)
+            grad_w = torch.mm(grad_y_raw.T, x.reshape(-1, in_features))
+            grad_alpha = None
+
         grad_x = grad_x_flat.view(*x.shape[:-1], in_features)
-
-        grad_w = torch.mm(grad_y_raw.T, x.reshape(-1, x.size(-1)))
 
         with torch.no_grad():
             grad_w.sign_().neg_()
             ctx.accumulator.add_(grad_w)
 
-        del grad_w, grad_y_raw, grad_output_flat
+        del grad_w, grad_output_flat
 
-        return grad_x, None, None, None, None, None
+        return grad_x, None, None, None, None, None, grad_alpha
 
 
 class Int8StochasticBitFlipLinear(torch.autograd.Function):

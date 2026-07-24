@@ -51,6 +51,7 @@ struct TernaryWeightXNOR {
     std::vector<float> floats;
     int rows, cols;
     float alpha;
+    std::vector<float> alphas;  // per-channel alphas (v3, empty = scalar alpha)
 };
 
 // SIMD dot product: sum(x[i] * w[i]) for i in [0, cols)
@@ -155,10 +156,13 @@ static void precompute_floats(TernaryWeightXNOR& w) {
 static void ternary_matmul_precomputed(
     const float* x, const TernaryWeightXNOR& w, float* out
 ) {
-    const float alpha = w.alpha;
+    const bool per_channel = !w.alphas.empty();
+    const float alpha0 = w.alpha;
+    const float* alphas = per_channel ? w.alphas.data() : nullptr;
     const float* data = w.floats.data();
     for (int r = 0; r < w.rows; r++) {
-        out[r] = dot_product_simd(x, data + r * w.cols, w.cols) * alpha;
+        float a = per_channel ? alphas[r] : alpha0;
+        out[r] = dot_product_simd(x, data + r * w.cols, w.cols) * a;
     }
 }
 
@@ -168,11 +172,14 @@ static void ternary_matmul_precomputed_decode(
 ) {
     const int rows = w.rows;
     const int cols = w.cols;
-    const float alpha = w.alpha;
+    const bool per_channel = !w.alphas.empty();
+    const float alpha0 = w.alpha;
+    const float* alphas = per_channel ? w.alphas.data() : nullptr;
     const float* data = w.floats.data();
     for (int r = 0; r < rows; r++) {
         if (r + 2 < rows) TETRA_PREFETCH(data + (r + 2) * cols);
-        out[r] = dot_product_simd(x, data + r * cols, cols) * alpha;
+        float a = per_channel ? alphas[r] : alpha0;
+        out[r] = dot_product_simd(x, data + r * cols, cols) * a;
     }
 }
 
@@ -420,7 +427,17 @@ static Model load_model(const char* path) {
             r.read(cols);
 
             float alpha = 1.0f;
-            if (h.version >= 2) r.read(alpha);
+            std::vector<float> alphas;
+            if (h.version >= 3) {
+                uint16_t num_alphas;
+                r.read(num_alphas);
+                if (num_alphas > 0) {
+                    alphas.resize(num_alphas);
+                    r.read_bytes(alphas.data(), num_alphas * sizeof(float));
+                }
+            } else if (h.version >= 2) {
+                r.read(alpha);
+            }
 
             int packed_size = (rows * cols + 3) / 4;
             std::vector<uint8_t> packed(packed_size);
@@ -430,6 +447,7 @@ static Model load_model(const char* path) {
             w.rows = rows;
             w.cols = cols;
             w.alpha = alpha;
+            w.alphas = std::move(alphas);
             w.packed = std::move(packed);
             precompute_floats(w);
             model.ternary_weights[name] = std::move(w);
