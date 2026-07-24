@@ -734,7 +734,7 @@ static std::vector<float> forward(
 
                 // Attention: read from cached K_full/V_full + K_rope
                 int actual_len = pos + 1;
-                float eff_scale = 1.0f / sqrtf((float)EHD);
+                float eff_scale = 1.0f / (float)EHD;
                 for (int head = 0; head < NH; head++) {
                     float* qh = q.data() + head * HD;
                     float* qrh = q_rope.data() + head * RP;
@@ -866,7 +866,7 @@ static std::vector<float> forward(
             const int RP = model.rope_per_head;
             const int RD = model.rope_dim;
             const int EHD = HD + RP;
-            float eff_scale = 1.0f / sqrtf((float)EHD);
+            float eff_scale = 1.0f / (float)EHD;
 
             std::string qn = pfx_s + "attn.q_proj.latent_weights";
             std::string kdn = pfx_s + "attn.kv_down_proj.latent_weights";
@@ -1066,6 +1066,24 @@ static std::mt19937& rng() {
 static int sample(const std::vector<float>& logits, float temperature, int top_k, float top_p,
                   const std::vector<int>& context = {}, float repeat_penalty = 1.0f) {
     int n = (int)logits.size();
+
+    // Greedy (temperature=0): argmax with optional repeat penalty
+    if (temperature <= 0.0f) {
+        std::vector<float> penalized(n);
+        for (int i = 0; i < n; i++) penalized[i] = logits[i];
+        if (repeat_penalty != 1.0f && !context.empty()) {
+            for (int id : context) {
+                if (id < 0 || id >= n) continue;
+                if (penalized[id] > 0.0f) penalized[id] /= repeat_penalty;
+                else penalized[id] *= repeat_penalty;
+            }
+        }
+        int best = 0;
+        for (int i = 1; i < n; i++)
+            if (penalized[i] > penalized[best]) best = i;
+        return best;
+    }
+
     std::vector<float> scaled(n);
     for (int i = 0; i < n; i++) scaled[i] = logits[i];
 

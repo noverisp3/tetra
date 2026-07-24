@@ -287,7 +287,24 @@ def main():
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     config = ckpt["config"]
     mode = config.get("mode", "ste")
-    mla = config.get("mla", False)
+
+    # Detect MLA from config or from state dict keys
+    sd = ckpt["model_state_dict"]
+    mla = config.get("mla", False) or any("kv_down_proj" in k for k in sd)
+
+    if mode == "stochastic" and mla:
+        # Infer MLA dims from packed_weights shapes in state dict
+        kv_latent_dim = config.get("kv_latent_dim", None)
+        rope_per_head = config.get("rope_per_head", None)
+        hidden_dim = config.get("hidden_dim", 256)
+        num_heads = config.get("num_heads", 4)
+        for k, v in sd.items():
+            if k.endswith("kv_down_proj.packed_weights") and kv_latent_dim is None:
+                kv_latent_dim = v.numel() * 4 // hidden_dim
+            if k.endswith("q_rope_proj.packed_weights") and rope_per_head is None:
+                rope_dim = v.numel() * 4 // hidden_dim
+                rope_per_head = rope_dim // num_heads
+        print(f"MLA detected: kv_latent_dim={kv_latent_dim}, rope_per_head={rope_per_head}")
 
     if mode == "stochastic" and mla:
         from ternary_llm.transformer import StochasticMLAModel

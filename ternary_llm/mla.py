@@ -55,7 +55,7 @@ class StochasticMLAAttention(nn.Module):
     def _get_freqs(self, seq_len, device):
         if self.freqs_cis is None or self.freqs_cis.size(-2) < seq_len:
             self.freqs_cis = precompute_freqs_cis(self.rope_per_head, max(seq_len * 2, 512), device=device)
-        return self.freqs_cis[:, :seq_len].to(device)
+        return self.freqs_cis[:seq_len, :].to(device)
 
     def forward(self, x, mask=None, past_kv=None):
         B, T, C = x.shape

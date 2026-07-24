@@ -216,7 +216,9 @@ class TernaryTrainer:
         self.config = config
 
         # Resolve device
-        if config.device and config.device != "cpu":
+        if config.device == "cpu":
+            self.device = torch.device("cpu")
+        elif config.device:
             if config.device == "cuda" and torch.cuda.is_available():
                 self.device = torch.device("cuda")
             elif config.device == "directml":
