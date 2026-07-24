@@ -286,6 +286,11 @@ class StochasticTransformerBlock(nn.Module):
         return x, (k, v)
 
     @torch.no_grad()
+    def set_thresholds(self, threshold: float) -> None:
+        self.attn.set_thresholds(threshold)
+        self.ffn.set_thresholds(threshold)
+
+    @torch.no_grad()
     def apply_bit_flips(self) -> None:
         self.attn.apply_bit_flips()
         self.ffn.apply_bit_flips()
@@ -364,6 +369,11 @@ class StochasticTransformerModel(nn.Module):
             next_id = torch.multinomial(probs, num_samples=1).clamp(0, self.token_embedding.num_embeddings - 1)
             input_ids = torch.cat([input_ids, next_id], dim=1)
         return input_ids
+
+    @torch.no_grad()
+    def set_thresholds(self, threshold: float) -> None:
+        for layer in self.layers:
+            layer.set_thresholds(threshold)
 
     @torch.no_grad()
     def apply_bit_flips(self) -> None:

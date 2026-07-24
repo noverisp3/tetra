@@ -130,6 +130,8 @@ def main():
                         help="[STE] Per-channel quantization threshold (instead of per-tensor)")
     parser.add_argument("--threshold", type=float, default=None,
                         help="[Stochastic] Bit-flip threshold (default: 20.0 / scale, auto-computed)")
+    parser.add_argument("--threshold-decay-to", type=float, default=None,
+                        help="[Stochastic] Decay threshold to this value by end of training (default: same as --threshold, no decay)")
     parser.add_argument("--int8", action="store_true",
                         help="[Stochastic] Use INT8 forward matmul (quantize activations to int8)")
     parser.add_argument("--topk", type=float, default=None,
@@ -220,6 +222,9 @@ def main():
     config.ternary_scale = args.ternary_scale
     config.per_channel = args.per_channel
     config.flip_every_n_steps = args.flip_every_n_steps
+    config.threshold = args.threshold if args.threshold is not None else 20.0
+    if args.threshold_decay_to is not None:
+        config.threshold_decay_to = args.threshold_decay_to
     if args.debug:
         config.debug = True
     if args.dtype:

@@ -76,6 +76,12 @@ class StochasticFFN(nn.Module):
         return self.dropout(output)
 
     @torch.no_grad()
+    def set_thresholds(self, threshold: float) -> None:
+        self.gate_proj.set_threshold(threshold)
+        self.up_proj.set_threshold(threshold)
+        self.down_proj.set_threshold(threshold)
+
+    @torch.no_grad()
     def apply_bit_flips(self) -> None:
         self.gate_proj.apply_bit_flips()
         self.up_proj.apply_bit_flips()

@@ -127,6 +127,13 @@ class StochasticMultiHeadAttention(nn.Module):
         return self.o_proj(out), k, v
 
     @torch.no_grad()
+    def set_thresholds(self, threshold: float) -> None:
+        self.q_proj.set_threshold(threshold)
+        self.k_proj.set_threshold(threshold)
+        self.v_proj.set_threshold(threshold)
+        self.o_proj.set_threshold(threshold)
+
+    @torch.no_grad()
     def apply_bit_flips(self) -> None:
         self.q_proj.apply_bit_flips()
         self.k_proj.apply_bit_flips()

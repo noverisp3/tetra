@@ -165,6 +165,10 @@ class StochasticTernaryLinear(nn.Module):
         return output
 
     @torch.no_grad()
+    def set_threshold(self, threshold: float) -> None:
+        self.threshold = threshold
+
+    @torch.no_grad()
     def apply_bit_flips(self) -> None:
         """Check accumulator and flip bits where threshold exceeded."""
         from .quantization import apply_bit_flips as _apply_bit_flips

@@ -158,6 +158,8 @@ class TrainingConfig:
 
     # Stochastic Bit-Flip
     flip_every_n_steps: int = 5  # check threshold & flip bits every N optimizer steps
+    threshold: float = 20.0  # Initial flip threshold (used for decay base)
+    threshold_decay_to: float | None = None  # Decay threshold from initial to this by end (None = constant)
 
     # Quantization (STE)
     ternary_scale: float = 0.7  # Δ = scale x mean(|W|), lower -> more {-1,+1}, higher -> more 0
@@ -474,6 +476,12 @@ class TernaryTrainer:
                     and step % self.config.flip_every_n_steps == 0):
                     if self.config.debug:
                         tqdm.write(f"  Optimizer step: {opt_time:.1f}s")
+                    # Apply threshold decay if configured
+                    if self.config.threshold_decay_to is not None:
+                        progress = min(step / self.config.max_steps, 1.0)
+                        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                        t = self.config.threshold_decay_to + (self.config.threshold - self.config.threshold_decay_to) * cosine
+                        self.model.set_thresholds(t)
                     self.log_mem("before apply_bit_flips")
                     flip_t0 = time.perf_counter()
                     self.model.apply_bit_flips()
