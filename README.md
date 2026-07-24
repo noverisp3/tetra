@@ -9,7 +9,7 @@
 Three training modes:
 
 - **STE** (Straight-Through Estimator) — FP32 latent shadow weights quantized on-the-fly via absmean, gradient flows through STE. (BitNet b1.58 approach)
-- **Stochastic Bit-Flip** — no latent weights. Weights stored as packed 2-bit ternary. Gradient sign accumulated in FP32 accumulator; weight flips when |accumulator| > threshold. Supports cosine threshold decay (`--threshold-decay-to`) and per-channel output scaling (`--per-channel`).
+- **Stochastic Bit-Flip** — no latent weights. Weights stored as packed 2-bit ternary. Gradient sign accumulated in FP32 accumulator; weight flips when |accumulator| > threshold. Supports cosine threshold decay (`--threshold-decay-to`), per-channel scaling (`--per-channel`), and per-group block scaling (`--group-size N`).
 - **Hybrid SSM-Attention** — 80% Ternary SSM (Mamba-style) + 20% Ternary Attention layers. SSM scan via vectorized parallel prefix (O(T), no Python loop).
 
 ## Architecture
@@ -18,7 +18,7 @@ Base BitNet b1.58-style transformer, optionally hybridized:
 
 | Component | STE / Stochastic | Hybrid |
 |-----------|-----------------|--------|
-| **Weights** | {-1, 0, +1} via absmean (STE) or packed 2-bit (Stochastic). Optional per-channel scaling alpha per output row. | Same per-layer |
+| **Weights** | {-1, 0, +1} via absmean (STE) or packed 2-bit (Stochastic). Optional per-channel or per-group scaling alpha. Per-group: `--group-size N` splits `in_features` into blocks of N, each with its own alpha. | Same per-layer |
 | **Attention** | Causal multi-head, KV cache, ternary Q/K/V/O projections | 20% of layers |
 | **SSM Block** | — | 80% of layers: RMSNorm → TernaryLinear(expand 2×) → depthwise Conv1d → SiLU → parallel-prefix SSM scan → gate → TernaryLinear(project back) |
 | **FFN** | SwiGLU: fused gate+up into one ternary matmul (2× FFN dim) | Same |
@@ -104,17 +104,25 @@ tetra_avx2.exe tetra_model.bin "373,378,67,338" 100 0.8 50 0.9 1.0
 python run_inference.py tetra_model.bin "Once upon a time" --max-tokens 100
 ```
 
-### Binary Format (v3)
+### Binary Format (v4)
 
 | Section | Encoding |
 |---------|----------|
 | Header (64B) | magic `TETR`, version, dims, param counts |
-| Ternary weights | name, shape, `num_alphas(2B)` + `alphas(N×4B)` (v3, empty=scalar `alpha=1.0`), 2-bit packed (4 weights/byte) |
+| Ternary weights | name, shape, `group_size(2B)` + `num_alphas(2B)` + `alphas(N×4B)`, 2-bit packed (4 weights/byte). `group_size=0` → per-channel or scalar (v3 compat). |
 | FP32/INT8 weights | name, shape, dtype byte: `0`=FP32, `1`=INT8 + scale |
 | Embeddings | INT8 (token 8K×256→2.0 MB, pos 512×256→0.13 MB) |
 | Norms | FP32 (tiny, ~12 KB) |
 
-Per-channel alphas (`--per-channel` flag): each output row gets its own FP32 scaling factor, written as contiguous array after `num_alphas`. Backward-compatible with v2 — if `num_alphas=0` the reader falls back to scalar `alpha=1.0`.
+Three alpha modes controlled by `group_size` and `num_alphas`:
+
+| Mode | `group_size` | `num_alphas` | Storage |
+|------|-------------|-------------|---------|
+| Scalar | 0 | 0 | default `alpha=1.0`, no extra bytes |
+| Per-channel | 0 | rows | `rows × 4B` |
+| Per-group | >0 | rows × ceil(cols/group_size) | `rows × ceil(cols/group_size) × 4B` |
+
+Per-group (`--group-size N`): each output row chia thành blocks N chiều, mỗi block có FP32 alpha riêng. Overhead: với `group_size=64` (tiny 256-dim) thêm ~770 KB.
 
 ## Examples
 
@@ -216,7 +224,7 @@ ternary_llm/
 inference/
   tetra.h                   # C++ inference engine (RMSNorm, SiLU, softmax, sampling, forward)
   tetra.cpp                 # CLI entry point, generation loop
-  export_model.py           # Checkpoint → binary format (v3, INT8 embedding)
+  export_model.py           # Checkpoint → binary format (v4, INT8 embedding)
   run_inference.py          # Python wrapper around C++ inference
   benchmark_ppl.py          # Perplexity measurement
   build.bat                 # MSVC build script (auto-detects VS via vswhere)
