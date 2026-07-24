@@ -97,16 +97,23 @@ Pure C++17 inference engine (`inference/tetra.h`, no dependencies):
 | **MLA** | Full MLA decode + prefill with KV latent compression, decoupled RoPE, and K/V reconstruction from cached latents |
 | **Prefill** | Parallel batch prefill — all prompt tokens in one forward pass (OpenMP) |
 | **Sampling** | Top-k + top-p + temperature + repetition penalty, matches PyTorch order |
-| **Build** | `build.bat avx2` (auto-detects VS via vswhere, enables `/openmp`) |
+| **Build (Windows)** | `build.bat avx2` (auto-detects VS via vswhere, enables `/openmp`) |
+| **Build (Linux)** | `build.sh avx2` (requires g++ with OpenMP) |
 
 ### Export & Run
 
 ```bash
 python inference/export_model.py checkpoints/checkpoint_*.pt inference/tetra_model.bin
+
+# Windows
 cd inference && build.bat avx2
-# Direct: provide token IDs + repeat_penalty (7th arg, 1.0=off)
 tetra_avx2.exe tetra_model.bin "373,378,67,338" 100 0.8 50 0.9 1.0
-# Or via Python with tokenizer
+
+# Linux
+cd inference && bash build.sh avx2
+./tetra_avx2 tetra_model.bin "373,378,67,338" 100 0.8 50 0.9 1.0
+
+# Or via Python with tokenizer (cross-platform)
 python run_inference.py tetra_model.bin "Once upon a time" --max-tokens 100
 ```
 
