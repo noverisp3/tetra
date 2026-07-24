@@ -1,18 +1,20 @@
-"""Train a custom BPE tokenizer on TinyStories.
+"""Train a custom BPE tokenizer on TinyStories or FineWeb Edu parquet.
 
 Usage:
-    python train_tokenizer.py                     # vocab_size=8192, trains on full TinyStories
-    python train_tokenizer.py --vocab-size 4096   # smaller vocab
-    python train_tokenizer.py --max-stories 50000 # quick test run
+    python train_tokenizer.py                          # vocab=8192, trains on TinyStories
+    python train_tokenizer.py --vocab-size 16384       # larger vocab
+    python train_tokenizer.py --max-stories 50000      # quick test run
+    python train_tokenizer.py --data-path data --from-parquet  # train on FineWeb Edu parquet
 
 Output:
     tokenizer/tetra_tokenizer.json  — HuggingFace tokenizers format
     tokenizer/vocab_info.json       — vocab_size and metadata
 
-The tokenizer is trained specifically on TinyStories text, so it captures
-the child-story vocabulary distribution much better than GPT-2's tokenizer.
+Training uses a random 500MB sample of text by default (enough for BPE).
 """
 import argparse
+import random
+import json
 from pathlib import Path
 
 
@@ -38,11 +40,45 @@ def find_tinystories(cache_dir: str = "data") -> str:
     exit(1)
 
 
+def _extract_parquet_sample(parquet_dir: str, output_dir: str, target_mb: int = 500) -> str:
+    """Sample text from FineWeb Edu parquet files and write to a temp .txt for tokenizer training."""
+    import pyarrow.parquet as pq
+    target_bytes = target_mb * 1024 * 1024
+    out_path = Path(output_dir) / "tokenizer_train_sample.txt"
+    if out_path.exists():
+        print(f"Using existing sample: {out_path} ({out_path.stat().st_size / 1e6:.0f} MB)")
+        return str(out_path)
+
+    parquet_files = sorted(Path(parquet_dir).glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No .parquet files in {parquet_dir}")
+
+    print(f"Extracting ~{target_mb}MB text sample from {len(parquet_files)} parquet files...")
+    written = 0
+    with open(out_path, "w", encoding="utf-8") as out:
+        for pf_path in parquet_files:
+            pf = pq.ParquetFile(str(pf_path))
+            for batch in pf.iter_batches(batch_size=2000, columns=["text"]):
+                for text in batch.column(0):
+                    t = text.as_py()
+                    if t:
+                        line = t.replace("\n", " ") + "\n"
+                        out.write(line)
+                        written += len(line.encode("utf-8"))
+                        if written >= target_bytes:
+                            print(f"  Reached {target_mb}MB, stopping.")
+                            return str(out_path)
+    print(f"  Extracted {written / 1e6:.0f} MB to {out_path}")
+    return str(out_path)
+
+
 def train_tokenizer(
     vocab_size: int = 8192,
     data_path: str | None = None,
     output_dir: str = "tokenizer",
     max_stories: int | None = None,
+    from_parquet: bool = False,
+    sample_mb: int = 500,
 ):
     from tokenizers import Tokenizer
     from tokenizers.models import BPE
@@ -52,9 +88,14 @@ def train_tokenizer(
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Get data path
-    if data_path is None:
-        data_path = find_tinystories()
+    # Get training text data
+    train_file = None
+    if data_path is not None and from_parquet:
+        train_file = _extract_parquet_sample(data_path, output_dir, sample_mb)
+    elif data_path is None:
+        train_file = find_tinystories()
+    else:
+        train_file = data_path
 
     # Create tokenizer with special tokens
     special_tokens = ["<PAD>", "<BOS>", "<EOS>", "<UNK>"]
@@ -68,7 +109,7 @@ def train_tokenizer(
     )
 
     # Train BPE
-    print(f"\nTraining BPE tokenizer (vocab_size={vocab_size}) on TinyStories...")
+    print(f"\nTraining BPE tokenizer (vocab_size={vocab_size})...")
     trainer = BpeTrainer(
         vocab_size=vocab_size,
         special_tokens=special_tokens,
@@ -77,10 +118,8 @@ def train_tokenizer(
         continuing_subword_prefix="",
     )
 
-    # Split into chunks for training (tokenizers lib expects iterable of files or string)
     if max_stories:
-        # Read file, split, take subset, write temp file
-        with open(data_path, "r", encoding="utf-8") as f:
+        with open(train_file, "r", encoding="utf-8") as f:
             text = f.read()
         stories = text.split("\n\n\n")
         stories = [s.strip() for s in stories if s.strip()][:max_stories]
@@ -90,7 +129,7 @@ def train_tokenizer(
         tokenizer.train(files=[str(temp_path)], trainer=trainer)
         temp_path.unlink()
     else:
-        tokenizer.train(files=[data_path], trainer=trainer)
+        tokenizer.train(files=[train_file], trainer=trainer)
 
     # Add BOS/EOS after training
     bos_id = tokenizer.token_to_id("<BOS>")
@@ -145,9 +184,11 @@ def train_tokenizer(
 def main():
     parser = argparse.ArgumentParser(description="Train BPE tokenizer for Tetra")
     parser.add_argument("--vocab-size", type=int, default=8192, help="Vocab size (default: 8192)")
-    parser.add_argument("--data-path", type=str, default=None, help="Path to text file")
+    parser.add_argument("--data-path", type=str, default=None, help="Path to text file or parquet dir")
     parser.add_argument("--output-dir", type=str, default="tokenizer", help="Output directory")
-    parser.add_argument("--max-stories", type=int, default=None, help="Max stories for quick train")
+    parser.add_argument("--max-stories", type=int, default=None, help="Max stories/rows for quick train")
+    parser.add_argument("--from-parquet", action="store_true", help="data-path is a FineWeb parquet dir")
+    parser.add_argument("--sample-mb", type=int, default=500, help="Text sample in MB (parquet mode)")
     args = parser.parse_args()
 
     train_tokenizer(
@@ -155,6 +196,8 @@ def main():
         data_path=args.data_path,
         output_dir=args.output_dir,
         max_stories=args.max_stories,
+        from_parquet=args.from_parquet,
+        sample_mb=args.sample_mb,
     )
 
 
