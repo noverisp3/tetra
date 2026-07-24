@@ -13,6 +13,9 @@
 #include <string>
 #include <unordered_map>
 #include <algorithm>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <random>
 #include <numeric>
 #include <cstdio>
@@ -605,7 +608,6 @@ static std::vector<float> forward(
             x[j * H + i] = tok_emb[tokens[j] * H + i] + pos_emb[(pos + j) * H + i];
 
     std::vector<float> q(seq_len * H), k(seq_len * H), v(seq_len * H);
-    std::vector<float> attn_scores(model.header.max_seq_len);
     std::vector<float> attn_out(seq_len * H);
 
     std::vector<float> gate(seq_len * FFN), up(seq_len * FFN);
@@ -616,6 +618,7 @@ static std::vector<float> forward(
         snprintf(pfx, sizeof(pfx), "layers.%d.", l);
 
         // Pre-norm + QKV for all positions (save original x for residual)
+        #pragma omp parallel for if(seq_len > 1)
         for (int j = 0; j < seq_len; j++) {
             float* xj = x.data() + j * H;
             std::vector<float> normed(H);
@@ -635,7 +638,9 @@ static std::vector<float> forward(
             }
 
         // Causal multi-head attention for each position
+        #pragma omp parallel for if(seq_len > 1)
         for (int j = 0; j < seq_len; j++) {
+            std::vector<float> attn_local(model.header.max_seq_len);
             int actual_len = pos + j + 1;
             for (int head = 0; head < NH; head++) {
                 float scale = 1.0f / sqrtf((float)HD);
@@ -645,13 +650,13 @@ static std::vector<float> forward(
                         cache.k_cache[l].data() + t * H + head * HD, HD) * scale;
                     if (s > 80.0f) s = 80.0f;
                     else if (s < -80.0f) s = -80.0f;
-                    attn_scores[t] = s;
+                    attn_local[t] = s;
                 }
-                softmax(attn_scores.data(), actual_len);
+                softmax(attn_local.data(), actual_len);
                 for (int d = 0; d < HD; d++) {
                     float sum = 0.0f;
                     for (int t = 0; t < actual_len; t++)
-                        sum += attn_scores[t] * cache.v_cache[l][t * H + head * HD + d];
+                        sum += attn_local[t] * cache.v_cache[l][t * H + head * HD + d];
                     attn_out[j * H + head * HD + d] = sum;
                 }
             }
@@ -659,6 +664,7 @@ static std::vector<float> forward(
 
         // Output projection for all positions
         std::vector<float> proj_out(seq_len * H);
+        #pragma omp parallel for if(seq_len > 1)
         for (int j = 0; j < seq_len; j++) {
             float* xj = x.data() + j * H;
             float os = absmean(attn_out.data() + j * H, H);
@@ -667,6 +673,7 @@ static std::vector<float> forward(
         }
 
         // FFN for all positions
+        #pragma omp parallel for if(seq_len > 1)
         for (int j = 0; j < seq_len; j++) {
             float* xj = x.data() + j * H;
             std::vector<float> ffn_normed(H);
