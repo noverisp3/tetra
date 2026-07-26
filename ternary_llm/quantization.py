@@ -1,18 +1,30 @@
+"""Ternary quantization and stochastic bit-flip training kernels.
+
+Provides custom autograd Functions for ternary weight quantization:
+- TernaryQuantizer: STE ternary quantization for standard training
+- FusedTernaryLinear: fused quantize + matmul for STE training
+- StochasticBitFlipLinear: packed 2-bit ternary with accumulator-based gradient
+- Int8StochasticBitFlipLinear: INT8 activation variant for memory efficiency
+
+Also provides pack/unpack utilities for 2-bit ternary encoding.
+"""
 import os
+import sys
+from typing import Optional
+
 __all__ = [
     "FusedTernaryLinear", "StochasticBitFlipLinear", "Int8StochasticBitFlipLinear",
     "TernaryQuantizer", "init_ternary_weight", "unpack_ternary_tensor",
     "apply_bit_flips", "ternary_matmul_forward", "ternary_forward_direct",
 ]
 
-import sys
 import torch
 import torch.nn.functional as F
 
 # Optional C++ SIMD extension for fast pack/unpack
 _ternary_ops = None
 
-def _try_load_from_cache(name):
+def _try_load_from_cache(name: str):
     """Try to import a compiled extension from PyTorch's cache directory by module name."""
     cache_base = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                               "torch_extensions", "torch_extensions", "Cache")
@@ -31,11 +43,11 @@ def _try_load_from_cache(name):
                 pass
     return None
 
-def _load_cpp_extension():
+def _load_cpp_extension() -> bool:
     """Load C++ ternary_ops extension.
 
     Tries AVX-512 then AVX2 with platform-appropriate compiler flags.
-    Returns False if no compiler available (e.g. Colab without build tools).
+    Returns True if loaded successfully, False if no compiler available.
     """
     global _ternary_ops
     if _ternary_ops is not None:
@@ -287,12 +299,31 @@ class StochasticBitFlipLinear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, packed_flat, w_raw, scale, accumulator, threshold, alphas=None, group_size=0):
-        """Forward with pre-unpacked w_raw (cached by module, avoids 1.2s unpack/step).
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        packed_flat: torch.Tensor,
+        w_raw: torch.Tensor,
+        scale: float,
+        accumulator: torch.Tensor,
+        threshold: float,
+        alphas: Optional[torch.Tensor] = None,
+        group_size: int = 0,
+    ) -> torch.Tensor:
+        """Forward with pre-unpacked w_raw (cached by module).
 
-        w_raw: float tensor of shape (out_features, in_features), values in {-1, 0, +1}.
-        alphas: per-group (out_features, num_groups) or per-channel (out_features,) or None.
-        group_size: block size (0=per-channel/scalar).
+        Args:
+            x: input tensor (..., in_features)
+            packed_flat: packed ternary weights (unused, kept for signature)
+            w_raw: unpacked ternary weights (out_features, in_features) in {-1, 0, +1}
+            scale: ternary weight scale factor
+            accumulator: gradient accumulator tensor (same shape as w_raw)
+            threshold: bit-flip threshold
+            alphas: optional per-group (out_features, num_groups) or per-channel (out_features,)
+            group_size: per-group block size (0 = scalar or per-channel)
+
+        Returns:
+            Output tensor (..., out_features)
         """
         ctx.save_for_backward(x)
         ctx.w_raw = w_raw
@@ -379,7 +410,28 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, packed_w, w_raw, scale, accumulator, threshold):
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        packed_w: torch.Tensor,
+        w_raw: torch.Tensor,
+        scale: float,
+        accumulator: torch.Tensor,
+        threshold: float,
+    ) -> torch.Tensor:
+        """Forward with INT8 quantized activations.
+
+        Args:
+            x: input tensor (..., in_features)
+            packed_w: packed ternary weights
+            w_raw: unpacked ternary weights (out_features, in_features)
+            scale: ternary weight scale factor
+            accumulator: gradient accumulator tensor
+            threshold: bit-flip threshold
+
+        Returns:
+            Output tensor (..., out_features)
+        """
         max_abs = x.abs().max()
         scale_x = max_abs / 127.0 if max_abs > 1e-10 else 1.0
         x_q = (x / scale_x).round().clamp(-128, 127).to(torch.int8)
@@ -429,12 +481,24 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
 
 
 @torch.no_grad()
-def apply_bit_flips(packed_weights: torch.Tensor, accumulator: torch.Tensor,
-                     threshold: float, scale: float, shape_w: tuple) -> None:
+def apply_bit_flips(
+    packed_weights: torch.Tensor,
+    accumulator: torch.Tensor,
+    threshold: float,
+    scale: float,
+    shape_w: tuple,
+) -> None:
     """Check accumulators and flip bits where threshold exceeded.
 
     Called externally every N steps instead of per-step in backward.
     Resets flipped accumulator entries to zero.
+
+    Args:
+        packed_weights: packed ternary weights (modified in-place)
+        accumulator: gradient accumulator tensor (same shape as unpacked weights)
+        threshold: flip threshold (accumulator values beyond ±threshold trigger flip)
+        scale: weight scale factor (unused, kept for compatibility)
+        shape_w: shape of the unpacked weight matrix (out_features, in_features)
     """
     flip_up = accumulator > threshold
     flip_down = accumulator < -threshold

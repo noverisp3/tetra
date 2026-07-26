@@ -27,8 +27,23 @@ from ternary_llm.data import get_tokenizer_compat, ChunkedDataset
 from inference.export_model import export_model
 
 
-def compute_ppl_pytorch(model, tokens, block_size=128, max_batches=200):
-    """Compute perplexity using PyTorch model on token chunks."""
+def compute_ppl_pytorch(
+    model: torch.nn.Module,
+    tokens: np.ndarray,
+    block_size: int = 128,
+    max_batches: int = 200,
+) -> tuple[float, float, int]:
+    """Compute perplexity using PyTorch model on token chunks.
+
+    Args:
+        model: PyTorch model in eval mode
+        tokens: numpy array of uint16 token ids
+        block_size: context window per sample
+        max_batches: maximum number of batches to process
+
+    Returns:
+        Tuple of (perplexity, avg_loss, total_tokens_evaluated)
+    """
     model.eval()
     device = next(model.parameters()).device
 
@@ -54,8 +69,16 @@ def compute_ppl_pytorch(model, tokens, block_size=128, max_batches=200):
     return ppl, avg_loss, total_tokens
 
 
-def get_pytorch_logits(model, tokens):
-    """Get last-position logits from PyTorch for a 1-D token array."""
+def get_pytorch_logits(model: torch.nn.Module, tokens: list[int]) -> np.ndarray:
+    """Get last-position logits from PyTorch for a 1-D token array.
+
+    Args:
+        model: PyTorch model in eval mode
+        tokens: list of input token ids
+
+    Returns:
+        Logits array of shape (vocab_size,) as float64
+    """
     model.eval()
     device = next(model.parameters()).device
     x = torch.tensor(np.array([tokens]), dtype=torch.long, device=device)
@@ -64,8 +87,17 @@ def get_pytorch_logits(model, tokens):
     return logits[0, -1, :].cpu().numpy().astype(np.float64)
 
 
-def get_cpp_logits(binary_path, model_path, tokens):
-    """Get last-position logits from C++ inference for a token list."""
+def get_cpp_logits(binary_path: str, model_path: str, tokens: list[int]) -> np.ndarray:
+    """Get last-position logits from C++ inference for a token list.
+
+    Args:
+        binary_path: path to tetra C++ binary
+        model_path: path to tetra_model.bin
+        tokens: list of input token ids
+
+    Returns:
+        Logits array of shape (vocab_size,) as float64
+    """
     token_str = ",".join(str(t) for t in tokens)
     result = subprocess.run(
         [binary_path, model_path, token_str, "0"],

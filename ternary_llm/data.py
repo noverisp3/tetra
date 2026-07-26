@@ -23,7 +23,7 @@ from tqdm import tqdm
 _tokenizer_cache = None
 
 
-def get_tokenizer(tokenizer_dir="tokenizer"):
+def get_tokenizer(tokenizer_dir: str = "tokenizer"):
     """Load tokenizer: custom BPE (tokenizers) by default, GPT-2 if tokenizer_dir='gpt2'."""
     global _tokenizer_cache
     if _tokenizer_cache is not None:
@@ -62,6 +62,11 @@ class TokenizerWrapper:
         enc.n_vocab -> int
     """
     def __init__(self, tokenizer):
+        """Initialize wrapper.
+
+        Args:
+            tokenizer: HuggingFace tokenizer or transformers.PreTrainedTokenizer
+        """
         self._tok = tokenizer
         # Detect tokenizer type
         if hasattr(tokenizer, "eos_token_id"):
@@ -76,7 +81,8 @@ class TokenizerWrapper:
             self.eot_token = vocab.get("<EOS>", vocab.get("<eos>", 2))
             self.n_vocab = tokenizer.get_vocab_size()
 
-    def encode(self, text):
+    def encode(self, text: str) -> list[int]:
+        """Encode text to token ids (strips BOS/EOS if present)."""
         if self._is_transformers:
             return self._tok.encode(text)
         ids = self._tok.encode(text).ids
@@ -89,7 +95,8 @@ class TokenizerWrapper:
     def encode_ordinary(self, text):
         return self.encode(text)
 
-    def decode(self, ids):
+    def decode(self, ids: list[int]) -> str:
+        """Decode token ids to text."""
         return self._tok.decode(ids)
 
     def token_to_id(self, token):
@@ -98,7 +105,7 @@ class TokenizerWrapper:
         return self._tok.token_to_id(token)
 
 
-def get_tokenizer_compat(tokenizer_dir="tokenizer"):
+def get_tokenizer_compat(tokenizer_dir: str = "tokenizer") -> TokenizerWrapper:
     """Return a TokenizerWrapper for unified tokenizer API."""
     raw = get_tokenizer(tokenizer_dir)
     return TokenizerWrapper(raw)
@@ -106,7 +113,11 @@ def get_tokenizer_compat(tokenizer_dir="tokenizer"):
 
 # Data Download & Tokenize
 
-def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stories=None):
+def download_and_tokenize(
+    cache_dir: str = "data",
+    tokenizer_dir: str = "tokenizer",
+    max_stories: int | None = None,
+) -> tuple[np.memmap, dict]:
     """Download TinyStories dataset, tokenize, and cache as .bin + metadata.json.
 
     Args:
@@ -115,8 +126,7 @@ def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stori
         max_stories: Limit number of stories to process (default: all)
 
     Returns:
-        tokens: numpy memmap of uint16 token ids
-        metadata: dict with vocab_size, total_tokens
+        Tuple of (tokens memmap, metadata dict)
     """
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
@@ -206,8 +216,14 @@ def download_and_tokenize(cache_dir="data", tokenizer_dir="tokenizer", max_stori
 # Dataset
 
 class ChunkedDataset(Dataset):
-    """Non-overlapping chunks of tokens for fast shuffling."""
-    def __init__(self, tokens, block_size):
+    """Non-overlapping chunks of tokens for fast shuffling.
+
+    Args:
+        tokens: numpy array of uint16 token ids
+        block_size: context window per sample
+    """
+
+    def __init__(self, tokens: np.ndarray, block_size: int):
         n = len(tokens)
         # Reserve 1 for y offset: max valid start_idx = n - block_size - 1
         valid_starts = n - block_size - 1  # extra -1 so y[start+block_size] is valid
@@ -219,17 +235,24 @@ class ChunkedDataset(Dataset):
         self.block_size = block_size
         self.n_samples = n_samples
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.n_samples
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         start = idx * self.block_size
         x = self.tokens[start : start + self.block_size]
         y = self.tokens[start + 1 : start + self.block_size + 1]
         return x, y
 
 
-def create_dataloaders(tokens, block_size=128, batch_size=8, val_split=0.05, num_workers=0, pin_memory=False):
+def create_dataloaders(
+    tokens: np.ndarray,
+    block_size: int = 128,
+    batch_size: int = 8,
+    val_split: float = 0.05,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+) -> tuple[DataLoader, DataLoader]:
     """Create train/validation DataLoaders from token array.
 
     Args:
@@ -241,7 +264,7 @@ def create_dataloaders(tokens, block_size=128, batch_size=8, val_split=0.05, num
         pin_memory: pin memory for GPU transfer
 
     Returns:
-        train_loader, val_loader
+        Tuple of (train_loader, val_loader)
     """
     split_idx = int(len(tokens) * (1 - val_split))
     train_ds = ChunkedDataset(tokens[:split_idx], block_size)
@@ -263,8 +286,9 @@ def create_dataloaders(tokens, block_size=128, batch_size=8, val_split=0.05, num
 # Multi-Source Dataset
 
 class MultiSourceChunkedDataset(Dataset):
-    """Multi-source chunked dataset with ratio-based sampling."""
-    """Reads multiple .bin chunk files from different sources,
+    """Multi-source chunked dataset with ratio-based sampling.
+
+    Reads multiple .bin chunk files from different sources,
     samples according to configured ratios.
 
     Directory structure:
@@ -274,8 +298,14 @@ class MultiSourceChunkedDataset(Dataset):
             cosmopedia_0000.bin
             orca_0000.bin
             ...
+
+    Args:
+        data_dir: path to data directory with manifest.json and chunk files
+        block_size: context window per sample
+        val_split: fraction of data for validation
     """
-    def __init__(self, data_dir, block_size, val_split=0.05):
+
+    def __init__(self, data_dir: str | Path, block_size: int, val_split: float = 0.05):
         data_dir = Path(data_dir)
         with open(data_dir / "manifest.json") as f:
             self.manifest = json.load(f)
@@ -331,10 +361,10 @@ class MultiSourceChunkedDataset(Dataset):
         # Cache np.memmap objects to avoid reopening files per __getitem__
         self._memmap_cache = {}
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.n_samples
 
-    def _get_source_for_index(self, global_idx):
+    def _get_source_for_index(self, global_idx: int) -> tuple[str, int]:
         """Pick a source by ratio, then map global index to local block."""
         # Weighted random source selection (deterministic per sample for reproducibility)
         r = self.rng.random()

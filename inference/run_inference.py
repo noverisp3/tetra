@@ -1,8 +1,12 @@
-"""Tetra Inference Runner."""
+"""Tetra Inference Runner.
+
+Provides both C++ binary and Python fallback inference.
+"""
 import sys
 import subprocess
 import argparse
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ternary_llm.data import get_tokenizer_compat
@@ -11,7 +15,8 @@ from ternary_llm.data import get_tokenizer_compat
 EOS_TOKEN = 2
 
 
-def find_exe() -> Path | None:
+def find_exe() -> Optional[Path]:
+    """Find the best available C++ binary (prefers optimized builds)."""
     # Try optimized builds first, then scalar fallback
     for name in ["tetra_avx2.exe", "tetra_avx10.exe", "tetra_avx512.exe", "tetra.exe", "tetra"]:
         exe = Path(__file__).parent / name
@@ -20,8 +25,31 @@ def find_exe() -> Path | None:
     return None
 
 
-def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
-                  top_k=50, top_p=0.9, tokenizer_dir="tokenizer", repeat_penalty=1.0):
+def run_inference(
+    model_path: str,
+    prompt: str,
+    max_tokens: int = 100,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    top_p: float = 0.9,
+    tokenizer_dir: str = "tokenizer",
+    repeat_penalty: float = 1.0,
+) -> str:
+    """Run inference using C++ binary or Python fallback.
+
+    Args:
+        model_path: path to tetra_model.bin
+        prompt: input text prompt
+        max_tokens: maximum tokens to generate
+        temperature: sampling temperature
+        top_k: top-k sampling
+        top_p: nucleus sampling threshold
+        tokenizer_dir: tokenizer directory
+        repeat_penalty: repetition penalty (>1.0 penalizes repeats)
+
+    Returns:
+        Generated text
+    """
     enc = get_tokenizer_compat(tokenizer_dir)
     tokens = enc.encode(prompt)
     token_str = ",".join(str(t) for t in tokens)
@@ -79,8 +107,25 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
     return prev_text
 
 
-def python_inference(model_path, prompt_tokens, max_tokens, temperature, top_k=50):
-    """Fallback: pure Python inference using checkpoint."""
+def python_inference(
+    model_path: str,
+    prompt_tokens: list[int],
+    max_tokens: int,
+    temperature: float,
+    top_k: int = 50,
+) -> str:
+    """Fallback: pure Python inference using checkpoint.
+
+    Args:
+        model_path: path to model binary (unused, uses latest checkpoint)
+        prompt_tokens: list of input token ids
+        max_tokens: maximum tokens to generate
+        temperature: sampling temperature
+        top_k: top-k sampling
+
+    Returns:
+        Generated text
+    """
     import torch
     from ternary_llm.transformer import (
         TernaryTransformerModel, StochasticTransformerModel, StochasticMLAModel,

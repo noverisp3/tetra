@@ -80,6 +80,14 @@ class TernaryLinear(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with ternary quantization.
+
+        Args:
+            x: input tensor (..., in_features)
+
+        Returns:
+            Output tensor (..., out_features)
+        """
         output = FusedTernaryLinear.apply(x, self.latent_weights, self.ternary_scale, self.per_channel)
         if self.bias is not None:
             output = output + self.bias
@@ -165,6 +173,17 @@ class StochasticTernaryLinear(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with stochastic ternary matmul.
+
+        Unpacks ternary weights on first call, then applies bit-flip
+        training kernel. Supports both FP32 and INT8 matmul paths.
+
+        Args:
+            x: input tensor (..., in_features)
+
+        Returns:
+            Output tensor (..., out_features)
+        """
         if self._w_raw_cache is None:
             self._w_raw_cache = unpack_ternary_tensor(
                 self.packed_weights, (self.out_features, self.in_features)
@@ -224,6 +243,14 @@ class TopKActivation(nn.Module):
         self.keep_ratio = keep_ratio
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: zero out non-top-k activations.
+
+        Args:
+            x: input tensor of any shape
+
+        Returns:
+            Tensor with non-top-k activations zeroed out
+        """
         if self.keep_ratio >= 1.0 or not self.training:
             return x
         x_f = x.float()
