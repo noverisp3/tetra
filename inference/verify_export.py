@@ -1,4 +1,7 @@
-"""Verify exported Tetra binary matches PyTorch model output."""
+"""Verify exported Tetra binary matches PyTorch model output.
+
+Supports STE, stochastic, and MLA models.
+"""
 import sys
 import struct
 import numpy as np
@@ -7,11 +10,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
-from ternary_llm.transformer import TernaryTransformerModel
-from ternary_llm.quantization import TernaryQuantizer
+from ternary_llm.transformer import (
+    TernaryTransformerModel, StochasticTransformerModel, StochasticMLAModel,
+)
 
 
-TERNARY_DECODING = {-1: 0b00, 0: 0b01, 1: 0b10}  # reverse of encoding
 TERNARY_REVERSE = {0b00: -1, 0b01: 0, 0b10: 1, 0b11: 0}
 
 
@@ -27,107 +30,327 @@ def unpack_ternary(data: bytes, n: int) -> np.ndarray:
     return result
 
 
-def load_binary_model(path: str) -> dict:
-    """Load exported Tetra binary model into a dict of numpy arrays."""
+def load_binary_model(path: str) -> tuple[dict, dict]:
+    """Load exported Tetra binary model.
+
+    Returns (weights_dict, header_info_dict).
+    """
     weights = {}
+    header_info = {}
     with open(path, "rb") as f:
-        # Header (64 bytes)
         header = f.read(64)
         magic, version, vocab_size, hidden_dim, num_layers, num_heads, ffn_dim, \
-        max_seq_len, ternary_count, fp32_count = \
+            max_seq_len, ternary_count, fp32_count = \
             struct.unpack("<4sIIIIIIIQQ", header[:48])
         assert magic == b"TETR", f"Bad magic: {magic}"
-        print(f"Header: v{version} vocab={vocab_size} hidden={hidden_dim} "
-          f"layers={num_layers} heads={num_heads} ffn={ffn_dim} seq={max_seq_len}")
 
-        # Ternary weights
-        for _ in range(6 * num_layers):  # q,k,v,o,gate_up,down per layer
-            name_len = struct.unpack("<I", f.read(4))[0]
-            name = f.read(name_len).decode("utf-8")
+        flags = 0; kv_latent_dim = 0; rope_per_head = 0; group_size = 0
+        if version >= 5:
+            flags, kv_latent_dim, rope_per_head, group_size = struct.unpack(
+                "<HHHH", header[48:56])
+
+        header_info = {
+            "version": version,
+            "vocab_size": vocab_size,
+            "hidden_dim": hidden_dim,
+            "num_layers": num_layers,
+            "num_heads": num_heads,
+            "ffn_dim": ffn_dim,
+            "max_seq_len": max_seq_len,
+            "ternary_count": ternary_count,
+            "fp32_count": fp32_count,
+            "is_mla": bool(flags & 1),
+            "kv_latent_dim": kv_latent_dim,
+            "rope_per_head": rope_per_head,
+            "group_size": group_size,
+        }
+
+        print(f"Header v{version}: vocab={vocab_size} hidden={hidden_dim} "
+              f"layers={num_layers} heads={num_heads} ffn={ffn_dim} seq={max_seq_len}")
+        if flags & 1:
+            print(f"  MLA: kv_latent_dim={kv_latent_dim} rope_per_head={rope_per_head}")
+        if group_size > 0:
+            print(f"  Group size: {group_size}")
+
+        # Ternary weights: peek name suffix to distinguish from FP32
+        ternary_count_loaded = 0
+        while f.tell() < f.seek(0, 2) - 4:
+            f.seek(0)
+            f.seek(f.tell())  # noop, just checking position
+            peek_pos = f.tell()
+            name_len_data = f.read(4)
+            if len(name_len_data) < 4:
+                break
+            name_len = struct.unpack("<I", name_len_data)[0]
+            if name_len > 1024 or name_len == 0:
+                break
+            name_bytes = f.read(name_len)
+            if len(name_bytes) < name_len:
+                break
+            name = name_bytes.decode("utf-8")
+
+            # Check if ternary (ends with "latent_weights")
+            is_ternary = name.endswith("latent_weights")
+            if not is_ternary:
+                # Back up: this is the start of FP32 section
+                f.seek(peek_pos)
+                break
+
             rows, cols = struct.unpack("<HH", f.read(4))
+
+            if version >= 4:
+                gs, num_alphas = struct.unpack("<HH", f.read(4))
+                if num_alphas > 0:
+                    f.read(num_alphas * 4)  # skip alphas
+            elif version >= 3:
+                num_alphas = struct.unpack("<H", f.read(2))[0]
+                if num_alphas > 0:
+                    f.read(num_alphas * 4)
+            elif version >= 2:
+                f.read(4)  # scalar alpha
+
             packed_size = (rows * cols + 3) // 4
             packed_data = f.read(packed_size)
             arr = unpack_ternary(packed_data, rows * cols).reshape(rows, cols)
             weights[name] = arr
+            ternary_count_loaded += 1
 
-        # FP32 weights
-        total_fp32_tensors = 0
+        # FP32/INT8 weights
+        fp32_count_loaded = 0
         while True:
             name_len_data = f.read(4)
             if len(name_len_data) < 4:
                 break
             name_len = struct.unpack("<I", name_len_data)[0]
+            if name_len > 1024:
+                break
             name = f.read(name_len).decode("utf-8")
             ndim = struct.unpack("<B", f.read(1))[0]
+            dtype = struct.unpack("<B", f.read(1))[0]
             padded = struct.unpack("<4I", f.read(16))
             shape = list(padded[:ndim])
             n_elements = 1
             for s in shape:
                 n_elements *= s
-            raw_data = f.read(n_elements * 4)
-            arr = np.frombuffer(raw_data, dtype=np.float32).reshape(shape)
+
+            if dtype == 1:  # INT8
+                scale_val = struct.unpack("<f", f.read(4))[0]
+                raw_int8 = np.frombuffer(f.read(n_elements), dtype=np.int8)
+                arr = raw_int8.astype(np.float32) * scale_val
+                arr = arr.reshape(shape)
+            else:
+                raw_data = f.read(n_elements * 4)
+                arr = np.frombuffer(raw_data, dtype=np.float32).reshape(shape)
+
             weights[name] = arr
-            total_fp32_tensors += 1
+            fp32_count_loaded += 1
 
-        print(f"Loaded {len(weights)} tensors ({6*num_layers} ternary, {total_fp32_tensors} fp32)")
-    return weights
+        print(f"Loaded {len(weights)} tensors ({ternary_count_loaded} ternary, {fp32_count_loaded} fp32/int8)")
+    return weights, header_info
 
 
-def compare(pytorch_model, binary_weights):
-    """Compare PyTorch model weights with binary-loaded weights."""
-    print("\n--- Weight comparison ---")
+def verify_export(checkpoint_path: str, binary_path: str, mode: str = None,
+                  verbose: bool = True) -> bool:
+    """Verify exported binary matches PyTorch model.
+
+    Returns True if verification passes.
+    """
+    print(f"\n{'='*50}")
+    print(f"  Verify Export")
+    print(f"{'='*50}")
+
+    # Load checkpoint
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config = ckpt["config"]
+    sd = ckpt["model_state_dict"]
+    if mode is None:
+        mode = config.get("mode", "ste")
+
+    mla = config.get("mla", False) or any("kv_down_proj" in k for k in sd)
+
+    if mode == "stochastic" and mla:
+        kv_latent_dim = config.get("kv_latent_dim", None)
+        rope_per_head = config.get("rope_per_head", None)
+        hidden_dim = config.get("hidden_dim", 256)
+        num_heads = config.get("num_heads", 4)
+        for k, v in sd.items():
+            if k.endswith("kv_down_proj.packed_weights") and kv_latent_dim is None:
+                kv_latent_dim = v.numel() * 4 // hidden_dim
+            if k.endswith("q_rope_proj.packed_weights") and rope_per_head is None:
+                rope_dim = v.numel() * 4 // hidden_dim
+                rope_per_head = rope_dim // num_heads
+        model = StochasticMLAModel(
+            vocab_size=config["vocab_size"], hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"], num_heads=config["num_heads"],
+            ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
+            scale=config.get("ternary_scale", 1.0),
+            threshold=config.get("threshold", None),
+            int8=config.get("int8", False),
+            topk=config.get("topk", 1.0),
+            group_size=config.get("group_size", 0),
+            kv_latent_dim=kv_latent_dim,
+            rope_per_head=rope_per_head,
+        )
+        print(f"Mode: stochastic+MLA")
+    elif mode == "stochastic":
+        model = StochasticTransformerModel(
+            vocab_size=config["vocab_size"], hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"], num_heads=config["num_heads"],
+            ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
+            scale=config.get("ternary_scale", 1.0),
+            threshold=config.get("threshold", None),
+            int8=config.get("int8", False),
+            topk=config.get("topk", 1.0),
+            group_size=config.get("group_size", 0),
+        )
+        print(f"Mode: stochastic")
+    else:
+        model = TernaryTransformerModel(
+            vocab_size=config["vocab_size"], hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"], num_heads=config["num_heads"],
+            ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
+        )
+        print(f"Mode: STE")
+
+    model.load_state_dict(sd)
+    model.eval()
+
+    # Load binary
+    bin_weights, header_info = load_binary_model(binary_path)
+
+    # Compare weights
+    print(f"\n--- Weight comparison ---")
     max_diff = 0.0
-    for name, param in pytorch_model.named_parameters():
-        is_ternary = any(t in name for t in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_up_proj", "down_proj"])
-        if name == "lm_head.weight":
-            continue
+    total_compared = 0
+    total_ok = 0
 
-        if name not in binary_weights:
-            print(f"  MISSING: {name}")
-            continue
+    has_packed = any("packed_weights" in n for n, _ in model.named_buffers())
 
-        if is_ternary:
-            pytorch_w = TernaryQuantizer.apply(param.data).cpu().numpy()
-        else:
-            pytorch_w = param.data.float().cpu().numpy()
+    if has_packed:
+        # Stochastic mode: unpack packed_weights and compare with binary latent_weights
+        from ternary_llm.quantization import unpack_ternary_tensor as _unpack
 
-        bin_w = binary_weights[name]
-        if pytorch_w.shape != bin_w.shape:
-            print(f"  SHAPE MISMATCH: {name} pytorch={pytorch_w.shape} binary={bin_w.shape}")
-            continue
+        buffers = dict(model.named_buffers())
+        for name, buf in buffers.items():
+            if not name.endswith(".packed_weights"):
+                continue
 
-        diff = np.abs(pytorch_w - bin_w).max()
-        max_diff = max(max_diff, diff)
-        if diff > 1e-5:
-            print(f"  {name}: max_diff={diff:.6f}")
-        else:
-            print(f"  {name}: OK (exact match)")
+            prefix = name.rsplit(".", 1)[0]
+            layer_idx = name.split(".")[1]
+            is_ffn_gate = "gate_proj" in name and f"layers.{layer_idx}.ffn" in name
 
-    print(f"\nOverall max diff: {max_diff:.6f}")
+            if is_ffn_gate:
+                up_name = name.replace("gate_proj", "up_proj")
+                if up_name not in buffers:
+                    continue
+                from inference.export_model import get_stochastic_shape
+                s = get_stochastic_shape(model, name)
+                gate_w = _unpack(buf, s)
+                up_w = _unpack(buffers[up_name], s)
+                fused = torch.cat([gate_w, up_w], dim=0).to(torch.int8)
+                bin_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
+            elif "up_proj" in name and f"layers.{layer_idx}.ffn" in name:
+                continue
+            else:
+                from inference.export_model import get_stochastic_shape
+                s = get_stochastic_shape(model, name)
+                fused = _unpack(buf, s).to(torch.int8)
+                bin_name = prefix + ".latent_weights"
+
+            if bin_name not in bin_weights:
+                print(f"  MISSING in binary: {bin_name}")
+                continue
+
+            py_w = fused.cpu().numpy().astype(np.int8)
+            bin_w = bin_weights[bin_name]
+            if py_w.shape != bin_w.shape:
+                print(f"  SHAPE MISMATCH: {bin_name} py={py_w.shape} bin={bin_w.shape}")
+                continue
+
+            total_compared += 1
+            diff = np.abs(py_w.astype(np.float32) - bin_w.astype(np.float32)).max()
+            max_diff = max(max_diff, diff)
+            if diff < 1e-5:
+                total_ok += 1
+            elif verbose:
+                print(f"  {bin_name}: max_diff={diff:.6f}")
+
+        # Compare FP32 params
+        for name, param in model.named_parameters():
+            if name == "lm_head.weight":
+                continue
+            if name not in bin_weights:
+                # Might be packed ternary (not stored as fp32)
+                continue
+            py_w = param.data.float().cpu().numpy()
+            bin_w = bin_weights[name]
+            if py_w.shape != bin_w.shape:
+                # Squeeze shape for comparison
+                py_w = py_w.reshape(bin_w.shape)
+            total_compared += 1
+            diff = np.abs(py_w - bin_w).max()
+            max_diff = max(max_diff, diff)
+            if diff < 1e-5:
+                total_ok += 1
+            elif verbose:
+                print(f"  {name}: max_diff={diff:.6f}")
+    else:
+        # STE mode: standard comparison
+        from ternary_llm.quantization import TernaryQuantizer
+        for name, param in model.named_parameters():
+            is_ternary = any(t in name for t in [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_up_proj", "down_proj",
+                "kv_down_proj", "k_up_proj", "v_up_proj",
+                "q_rope_proj", "k_rope_proj",
+            ])
+            if name == "lm_head.weight":
+                continue
+            if name not in bin_weights:
+                print(f"  MISSING: {name}")
+                continue
+            if is_ternary:
+                py_w = TernaryQuantizer.apply(param.data).cpu().numpy()
+            else:
+                py_w = param.data.float().cpu().numpy()
+            bin_w = bin_weights[name]
+            if py_w.shape != bin_w.shape:
+                print(f"  SHAPE MISMATCH: {name} py={py_w.shape} bin={bin_w.shape}")
+                continue
+            total_compared += 1
+            diff = np.abs(py_w - bin_w).max()
+            max_diff = max(max_diff, diff)
+            if diff < 1e-5:
+                total_ok += 1
+            elif verbose:
+                print(f"  {name}: max_diff={diff:.6f}")
+
+    print(f"\n  Compared: {total_compared} tensors")
+    print(f"  Exact match: {total_ok}/{total_compared}")
+    print(f"  Max diff: {max_diff:.6f}")
+
+    passed = max_diff < 1e-3
+    if passed:
+        print(f"\n  [OK] Verification passed (max_diff < 1e-3)")
+    else:
+        print(f"\n  [WARN] Verification failed (max_diff >= 1e-3)")
+    print(f"{'='*50}\n")
+    return passed
 
 
 def main():
-    ckpt_path = sys.argv[1] if len(sys.argv) > 1 else None
-    bin_path = sys.argv[2] if len(sys.argv) > 2 else "tetra_model.bin"
+    import argparse
+    parser = argparse.ArgumentParser(description="Verify exported Tetra binary")
+    parser.add_argument("checkpoint", help="Path to .pt checkpoint")
+    parser.add_argument("binary", nargs="?", default="tetra_model.bin",
+                        help="Path to exported .bin (default: tetra_model.bin)")
+    parser.add_argument("--mode", choices=["ste", "stochastic"], default=None,
+                        help="Override mode detection")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress verbose output")
+    args = parser.parse_args()
 
-    print("Loading PyTorch model...")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    config = ckpt["config"]
-    model = TernaryTransformerModel(
-        vocab_size=config["vocab_size"],
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        num_heads=config["num_heads"],
-        ffn_dim=config["ffn_dim"],
-        max_seq_len=config["max_seq_len"],
-    )
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-
-    print("Loading binary model...")
-    binary_weights = load_binary_model(bin_path)
-
-    compare(model, binary_weights)
+    verify_export(args.checkpoint, args.binary, mode=args.mode, verbose=not args.quiet)
 
 
 if __name__ == "__main__":

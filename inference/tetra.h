@@ -236,6 +236,11 @@ struct ModelHeader {
     uint32_t version, vocab_size, hidden_dim, num_layers, num_heads;
     uint32_t ffn_dim, max_seq_len;
     uint64_t ternary_params, fp32_params;
+    // v5 fields
+    uint16_t flags;         // bit0=is_mla, bit1=int8_embeddings
+    uint16_t kv_latent_dim;
+    uint16_t rope_per_head;
+    uint16_t group_size;
 };
 
 // Decode FP32 matmul with prefetch
@@ -449,10 +454,10 @@ struct Model {
     }
     int head_dim() const { return header.hidden_dim / header.num_heads; }
 
-    // MLA fields
-    bool is_mla = false;
-    int kv_latent_dim = 0;
-    int rope_per_head = 0;
+    // MLA fields: prefer header v5, fallback to tensor name inference
+    bool is_mla = (header.version >= 5) ? (header.flags & 1) : false;
+    int kv_latent_dim = (header.version >= 5) ? header.kv_latent_dim : 0;
+    int rope_per_head = (header.version >= 5) ? header.rope_per_head : 0;
     int rope_dim = 0;
     std::vector<float> freqs_cis;
 };
@@ -478,8 +483,24 @@ static Model load_model(const char* path) {
     memcpy(&h.ternary_params, header_buf + 32, 8);
     memcpy(&h.fp32_params,    header_buf + 40, 8);
 
-    fprintf(stderr, "Tetra: %d layers, hidden=%d, heads=%d, ffn=%d, vocab=%d, seq=%d\n",
+    // v5 fields (bytes 48-55)
+    h.flags = 0; h.kv_latent_dim = 0; h.rope_per_head = 0; h.group_size = 0;
+    if (h.version >= 5) {
+        memcpy(&h.flags,         header_buf + 48, 2);
+        memcpy(&h.kv_latent_dim, header_buf + 50, 2);
+        memcpy(&h.rope_per_head, header_buf + 52, 2);
+        memcpy(&h.group_size,    header_buf + 54, 2);
+    }
+
+    fprintf(stderr, "Tetra: %d layers, hidden=%d, heads=%d, ffn=%d, vocab=%d, seq=%d",
             h.num_layers, h.hidden_dim, h.num_heads, h.ffn_dim, h.vocab_size, h.max_seq_len);
+    if (h.version >= 5 && (h.flags & 1)) {
+        fprintf(stderr, " [MLA kv_lat=%d rope_per_head=%d]", h.kv_latent_dim, h.rope_per_head);
+    }
+    if (h.version >= 5 && h.group_size > 0) {
+        fprintf(stderr, " [group=%d]", h.group_size);
+    }
+    fprintf(stderr, "\n");
 
     // Read ternary weights: read until we hit FP32 section
     // (ternary names end with ".latent_weights", FP32 names don't)
@@ -550,21 +571,27 @@ static Model load_model(const char* path) {
         model.ternary_weights[name] = std::move(w);
         ternary_count++;
 
-        // Detect MLA from tensor names
+        // Detect MLA from tensor names (fallback for v4 and earlier)
         if (name.find("kv_down_proj") != std::string::npos)
             model.is_mla = true;
     }
 
-    // Extract MLA dimensions from ternaries
+    // Extract MLA dimensions: prefer header, fallback to tensor shapes
     if (model.is_mla) {
-        for (auto& [name, w] : model.ternary_weights) {
-            if (name.find("kv_down_proj") != std::string::npos) {
-                model.kv_latent_dim = w.rows;  // kv_down: out=latent_dim, in=hidden
+        if (model.rope_per_head == 0 || model.kv_latent_dim == 0) {
+            // Fallback: infer from tensor dimensions
+            for (auto& [name, w] : model.ternary_weights) {
+                if (name.find("kv_down_proj") != std::string::npos && model.kv_latent_dim == 0) {
+                    model.kv_latent_dim = w.rows;
+                }
+                if (name.find("q_rope_proj") != std::string::npos && model.rope_per_head == 0) {
+                    model.rope_dim = w.rows;
+                    model.rope_per_head = w.rows / h.num_heads;
+                }
             }
-            if (name.find("q_rope_proj") != std::string::npos) {
-                model.rope_dim = w.rows;  // q_rope: out=rope_dim, in=hidden
-                model.rope_per_head = w.rows / h.num_heads;
-            }
+        } else {
+            // Compute rope_dim from header values
+            model.rope_dim = model.rope_per_head * h.num_heads;
         }
         model.freqs_cis = precompute_rope_freqs(model.rope_per_head, h.max_seq_len);
     }

@@ -82,7 +82,9 @@ def run_inference(model_path, prompt, max_tokens=100, temperature=0.8,
 def python_inference(model_path, prompt_tokens, max_tokens, temperature, top_k=50):
     """Fallback: pure Python inference using checkpoint."""
     import torch
-    from ternary_llm.transformer import TernaryTransformerModel
+    from ternary_llm.transformer import (
+        TernaryTransformerModel, StochasticTransformerModel, StochasticMLAModel,
+    )
 
     enc = get_tokenizer_compat()
     candidates = sorted(Path("checkpoints").glob("checkpoint_*.pt"))
@@ -92,15 +94,51 @@ def python_inference(model_path, prompt_tokens, max_tokens, temperature, top_k=5
         c = candidates[-1]
         ckpt = torch.load(c, map_location="cpu", weights_only=False)
         config = ckpt["config"]
-        model = TernaryTransformerModel(
-            vocab_size=config["vocab_size"],
-            hidden_dim=config["hidden_dim"],
-            num_layers=config["num_layers"],
-            num_heads=config["num_heads"],
-            ffn_dim=config["ffn_dim"],
-            max_seq_len=config["max_seq_len"],
-        )
-        model.load_state_dict(ckpt["model_state_dict"])
+        sd = ckpt["model_state_dict"]
+        mode = config.get("mode", "ste")
+        mla = config.get("mla", False) or any("kv_down_proj" in k for k in sd)
+
+        if mode == "stochastic" and mla:
+            kv_latent_dim = config.get("kv_latent_dim", None)
+            rope_per_head = config.get("rope_per_head", None)
+            hidden_dim = config.get("hidden_dim", 256)
+            num_heads = config.get("num_heads", 4)
+            for k, v in sd.items():
+                if k.endswith("kv_down_proj.packed_weights") and kv_latent_dim is None:
+                    kv_latent_dim = v.numel() * 4 // hidden_dim
+                if k.endswith("q_rope_proj.packed_weights") and rope_per_head is None:
+                    rope_dim = v.numel() * 4 // hidden_dim
+                    rope_per_head = rope_dim // num_heads
+            model = StochasticMLAModel(
+                vocab_size=config["vocab_size"], hidden_dim=config["hidden_dim"],
+                num_layers=config["num_layers"], num_heads=config["num_heads"],
+                ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
+                scale=config.get("ternary_scale", 1.0),
+                threshold=config.get("threshold", None),
+                int8=config.get("int8", False),
+                topk=config.get("topk", 1.0),
+                group_size=config.get("group_size", 0),
+                kv_latent_dim=kv_latent_dim,
+                rope_per_head=rope_per_head,
+            )
+        elif mode == "stochastic":
+            model = StochasticTransformerModel(
+                vocab_size=config["vocab_size"], hidden_dim=config["hidden_dim"],
+                num_layers=config["num_layers"], num_heads=config["num_heads"],
+                ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
+                scale=config.get("ternary_scale", 1.0),
+                threshold=config.get("threshold", None),
+                int8=config.get("int8", False),
+                topk=config.get("topk", 1.0),
+                group_size=config.get("group_size", 0),
+            )
+        else:
+            model = TernaryTransformerModel(
+                vocab_size=config["vocab_size"], hidden_dim=config["hidden_dim"],
+                num_layers=config["num_layers"], num_heads=config["num_heads"],
+                ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
+            )
+        model.load_state_dict(sd)
         model.eval()
         print(f"Loaded from {c}")
 

@@ -20,7 +20,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import torch
 
-from ternary_llm.transformer import TernaryTransformerModel
+from ternary_llm.transformer import (
+    TernaryTransformerModel, StochasticTransformerModel, StochasticMLAModel,
+)
 from ternary_llm.data import get_tokenizer_compat, ChunkedDataset
 from inference.export_model import export_model
 
@@ -124,22 +126,63 @@ def main():
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     config = ckpt["config"]
+    sd = ckpt["model_state_dict"]
+    mode = config.get("mode", "ste")
+    mla = config.get("mla", False) or any("kv_down_proj" in k for k in sd)
 
-    model = TernaryTransformerModel(
-        vocab_size=config["vocab_size"],
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        num_heads=config["num_heads"],
-        ffn_dim=config["ffn_dim"],
-        max_seq_len=config["max_seq_len"],
-    )
-    model.load_state_dict(ckpt["model_state_dict"])
+    if mode == "stochastic" and mla:
+        kv_latent_dim = config.get("kv_latent_dim", None)
+        rope_per_head = config.get("rope_per_head", None)
+        hidden_dim = config.get("hidden_dim", 256)
+        num_heads = config.get("num_heads", 4)
+        for k, v in sd.items():
+            if k.endswith("kv_down_proj.packed_weights") and kv_latent_dim is None:
+                kv_latent_dim = v.numel() * 4 // hidden_dim
+            if k.endswith("q_rope_proj.packed_weights") and rope_per_head is None:
+                rope_dim = v.numel() * 4 // hidden_dim
+                rope_per_head = rope_dim // num_heads
+        model = StochasticMLAModel(
+            vocab_size=config["vocab_size"], hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"], num_heads=config["num_heads"],
+            ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
+            scale=config.get("ternary_scale", 1.0),
+            threshold=config.get("threshold", None),
+            int8=config.get("int8", False),
+            topk=config.get("topk", 1.0),
+            group_size=config.get("group_size", 0),
+            kv_latent_dim=kv_latent_dim,
+            rope_per_head=rope_per_head,
+        )
+        print(f"Mode: stochastic+MLA")
+    elif mode == "stochastic":
+        model = StochasticTransformerModel(
+            vocab_size=config["vocab_size"], hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"], num_heads=config["num_heads"],
+            ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
+            scale=config.get("ternary_scale", 1.0),
+            threshold=config.get("threshold", None),
+            int8=config.get("int8", False),
+            topk=config.get("topk", 1.0),
+            group_size=config.get("group_size", 0),
+        )
+        print(f"Mode: stochastic")
+    else:
+        model = TernaryTransformerModel(
+            vocab_size=config["vocab_size"], hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"], num_heads=config["num_heads"],
+            ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
+        )
+        print(f"Mode: STE")
+    model.load_state_dict(sd)
     model.eval()
 
     total_params = sum(p.numel() for p in model.parameters())
     ternary_params = sum(
         p.numel() for name, p in model.named_parameters()
-        if any(t in name for t in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_up_proj", "down_proj"])
+        if any(t in name for t in [
+            "q_proj", "k_proj", "v_proj", "o_proj", "gate_up_proj", "down_proj",
+            "kv_down_proj", "k_up_proj", "v_up_proj", "q_rope_proj", "k_rope_proj",
+        ])
     )
     print(f"Model params: {total_params:,} (ternary: {ternary_params:,})")
 
@@ -168,7 +211,8 @@ def main():
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
             model_bin_path = f.name
         print(f"Exporting model to {model_bin_path}...")
-        export_model(model, model_bin_path)
+        export_mode = config.get("mode", "ste")
+        export_model(model, model_bin_path, mode=export_mode)
 
         # Collect logit pairs from random chunks
         bs = args.block_size

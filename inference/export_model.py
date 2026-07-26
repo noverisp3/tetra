@@ -1,32 +1,52 @@
 """Export model weights to binary format for C++ inference.
 
-2 bits per ternary weight, 4 weights per byte (MSB first).
-Binary format v4: header (64 bytes) + ternary sections + fp32 sections.
+Binary format v5: header (64 bytes) + ternary sections + fp32/int8 sections + optional metadata.
+
+Header v5 layout (64 bytes):
+  0-3:   magic "TETR"
+  4-7:   version (5)
+  8-11:  vocab_size
+  12-15: hidden_dim
+  16-19: num_layers
+  20-23: num_heads
+  24-27: ffn_dim
+  28-31: max_seq_len
+  32-39: ternary_params (uint64)
+  40-47: fp32_params (uint64)
+  48-49: flags (bit0=is_mla, bit1=int8_embeddings)
+  50-51: kv_latent_dim (uint16, MLA only)
+  52-53: rope_per_head (uint16, MLA only)
+  54-55: group_size (uint16, default quantization group size)
+  56-63: reserved (zeroes)
+
+Metadata section (optional, after all weights):
+  4 bytes: "META" magic
+  4 bytes: metadata_len (uint32 LE)
+  N bytes: UTF-8 JSON string
 """
 import sys
 import struct
+import json
+import time
 import numpy as np
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
-from ternary_llm.transformer import TernaryTransformerModel, StochasticTransformerModel
-
+from ternary_llm.transformer import (
+    TernaryTransformerModel, StochasticTransformerModel, StochasticMLAModel,
+)
 
 TERNARY_ENCODING = {-1: 0b00, 0: 0b01, 1: 0b10}
 
-TERNARY_PARAM_NAMES = [
-    "q_proj", "k_proj", "v_proj", "o_proj",   # attention
-    "gate_up_proj", "down_proj",               # ffn
-]
+HEADER_V5_SIZE = 64
+METADATA_MAGIC = b"META"
 
-FP32_PARAM_NAMES = [
-    "token_embedding", "pos_embedding",  # embeddings
-    "attn_norm", "ffn_norm", "norm",     # norms
-    "lm_head",                            # lm head (tied to embedding)
-]
 
+# ──────────────────────────────────────────────────────────────
+# Packing helpers
+# ──────────────────────────────────────────────────────────────
 
 def pack_ternary(weights: torch.Tensor) -> bytes:
     """Pack ternary weights {-1, 0, 1} into 2-bit encoding."""
@@ -52,24 +72,36 @@ def pack_ternary(weights: torch.Tensor) -> bytes:
     return packed.tobytes()
 
 
+# ──────────────────────────────────────────────────────────────
+# Parameter counting
+# ──────────────────────────────────────────────────────────────
+
+TERNARY_PARAM_NAMES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_up_proj", "down_proj",
+    "kv_down_proj", "k_up_proj", "v_up_proj",
+    "q_rope_proj", "k_rope_proj",
+]
+
+FP32_PARAM_NAMES = [
+    "token_embedding", "pos_embedding",
+    "attn_norm", "ffn_norm", "norm",
+    "lm_head",
+]
+
+
 def count_params(model) -> tuple[int, int]:
     """Count ternary vs fp32 parameters."""
     ternary_count = 0
     fp32_count = 0
-
-    # Check if model is stochastic (has packed_weights buffers)
     has_packed = any("packed_weights" in n for n, _ in model.named_buffers())
 
     if has_packed:
-        # Stochastic mode: count packed_weights buffers as ternary
         for name, buf in model.named_buffers():
             if "packed_weights" in name:
-                # Each packed byte holds 4 ternary weights
                 ternary_count += buf.numel() * 4
-        # Count remaining parameters (norms, embeddings, bias) as fp32
         for name, param in model.named_parameters():
             fp32_count += param.numel()
-        # Subtract accumulator buffers (not exported)
     else:
         for name, param in model.named_parameters():
             is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
@@ -81,8 +113,11 @@ def count_params(model) -> tuple[int, int]:
     return ternary_count, fp32_count
 
 
+# ──────────────────────────────────────────────────────────────
+# Stochastic module helpers
+# ──────────────────────────────────────────────────────────────
+
 def get_stochastic_module(model, buf_name: str):
-    """Get the StochasticTernaryLinear module from a packed_weights buffer name."""
     name = buf_name.replace(".packed_weights", "")
     parts = name.split(".")
     layer = model.layers[int(parts[1])]
@@ -93,207 +128,407 @@ def get_stochastic_module(model, buf_name: str):
 
 
 def get_stochastic_shape(model, buf_name: str) -> tuple:
-    """Get (out_features, in_features) from the StochasticTernaryLinear module."""
     sub = get_stochastic_module(model, buf_name)
     return (sub.out_features, sub.in_features)
 
 
-def export_model(model, output_path, mode="ste", scale=1.0):
-    """Export model weights to binary format."""
+# ──────────────────────────────────────────────────────────────
+# INT8 quantization
+# ──────────────────────────────────────────────────────────────
+
+def quantize_fp32_to_int8(tensor: torch.Tensor):
+    """Quantize float32 tensor to int8 with per-tensor scale.
+
+    Returns (scale: float32, w_int8: int8 numpy array).
+    """
+    w = tensor.detach().float().cpu().numpy().flatten()
+    scale = np.max(np.abs(w)) / 127.0
+    if scale < 1e-10:
+        scale = 1.0
+    w_int8 = np.clip(np.round(w / scale), -128, 127).astype(np.int8)
+    return scale, w_int8
+
+
+# ──────────────────────────────────────────────────────────────
+# Binary write helpers
+# ──────────────────────────────────────────────────────────────
+
+def write_header_v5(f, *, vocab_size, hidden_dim, num_layers, num_heads,
+                     ffn_dim, max_seq_len, ternary_count, fp32_count,
+                     is_mla=False, kv_latent_dim=0, rope_per_head=0,
+                     group_size=0, int8_embeddings=False):
+    """Write 64-byte v5 header."""
+    flags = 0
+    if is_mla:
+        flags |= 1
+    if int8_embeddings:
+        flags |= 2
+
+    header = struct.pack(
+        "<4sIIIIIIIQQHHHH8s",
+        b"TETR",
+        5,
+        vocab_size,
+        hidden_dim,
+        num_layers,
+        num_heads,
+        ffn_dim,
+        max_seq_len,
+        ternary_count,
+        fp32_count,
+        flags,
+        kv_latent_dim,
+        rope_per_head,
+        group_size,
+        b"\x00" * 8,
+    )
+    assert len(header) == HEADER_V5_SIZE, f"Header size mismatch: {len(header)} != {HEADER_V5_SIZE}"
+    f.write(header)
+
+
+def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None):
+    """Write a ternary weight entry."""
+    nb = new_name.encode("utf-8")
+    f.write(struct.pack("<I", len(nb)))
+    f.write(nb)
+    f.write(struct.pack("<HH", tensor.shape[0], tensor.shape[1]))
+
+    group_size = getattr(mod, 'group_size', 0) if mod is not None else 0
+    f.write(struct.pack("<H", group_size))
+
+    if alphas is not None:
+        a = alphas.detach().float().cpu().numpy() if hasattr(alphas, 'cpu') else np.array(alphas, dtype=np.float32)
+        a = a.flatten()
+        f.write(struct.pack("<H", len(a)))
+        f.write(a.tobytes())
+    elif mod is not None and hasattr(mod, 'alphas') and mod.alphas is not None:
+        a = mod.alphas.detach().float().cpu().numpy().flatten()
+        f.write(struct.pack("<H", len(a)))
+        f.write(a.tobytes())
+    else:
+        f.write(struct.pack("<H", 0))
+    f.write(pack_ternary(tensor))
+
+
+def write_fp32_entry(f, name, param, quantize_int8=False):
+    """Write a fp32 (or int8-quantized) weight entry."""
+    ndim = len(param.shape)
+    shape = list(param.shape)
+    while len(shape) < 4:
+        shape.append(1)
+
+    name_bytes = name.encode("utf-8")
+    f.write(struct.pack("<I", len(name_bytes)))
+    f.write(name_bytes)
+    f.write(struct.pack("<B", ndim))
+
+    is_int8_candidate = name in ("token_embedding.weight", "pos_embedding.weight")
+    use_int8 = is_int8_candidate or quantize_int8
+
+    if use_int8:
+        scale, w_int8 = quantize_fp32_to_int8(param.data)
+        f.write(struct.pack("<B", 1))  # dtype=1 (INT8)
+        f.write(struct.pack("<4I", *shape))
+        f.write(struct.pack("<f", scale))
+        f.write(w_int8.tobytes())
+    else:
+        f.write(struct.pack("<B", 0))  # dtype=0 (FP32)
+        w_fp32 = param.data.float().cpu().numpy().flatten()
+        f.write(struct.pack("<4I", *shape))
+        f.write(w_fp32.tobytes())
+
+
+def write_metadata(f, metadata: dict):
+    """Write optional metadata section at end of file."""
+    json_bytes = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+    f.write(METADATA_MAGIC)
+    f.write(struct.pack("<I", len(json_bytes)))
+    f.write(json_bytes)
+
+
+# ──────────────────────────────────────────────────────────────
+# Model architecture detection
+# ──────────────────────────────────────────────────────────────
+
+def detect_model_info(model) -> dict:
+    """Detect model architecture info from a loaded model."""
+    info = {}
+
+    # MLA detection
+    has_packed = any("packed_weights" in n for n, _ in model.named_buffers())
+    if has_packed:
+        info["mode"] = "stochastic"
+        info["is_mla"] = any("kv_down_proj" in n for n, _ in model.named_buffers())
+    else:
+        info["mode"] = "ste"
+        info["is_mla"] = False
+
+    info["hidden_dim"] = model.hidden_dim
+    info["num_layers"] = len(model.layers)
+    info["vocab_size"] = model.token_embedding.num_embeddings
+    info["max_seq_len"] = model.max_seq_len
+
+    # Get attention params
+    layer0 = model.layers[0]
+    if hasattr(layer0, 'attn'):
+        attn = layer0.attn
+        info["num_heads"] = attn.num_heads
+        if info["is_mla"]:
+            info["kv_latent_dim"] = getattr(attn, 'kv_latent_dim', 0)
+            info["rope_per_head"] = getattr(attn, 'rope_per_head', 0)
+        else:
+            info["kv_latent_dim"] = 0
+            info["rope_per_head"] = 0
+
+    # Get FFN dim
+    ffn_layer = layer0.ffn
+    if hasattr(ffn_layer, 'gate_up_proj'):
+        info["ffn_dim"] = ffn_layer.gate_up_proj.out_features // 2
+    elif hasattr(ffn_layer, 'gate_proj'):
+        info["ffn_dim"] = ffn_layer.gate_proj.out_features
+    else:
+        info["ffn_dim"] = 0
+
+    # Group size (from first ternary layer)
+    info["group_size"] = 0
+    if has_packed:
+        for name, buf in model.named_buffers():
+            if "packed_weights" in name:
+                mod = get_stochastic_module(model, name)
+                info["group_size"] = getattr(mod, 'group_size', 0)
+                break
+
+    # Check for int8 embeddings
+    info["int8_embeddings"] = True  # we always quantize embeddings to int8
+
+    # Total params
+    ternary_count, fp32_count = count_params(model)
+    info["ternary_count"] = ternary_count
+    info["fp32_count"] = fp32_count
+    info["total_count"] = ternary_count + fp32_count
+
+    return info
+
+
+# ──────────────────────────────────────────────────────────────
+# Export: STE mode
+# ──────────────────────────────────────────────────────────────
+
+def export_ste(f, model, quantize_int8=False):
+    """Export STE-mode ternary weights."""
+    from ternary_llm.quantization import TernaryQuantizer
+
+    for name, param in model.named_parameters():
+        is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
+        if not is_ternary:
+            continue
+        w_ternary = TernaryQuantizer.apply(param.data)
+        w_ternary = w_ternary.to(torch.int8)
+        write_ternary_entry(f, w_ternary, name)
+
+    for name, param in model.named_parameters():
+        is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
+        if is_ternary or name == "lm_head.weight":
+            continue
+        write_fp32_entry(f, name, param, quantize_int8=quantize_int8)
+
+
+# ──────────────────────────────────────────────────────────────
+# Export: Stochastic mode
+# ──────────────────────────────────────────────────────────────
+
+def export_stochastic(f, model, quantize_int8=False):
+    """Export stochastic-mode ternary weights with gate+up fusion."""
+    from ternary_llm.quantization import unpack_ternary_tensor as _unpack
+
+    buffers = dict(model.named_buffers())
+    written = set()
+
+    for name, buf in buffers.items():
+        if not name.endswith(".packed_weights"):
+            continue
+        if name in written:
+            continue
+        written.add(name)
+
+        prefix = name.rsplit(".", 1)[0]
+        layer_idx = name.split(".")[1]
+        is_ffn_gate = "gate_proj" in name and f"layers.{layer_idx}.ffn" in name
+
+        if is_ffn_gate:
+            up_name = name.replace("gate_proj", "up_proj")
+            if up_name not in buffers:
+                continue
+            written.add(up_name)
+            s = get_stochastic_shape(model, name)
+            gate_w = _unpack(buf, s)
+            up_w = _unpack(buffers[up_name], s)
+            fused = torch.cat([gate_w, up_w], dim=0).to(torch.int8)
+            new_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
+            gate_mod = get_stochastic_module(model, name)
+            up_mod = get_stochastic_module(model, up_name)
+            if gate_mod.alphas is not None:
+                combined = torch.cat([gate_mod.alphas, up_mod.alphas])
+                write_ternary_entry(fused, new_name, alphas=combined)
+            else:
+                write_ternary_entry(fused, new_name)
+        elif "up_proj" in name and f"layers.{layer_idx}.ffn" in name:
+            continue
+        else:
+            s = get_stochastic_shape(model, name)
+            w = _unpack(buf, s).to(torch.int8)
+            new_name = prefix + ".latent_weights"
+            mod = get_stochastic_module(model, name)
+            write_ternary_entry(f, w, new_name, mod)
+
+    for name, param in model.named_parameters():
+        if name == "lm_head.weight":
+            continue
+        write_fp32_entry(f, name, param, quantize_int8=quantize_int8)
+
+
+# ──────────────────────────────────────────────────────────────
+# Main export function
+# ──────────────────────────────────────────────────────────────
+
+def export_model(model, output_path, mode="ste", quantize_int8=False,
+                 metadata=None, verbose=True):
+    """Export model weights to binary format.
+
+    Args:
+        model: PyTorch model
+        output_path: output .bin path
+        mode: "ste" or "stochastic"
+        quantize_int8: quantize all FP32 weights to INT8
+        metadata: optional dict to store as JSON metadata section
+        verbose: print detailed stats
+    """
     model.eval()
 
-    ternary_count, fp32_count = count_params(model)
-    print(f"Ternary params: {ternary_count:,} ({ternary_count * 2 / 8 / 1024:.1f} KB packed)")
-    print(f"FP32 params: {fp32_count:,} ({fp32_count * 4 / 1024:.1f} KB)")
-    print(f"Total: {ternary_count + fp32_count:,}")
+    info = detect_model_info(model)
+    ternary_count = info["ternary_count"]
+    fp32_count = info["fp32_count"]
+
+    if verbose:
+        print(f"\n{'='*50}")
+        print(f"  Tetra Export v5")
+        print(f"{'='*50}")
+        print(f"  Mode:          {info['mode']}")
+        print(f"  MLA:           {info['is_mla']}")
+        if info['is_mla']:
+            print(f"  kv_latent_dim: {info['kv_latent_dim']}")
+            print(f"  rope_per_head: {info['rope_per_head']}")
+        print(f"  Hidden:        {info['hidden_dim']}")
+        print(f"  Layers:        {info['num_layers']}")
+        print(f"  Heads:         {info['num_heads']}")
+        print(f"  FFN dim:       {info['ffn_dim']}")
+        print(f"  Vocab:         {info['vocab_size']}")
+        print(f"  Max seq:       {info['max_seq_len']}")
+        print(f"  Group size:    {info['group_size']}")
+        print(f"  Ternary:       {ternary_count:,} ({ternary_count * 2 / 8 / 1024:.1f} KB packed)")
+        print(f"  FP32/INT8:     {fp32_count:,} ({fp32_count * 4 / 1024:.1f} KB)")
+        if quantize_int8:
+            print(f"  INT8 quant:    all FP32 weights → INT8 (4× compression)")
+        print(f"{'='*50}")
 
     with open(output_path, "wb") as f:
-        # Header (64 bytes)
-        vocab_size = model.token_embedding.num_embeddings
-        hidden_dim = model.hidden_dim
-        num_layers = len(model.layers)
-        num_heads = model.layers[0].attn.num_heads
-
-        # Get FFN dim from first layer
-        ffn_layer = model.layers[0].ffn
-        if hasattr(ffn_layer, 'gate_up_proj'):
-            ffn_dim = ffn_layer.gate_up_proj.out_features // 2
-        else:
-            ffn_dim = ffn_layer.gate_proj.out_features
-        max_seq_len = model.max_seq_len
-
-        header = struct.pack(
-            "<4sIIIIIIIQQ16s",
-            b"TETR",
-            4,
-            vocab_size,
-            hidden_dim,
-            num_layers,
-            num_heads,
-            ffn_dim,
-            max_seq_len,
-            ternary_count,
-            fp32_count,
-            b"\x00" * 16,
+        # Write v5 header
+        write_header_v5(
+            f,
+            vocab_size=info["vocab_size"],
+            hidden_dim=info["hidden_dim"],
+            num_layers=info["num_layers"],
+            num_heads=info["num_heads"],
+            ffn_dim=info["ffn_dim"],
+            max_seq_len=info["max_seq_len"],
+            ternary_count=ternary_count,
+            fp32_count=fp32_count,
+            is_mla=info["is_mla"],
+            kv_latent_dim=info.get("kv_latent_dim", 0),
+            rope_per_head=info.get("rope_per_head", 0),
+            group_size=info.get("group_size", 0),
+            int8_embeddings=info.get("int8_embeddings", False),
         )
-        f.write(header)
 
-        def write_ternary_entry(tensor, new_name, mod=None, alphas=None):
-            """Write a ternary weight with v4 per-group alpha support."""
-            nb = new_name.encode("utf-8")
-            f.write(struct.pack("<I", len(nb))); f.write(nb)
-            f.write(struct.pack("<HH", tensor.shape[0], tensor.shape[1]))
-            group_size = getattr(mod, 'group_size', 0) if mod is not None else 0
-            f.write(struct.pack("<H", group_size))
-            if alphas is not None:
-                a = alphas.detach().float().cpu().numpy() if hasattr(alphas, 'cpu') else np.array(alphas, dtype=np.float32)
-                a = a.flatten()
-                f.write(struct.pack("<H", len(a)))
-                f.write(a.tobytes())
-            elif mod is not None and hasattr(mod, 'alphas') and mod.alphas is not None:
-                a = mod.alphas.detach().float().cpu().numpy().flatten()
-                f.write(struct.pack("<H", len(a)))
-                f.write(a.tobytes())
-            else:
-                f.write(struct.pack("<H", 0))
-            f.write(pack_ternary(tensor))
-
+        # Write ternary + FP32 weights
         if mode == "stochastic":
-            from ternary_llm.quantization import unpack_ternary_tensor as _unpack
-            buffers = dict(model.named_buffers())
-            written = set()
-
-            for name, buf in buffers.items():
-                if not name.endswith(".packed_weights"):
-                    continue
-                if name in written:
-                    continue
-                written.add(name)
-
-                prefix = name.rsplit(".", 1)[0]
-                layer_idx = name.split(".")[1]  # get layer index for gate_proj fusion check
-                is_ffn_gate = "gate_proj" in name and f"layers.{layer_idx}.ffn" in name
-
-                if is_ffn_gate:
-                    up_name = name.replace("gate_proj", "up_proj")
-                    if up_name not in buffers:
-                        continue
-                    written.add(up_name)
-                    s = get_stochastic_shape(model, name)
-                    gate_w = _unpack(buf, s)
-                    up_w = _unpack(buffers[up_name], s)
-                    fused = torch.cat([gate_w, up_w], dim=0).to(torch.int8)
-                    new_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
-                    gate_mod = get_stochastic_module(model, name)
-                    up_mod = get_stochastic_module(model, up_name)
-                    if gate_mod.alphas is not None:
-                        combined = torch.cat([gate_mod.alphas, up_mod.alphas])
-                        write_ternary_entry(fused, new_name, alphas=combined)
-                    else:
-                        write_ternary_entry(fused, new_name)
-                elif "up_proj" in name and f"layers.{layer_idx}.ffn" in name:
-                    continue
-                else:
-                    s = get_stochastic_shape(model, name)
-                    w = _unpack(buf, s).to(torch.int8)
-                    new_name = prefix + ".latent_weights"
-                    mod = get_stochastic_module(model, name)
-                    write_ternary_entry(w, new_name, mod)
-
-            # --- Write fp32/int8 weights (stochastic) ---
-            for name, param in model.named_parameters():
-                if name == "lm_head.weight":
-                    continue
-                ndim = len(param.shape)
-                shape = list(param.shape)
-                while len(shape) < 4:
-                    shape.append(1)
-                name_bytes = name.encode("utf-8")
-                f.write(struct.pack("<I", len(name_bytes)))
-                f.write(name_bytes)
-                f.write(struct.pack("<B", ndim))
-
-                is_int8 = name in ("token_embedding.weight", "pos_embedding.weight")
-                if is_int8:
-                    f.write(struct.pack("<B", 1))
-                    w = param.data.float().cpu().numpy().flatten()
-                    scale = np.max(np.abs(w)) / 127.0
-                    w_int8 = np.clip(np.round(w / scale), -128, 127).astype(np.int8)
-                    f.write(struct.pack("<4I", *shape))
-                    f.write(struct.pack("<f", scale))
-                    f.write(w_int8.tobytes())
-                else:
-                    f.write(struct.pack("<B", 0))
-                    w_fp32 = param.data.float().cpu().numpy().flatten()
-                    f.write(struct.pack("<4I", *shape))
-                    f.write(w_fp32.tobytes())
-
+            export_stochastic(f, model, quantize_int8=quantize_int8)
         else:
-            # --- STE mode: original export logic ---
-            for name, param in model.named_parameters():
-                is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
-                if not is_ternary:
-                    continue
+            export_ste(f, model, quantize_int8=quantize_int8)
 
-                from ternary_llm.quantization import TernaryQuantizer
-                w_ternary = TernaryQuantizer.apply(param.data)
-                w_ternary = w_ternary.to(torch.int8)
-                write_ternary_entry(w_ternary, name)
-
-            for name, param in model.named_parameters():
-                is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
-                if is_ternary:
-                    continue
-                if name == "lm_head.weight":
-                    continue
-
-                ndim = len(param.shape)
-                shape = list(param.shape)
-                while len(shape) < 4:
-                    shape.append(1)
-                name_bytes = name.encode("utf-8")
-                f.write(struct.pack("<I", len(name_bytes)))
-                f.write(name_bytes)
-                f.write(struct.pack("<B", ndim))
-
-                is_int8 = name in ("token_embedding.weight", "pos_embedding.weight")
-                if is_int8:
-                    f.write(struct.pack("<B", 1))
-                    w = param.data.float().cpu().numpy().flatten()
-                    scale = np.max(np.abs(w)) / 127.0
-                    w_int8 = np.clip(np.round(w / scale), -128, 127).astype(np.int8)
-                    f.write(struct.pack("<4I", *shape))
-                    f.write(struct.pack("<f", scale))
-                    f.write(w_int8.tobytes())
-                else:
-                    f.write(struct.pack("<B", 0))
-                    w_fp32 = param.data.float().cpu().numpy().flatten()
-                    f.write(struct.pack("<4I", *shape))
-                    f.write(w_fp32.tobytes())
+        # Write metadata section
+        if metadata:
+            meta = dict(metadata)
+            meta["_export_version"] = 5
+            meta["_export_time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            meta["_info"] = {
+                k: v for k, v in info.items()
+                if k not in ("mode",)  # exclude non-serializable
+            }
+            write_metadata(f, meta)
 
     file_size = Path(output_path).stat().st_size
-    print(f"\nExported to {output_path} ({file_size / 1024:.1f} KB)")
+    ternary_kb = ternary_count * 2 / 8 / 1024
+    overhead_kb = (file_size - ternary_kb * 1024) / 1024
 
+    if verbose:
+        print(f"\n  Output:        {output_path}")
+        print(f"  File size:     {file_size / 1024:.1f} KB")
+        print(f"  Compression:   {info['total_count'] * 4 / 1024 / (file_size / 1024):.1f}× vs FP32")
+        if metadata:
+            print(f"  Metadata:      {len(json.dumps(metadata))} bytes (JSON)")
+        print(f"{'='*50}\n")
+
+    return info
+
+
+# ──────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python export_model.py <checkpoint.pt> [output.bin]")
-        sys.exit(1)
+    import argparse
 
-    ckpt_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else "tetra_model.bin"
+    parser = argparse.ArgumentParser(
+        description="Export Tetra model to binary format for C++ inference",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python export_model.py checkpoint.pt
+  python export_model.py checkpoint.pt -o model.bin
+  python export_model.py checkpoint.pt --quantize-int8 --verify
+  python export_model.py checkpoint.pt --metadata-step 15000 --metadata-loss 2.31
+        """,
+    )
+    parser.add_argument("checkpoint", help="Path to .pt checkpoint")
+    parser.add_argument("-o", "--output", default="tetra_model.bin",
+                        help="Output binary path (default: tetra_model.bin)")
+    parser.add_argument("--quantize-int8", action="store_true",
+                        help="Quantize all FP32 weights to INT8 (saves ~50% non-ternary size)")
+    parser.add_argument("--verify", action="store_true",
+                        help="Auto-verify export against PyTorch model")
+    parser.add_argument("--no-metadata", action="store_true",
+                        help="Skip embedding training metadata")
+    parser.add_argument("--metadata-step", type=int, default=None,
+                        help="Training step for metadata")
+    parser.add_argument("--metadata-loss", type=float, default=None,
+                        help="Training loss for metadata")
+    parser.add_argument("--metadata-dataset", type=str, default=None,
+                        help="Dataset name for metadata")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress verbose output")
+    args = parser.parse_args()
 
-    print(f"Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    print(f"Loading checkpoint: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = ckpt["config"]
+    sd = ckpt["model_state_dict"]
     mode = config.get("mode", "ste")
 
-    # Detect MLA from config or from state dict keys
-    sd = ckpt["model_state_dict"]
+    # Detect MLA from config or state dict keys
     mla = config.get("mla", False) or any("kv_down_proj" in k for k in sd)
 
     if mode == "stochastic" and mla:
-        # Infer MLA dims from packed_weights shapes in state dict
         kv_latent_dim = config.get("kv_latent_dim", None)
         rope_per_head = config.get("rope_per_head", None)
         hidden_dim = config.get("hidden_dim", 256)
@@ -305,9 +540,6 @@ def main():
                 rope_dim = v.numel() * 4 // hidden_dim
                 rope_per_head = rope_dim // num_heads
         print(f"MLA detected: kv_latent_dim={kv_latent_dim}, rope_per_head={rope_per_head}")
-
-    if mode == "stochastic" and mla:
-        from ternary_llm.transformer import StochasticMLAModel
         model = StochasticMLAModel(
             vocab_size=config["vocab_size"],
             hidden_dim=config["hidden_dim"],
@@ -320,8 +552,8 @@ def main():
             int8=config.get("int8", False),
             topk=config.get("topk", 1.0),
             group_size=config.get("group_size", 0),
-            kv_latent_dim=config.get("kv_latent_dim", None),
-            rope_per_head=config.get("rope_per_head", None),
+            kv_latent_dim=kv_latent_dim,
+            rope_per_head=rope_per_head,
         )
     elif mode == "stochastic":
         model = StochasticTransformerModel(
@@ -346,10 +578,38 @@ def main():
             ffn_dim=config["ffn_dim"],
             max_seq_len=config["max_seq_len"],
         )
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(sd)
 
-    scale = config.get("ternary_scale", 1.0)
-    export_model(model, output_path, mode=mode, scale=scale)
+    # Build metadata
+    metadata = None
+    if not args.no_metadata:
+        metadata = dict(config)
+        # Remove non-serializable items
+        for k in list(metadata.keys()):
+            v = metadata[k]
+            if isinstance(v, torch.Tensor):
+                metadata[k] = v.tolist()
+            elif not isinstance(v, (str, int, float, bool, list, dict, type(None))):
+                del metadata[k]
+        if args.metadata_step is not None:
+            metadata["training_step"] = args.metadata_step
+        if args.metadata_loss is not None:
+            metadata["training_loss"] = args.metadata_loss
+        if args.metadata_dataset is not None:
+            metadata["dataset"] = args.metadata_dataset
+
+    info = export_model(
+        model, args.output, mode=mode,
+        quantize_int8=args.quantize_int8,
+        metadata=metadata,
+        verbose=not args.quiet,
+    )
+
+    # Auto-verify
+    if args.verify:
+        print("--- Running verification ---")
+        from inference.verify_export import verify_export
+        verify_export(args.checkpoint, args.output, mode=mode)
 
 
 if __name__ == "__main__":
