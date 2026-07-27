@@ -336,15 +336,12 @@ class StochasticBitFlipLinear(torch.autograd.Function):
             in_features = x.size(-1)
             num_groups = (in_features + group_size - 1) // group_size
             ctx.num_groups = num_groups
-            out_features = w_raw.size(0)
-            out = torch.zeros(*x.shape[:-1], out_features, dtype=x.dtype, device=x.device)
-            for g in range(num_groups):
-                start = g * group_size
-                end = min(start + group_size, in_features)
-                x_g = x[..., start:end]
-                w_g = w_raw[:, start:end]
-                out = out + F.linear(x_g, w_g) * alphas[:, g].unsqueeze(0)
-            return out
+            # Fused group matmul: expand alphas to full in_features, scale w_raw once
+            alphas_expanded = torch.repeat_interleave(alphas, group_size, dim=1)
+            if in_features % group_size != 0:
+                alphas_expanded = alphas_expanded[:, :in_features]
+            w_scaled = w_raw * alphas_expanded
+            return F.linear(x, w_scaled)
         elif alphas is not None:
             ctx.alphas = alphas
             return F.linear(x, w_raw) * alphas.unsqueeze(0)
@@ -353,7 +350,6 @@ class StochasticBitFlipLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x = ctx.saved_tensors[0].to(grad_output.dtype)
-        scale = ctx.scale
         in_features = x.size(-1)
         out_features = grad_output.size(-1)
 
@@ -364,21 +360,22 @@ class StochasticBitFlipLinear(torch.autograd.Function):
             num_groups = ctx.num_groups
             alphas = ctx.alphas
             bsz = x.shape[:-1]
-            grad_x = torch.zeros(*bsz, in_features, dtype=x.dtype, device=x.device)
+            # Reconstruct expanded alphas and scaled weights
+            alphas_expanded = torch.repeat_interleave(alphas, ctx.group_size, dim=1)
+            if in_features % ctx.group_size != 0:
+                alphas_expanded = alphas_expanded[:, :in_features]
+            w_scaled = w_raw * alphas_expanded
+            # Single fused matmul for grad_x and grad_w_scaled
+            x_flat = x.reshape(-1, in_features)
+            grad_x = torch.mm(grad_output_flat, w_scaled).view(*bsz, in_features)
+            grad_w_scaled = torch.mm(grad_output_flat.T, x_flat)
+            grad_w = grad_w_scaled * alphas_expanded
+            # Scatter grad_alpha: sum over columns per group (still a loop, but trivial O(num_groups))
             grad_alpha = torch.zeros(out_features, num_groups, device=x.device)
-            grad_w = torch.zeros(out_features, in_features, device=x.device)
             for g in range(num_groups):
                 start = g * ctx.group_size
                 end = min(start + ctx.group_size, in_features)
-                x_g = x[..., start:end]
-                w_g = w_raw[:, start:end]
-                alpha_g = alphas[:, g]
-                x_g_flat = x_g.reshape(-1, x_g.size(-1))
-                grad_y_scaled = grad_output_flat * alpha_g.unsqueeze(0)
-                grad_x_g = torch.mm(grad_y_scaled, w_g).view(*bsz, -1)
-                grad_x[..., start:end] = grad_x_g
-                grad_w[:, start:end] = torch.mm(grad_y_scaled.T, x_g_flat)
-                grad_alpha[:, g] = (grad_output_flat * F.linear(x_g_flat, w_g)).sum(dim=0)
+                grad_alpha[:, g] = (grad_w_scaled[:, start:end] * w_raw[:, start:end]).sum(dim=1)
             grad_alpha = grad_alpha.detach()
         elif hasattr(ctx, 'alphas') and ctx.alphas is not None:
             grad_y_scaled = grad_output_flat * ctx.alphas.unsqueeze(0)
