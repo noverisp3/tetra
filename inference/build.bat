@@ -32,29 +32,49 @@ if %errorlevel% neq 0 (
 )
 
 set SRC=.\tetra.cpp
+set SRC2=.\selflearn.cpp
 
 set OPENMP=/openmp
 
-if /I "%1"=="avx2" (
-    cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX2 /Fe:tetra_avx2.exe %SRC%
-    echo Build: tetra_avx2.exe (AVX2+FMA)
-) else if /I "%1"=="avx10" (
-    cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX10 /Fe:tetra_avx10.exe %SRC%
-    echo Build: tetra_avx10.exe (AVX10)
-) else if /I "%1"=="avx512" (
-    cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX512 /Fe:tetra_avx512.exe %SRC%
-    echo Build: tetra_avx512.exe (AVX-512)
-) else if "%1"=="" (
-    cl /EHsc /O2 /std:c++17 %OPENMP% /Fe:tetra.exe %SRC%
-    echo Build: tetra.exe (scalar fallback)
-) else (
-    echo Usage: build.bat [avx2^|avx10^|avx512]
-    echo   (no args)  - scalar fallback
-    echo   avx2       - AVX2+FMA
-    echo   avx10      - AVX10
-    echo   avx512     - AVX-512
-    exit /b 1
-)
+if /I "%1"=="avx2" goto :avx2
+if /I "%1"=="avx10" goto :avx10
+if /I "%1"=="avx512" goto :avx512
+if "%1"=="" goto :scalar
+goto :usage
+
+:avx2
+cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX2 /Fe:tetra_avx2.exe %SRC%
+cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX2 /Fe:selflearn_avx2.exe %SRC2%
+echo Build: tetra_avx2.exe + selflearn_avx2.exe (AVX2+FMA)
+goto :done
+
+:avx10
+cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX10 /Fe:tetra_avx10.exe %SRC%
+cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX10 /Fe:selflearn_avx10.exe %SRC2%
+echo Build: tetra_avx10.exe + selflearn_avx10.exe (AVX10)
+goto :done
+
+:avx512
+cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX512 /Fe:tetra_avx512.exe %SRC%
+cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX512 /Fe:selflearn_avx512.exe %SRC2%
+echo Build: tetra_avx512.exe + selflearn_avx512.exe (AVX-512)
+goto :done
+
+:scalar
+cl /EHsc /O2 /std:c++17 %OPENMP% /Fe:tetra.exe %SRC%
+cl /EHsc /O2 /std:c++17 %OPENMP% /Fe:selflearn.exe %SRC2%
+echo Build: tetra.exe + selflearn.exe (scalar fallback)
+goto :done
+
+:usage
+echo Usage: build.bat [avx2^|avx10^|avx512]
+echo   (no args)  - scalar fallback
+echo   avx2       - AVX2+FMA
+echo   avx10      - AVX10
+echo   avx512     - AVX-512
+exit /b 1
+
+:done
 
 if %errorlevel% neq 0 (
     echo Compilation failed

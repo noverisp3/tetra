@@ -156,8 +156,8 @@ def quantize_fp32_to_int8(tensor: torch.Tensor):
 def write_header_v5(f, *, vocab_size, hidden_dim, num_layers, num_heads,
                      ffn_dim, max_seq_len, ternary_count, fp32_count,
                      is_mla=False, kv_latent_dim=0, rope_per_head=0,
-                     group_size=0, int8_embeddings=False):
-    """Write 64-byte v5 header."""
+                     group_size=0, int8_embeddings=False, version=5):
+    """Write 64-byte v5/v6 header."""
     flags = 0
     if is_mla:
         flags |= 1
@@ -167,7 +167,7 @@ def write_header_v5(f, *, vocab_size, hidden_dim, num_layers, num_heads,
     header = struct.pack(
         "<4sIIIIIIIQQHHHH8s",
         b"TETR",
-        5,
+        version,
         vocab_size,
         hidden_dim,
         num_layers,
@@ -186,8 +186,13 @@ def write_header_v5(f, *, vocab_size, hidden_dim, num_layers, num_heads,
     f.write(header)
 
 
-def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None):
-    """Write a ternary weight entry."""
+def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None, accumulator=None):
+    """Write a ternary weight entry.
+
+    When ``accumulator`` (FP32, rows*cols) is given the entry is written in
+    v6 form: the FP32 accumulator follows the packed ternary data. This is the
+    learning state that lets the C++ runtime keep self-learning across runs.
+    """
     nb = new_name.encode("utf-8")
     f.write(struct.pack("<I", len(nb)))
     f.write(nb)
@@ -208,6 +213,11 @@ def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None):
     else:
         f.write(struct.pack("<H", 0))
     f.write(pack_ternary(tensor))
+
+    if accumulator is not None:
+        acc = (accumulator.detach().float().cpu().numpy()
+               if hasattr(accumulator, "cpu") else np.asarray(accumulator, dtype=np.float32))
+        f.write(acc.reshape(-1).astype(np.float32).tobytes())
 
 
 def write_fp32_entry(f, name, param, quantize_int8=False):
@@ -388,6 +398,148 @@ def export_stochastic(f, model, quantize_int8=False):
 
 
 # ──────────────────────────────────────────────────────────────
+# Export: Self-learning mode (v6)
+# ──────────────────────────────────────────────────────────────
+
+def export_self_learning(
+    model, output_path,
+    rule="c", threshold=20.0, acc_decay=0.99, flip_every_n=5,
+    logit_scale=1.0 / 16.0, lr_embedding=1e-4, wd_embedding=0.1,
+    block_size=128, metadata=None, verbose=True,
+):
+    """Export a stochastic model to binary format v6 for the C++ self-learning runtime.
+
+    v6 = v5 + per-ternary FP32 accumulators (learning state) + ``sl_*`` config
+    in the metadata JSON. The token embedding is written as FP32 (mutable) so
+    the runtime can keep applying its local SGD.
+    """
+    model.eval()
+    from ternary_llm.quantization import unpack_ternary_tensor as _unpack
+
+    info = detect_model_info(model)
+    ternary_count = info["ternary_count"]
+    fp32_count = info["fp32_count"]
+
+    buffers = dict(model.named_buffers())
+    acc_buffers = {
+        n.replace(".packed_weights", ".accumulator"): buffers.get(n.replace(".packed_weights", ".accumulator"))
+        for n, b in buffers.items() if n.endswith(".packed_weights")
+    }
+
+    if verbose:
+        print(f"\n{'='*50}")
+        print(f"  Tetra Export v6 (self-learning)")
+        print(f"{'='*50}")
+        print(f"  Rule:          {rule}  (c=predictive coding)")
+        print(f"  Threshold:     {threshold}")
+        print(f"  Acc decay:     {acc_decay}")
+        print(f"  Flip every:    {flip_every_n}")
+        print(f"  Logit scale:   {logit_scale:.6f}")
+        print(f"  Emb lr/wd:     {lr_embedding} / {wd_embedding}")
+        print(f"  Block size:    {block_size}")
+        print(f"  Hidden:        {info['hidden_dim']}")
+        print(f"  Layers:        {info['num_layers']}")
+        print(f"  Heads:         {info['num_heads']}")
+        print(f"  FFN dim:       {info['ffn_dim']}")
+        print(f"  Vocab:         {info['vocab_size']}")
+        print(f"  Ternary:       {ternary_count:,} ({ternary_count * 2 / 8 / 1024:.1f} KB packed)")
+        print(f"  Accumulators:  {ternary_count * 4 / 1024:.1f} KB FP32")
+        print(f"{'='*50}")
+
+    with open(output_path, "wb") as f:
+        write_header_v5(
+            f,
+            vocab_size=info["vocab_size"],
+            hidden_dim=info["hidden_dim"],
+            num_layers=info["num_layers"],
+            num_heads=info["num_heads"],
+            ffn_dim=info["ffn_dim"],
+            max_seq_len=info["max_seq_len"],
+            ternary_count=ternary_count,
+            fp32_count=fp32_count,
+            is_mla=info["is_mla"],
+            kv_latent_dim=info.get("kv_latent_dim", 0),
+            rope_per_head=info.get("rope_per_head", 0),
+            group_size=info.get("group_size", 0),
+            int8_embeddings=False,
+            version=6,
+        )
+
+        written = set()
+        for name, buf in buffers.items():
+            if not name.endswith(".packed_weights"):
+                continue
+            if name in written:
+                continue
+            written.add(name)
+
+            prefix = name.rsplit(".", 1)[0]
+            layer_idx = name.split(".")[1]
+            is_ffn_gate = "gate_proj" in name and f"layers.{layer_idx}.ffn" in name
+            acc = acc_buffers.get(prefix + ".accumulator")
+
+            if is_ffn_gate:
+                up_name = name.replace("gate_proj", "up_proj")
+                if up_name not in buffers:
+                    continue
+                written.add(up_name)
+                s = get_stochastic_shape(model, name)
+                gate_w = _unpack(buf, s)
+                up_w = _unpack(buffers[up_name], s)
+                fused = torch.cat([gate_w, up_w], dim=0).to(torch.int8)
+                new_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
+                up_acc = acc_buffers.get(prefix.replace("gate_proj", "up_proj") + ".accumulator")
+                fused_acc = (torch.cat([acc, up_acc], dim=0) if acc is not None and up_acc is not None else None)
+                gate_mod = get_stochastic_module(model, name)
+                up_mod = get_stochastic_module(model, up_name)
+                if gate_mod.alphas is not None:
+                    combined = torch.cat([gate_mod.alphas, up_mod.alphas])
+                    write_ternary_entry(f, fused, new_name, alphas=combined,
+                                        accumulator=fused_acc)
+                else:
+                    write_ternary_entry(f, fused, new_name, accumulator=fused_acc)
+            elif "up_proj" in name and f"layers.{layer_idx}.ffn" in name:
+                continue
+            else:
+                s = get_stochastic_shape(model, name)
+                w = _unpack(buf, s).to(torch.int8)
+                new_name = prefix + ".latent_weights"
+                mod = get_stochastic_module(model, name)
+                write_ternary_entry(f, w, new_name, mod, accumulator=acc)
+
+        # FP32 weights (embedding must stay FP32 for local SGD)
+        for name, param in model.named_parameters():
+            if name == "lm_head.weight":
+                continue
+            is_embed = name in ("token_embedding.weight", "pos_embedding.weight")
+            write_fp32_entry(f, name, param, quantize_int8=False if is_embed else False)
+
+        meta = dict(metadata) if metadata else {}
+        meta.update({
+            "_export_version": 6,
+            "_export_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "sl_rule": rule,
+            "sl_threshold": float(threshold),
+            "sl_acc_decay": float(acc_decay),
+            "sl_flip_every_n": int(flip_every_n),
+            "sl_logit_scale": float(logit_scale),
+            "sl_lr_embedding": float(lr_embedding),
+            "sl_wd_embedding": float(wd_embedding),
+            "sl_block_size": int(block_size),
+            "_info": {k: v for k, v in info.items() if k != "mode"},
+        })
+        write_metadata(f, meta)
+
+    file_size = Path(output_path).stat().st_size
+    if verbose:
+        print(f"\n  Output:        {output_path}")
+        print(f"  File size:     {file_size / 1024:.1f} KB")
+        print(f"{'='*50}\n")
+
+    return info
+
+
+# ──────────────────────────────────────────────────────────────
 # Main export function
 # ──────────────────────────────────────────────────────────────
 
@@ -517,6 +669,16 @@ Examples:
                         help="Dataset name for metadata")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress verbose output")
+    parser.add_argument("--self-learning", action="store_true",
+                        help="Export to v6 with accumulators + sl_* config for the C++ self-learning runtime")
+    parser.add_argument("--sl-rule", default="c",
+                        help="Self-learning rule for C++ runtime (default: c=predictive coding)")
+    parser.add_argument("--sl-threshold", type=float, default=20.0)
+    parser.add_argument("--sl-acc-decay", type=float, default=0.99)
+    parser.add_argument("--sl-flip-every-n", type=int, default=5)
+    parser.add_argument("--sl-lr-embedding", type=float, default=1e-4)
+    parser.add_argument("--sl-wd-embedding", type=float, default=0.1)
+    parser.add_argument("--sl-block-size", type=int, default=128)
     args = parser.parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -524,6 +686,49 @@ Examples:
     config = ckpt["config"]
     sd = ckpt["model_state_dict"]
     mode = config.get("mode", "ste")
+
+    # Detect discrete (gradient-free) checkpoints: DiscreteConfig has a "rule".
+    is_discrete = "rule" in config and "acc_decay" in config
+
+    if args.self_learning or is_discrete:
+        model = StochasticTransformerModel(
+            vocab_size=config["vocab_size"],
+            hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"],
+            num_heads=config["num_heads"],
+            ffn_dim=config["ffn_dim"],
+            max_seq_len=config["max_seq_len"],
+            scale=config.get("ternary_scale", 1.0),
+            threshold=config.get("threshold", None),
+            int8=config.get("int8", False),
+            topk=config.get("topk", 1.0),
+            group_size=config.get("group_size", 0),
+        )
+        model.load_state_dict(sd)
+
+        logit_scale = 1.0 / (config["hidden_dim"] ** 0.5)
+        metadata = dict(config) if not args.no_metadata else {}
+        for k in list(metadata.keys()):
+            v = metadata[k]
+            if isinstance(v, torch.Tensor):
+                metadata[k] = v.tolist()
+            elif not isinstance(v, (str, int, float, bool, list, dict, type(None))):
+                del metadata[k]
+
+        export_self_learning(
+            model, args.output,
+            rule=args.sl_rule if not is_discrete or args.self_learning else config.get("rule", "c"),
+            threshold=args.sl_threshold,
+            acc_decay=args.sl_acc_decay,
+            flip_every_n=args.sl_flip_every_n,
+            logit_scale=logit_scale,
+            lr_embedding=args.sl_lr_embedding,
+            wd_embedding=args.sl_wd_embedding,
+            block_size=args.sl_block_size,
+            metadata=metadata,
+            verbose=not args.quiet,
+        )
+        return
 
     # Detect MLA from config or state dict keys
     mla = config.get("mla", False) or any("kv_down_proj" in k for k in sd)

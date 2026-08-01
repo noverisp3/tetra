@@ -53,6 +53,7 @@ struct TernaryWeightXNOR {
     int group_size;            // 0 = scalar/per-channel, >0 = per-group block
     float alpha;               // scalar alpha (default 1.0)
     std::vector<float> alphas; // flat array: per-group = rows*num_groups, per-channel = rows, empty = scalar
+    std::vector<float> accumulator; // FP32 learning state (rows*cols), v6 only
 };
 
 // SIMD dot product: sum(x[i] * w[i]) for i in [0, cols)
@@ -460,7 +461,52 @@ struct Model {
     int rope_per_head = (header.version >= 5) ? header.rope_per_head : 0;
     int rope_dim = 0;
     std::vector<float> freqs_cis;
+
+    // Self-learning config (v6, from metadata JSON)
+    int sl_rule = 0;              // 0=c predictive coding, 1=b FF, 2=p target PC
+    float sl_threshold = 20.0f;
+    float sl_acc_decay = 0.99f;
+    int sl_flip_every_n = 5;
+    float sl_logit_scale = 0.0625f;
+    float sl_lr_embedding = 1e-4f;
+    float sl_wd_embedding = 0.1f;
+    int sl_block_size = 128;
+    bool sl_enabled = false;      // true when a v6 self-learning model was loaded
 };
+
+// ──────────────────────────────────────────────────────────────
+// Minimal JSON field extractors (for the metadata section)
+// ──────────────────────────────────────────────────────────────
+
+static std::string json_get_str(const std::string& j, const std::string& key) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = j.find(pat);
+    if (p == std::string::npos) return "";
+    p = j.find(':', p + pat.size());
+    if (p == std::string::npos) return "";
+    while (p + 1 < j.size() && (j[p+1] == ' ' || j[p+1] == '\t' || j[p+1] == '\n' || j[p+1] == '\r')) p++;
+    if (p + 1 >= j.size() || j[p+1] != '"') return "";
+    size_t q = p + 2;
+    size_t end = j.find('"', q);
+    if (end == std::string::npos) return "";
+    return j.substr(q, end - q);
+}
+
+static double json_get_num(const std::string& j, const std::string& key, double dflt) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = j.find(pat);
+    if (p == std::string::npos) return dflt;
+    p = j.find(':', p + pat.size());
+    if (p == std::string::npos) return dflt;
+    p++;
+    while (p < j.size() && (j[p] == ' ' || j[p] == '\t' || j[p] == '\n' || j[p] == '\r')) p++;
+    size_t start = p;
+    while (p < j.size() && (j[p] == '-' || j[p] == '+' || j[p] == '.' ||
+                            (j[p] >= '0' && j[p] <= '9') || j[p] == 'e' || j[p] == 'E')) p++;
+    if (p == start) return dflt;
+    try { return std::stod(j.substr(start, p - start)); }
+    catch (...) { return dflt; }
+}
 
 static Model load_model(const char* path) {
     Model model;
@@ -567,6 +613,12 @@ static Model load_model(const char* path) {
         w.alpha = alphas.empty() ? 1.0f : alphas[0];
         w.alphas = std::move(alphas);
         w.packed = std::move(packed);
+
+        if (h.version >= 6) {
+            w.accumulator.resize((size_t)rows * cols, 0.0f);
+            r.read_bytes(w.accumulator.data(), w.accumulator.size() * sizeof(float));
+        }
+
         precompute_floats(w);
         model.ternary_weights[name] = std::move(w);
         ternary_count++;
@@ -636,6 +688,33 @@ static Model load_model(const char* path) {
 
     fprintf(stderr, "Loaded %zu ternary + %zu fp32 tensors\n",
             model.ternary_weights.size(), model.fp32_weights.size());
+
+    // v6: parse the metadata JSON section for the self-learning config.
+    // Note: the fp32 loop already consumed the 4-byte "META" magic as a
+    // (rejected) name-length field, so the magic sits at r.pos - 4.
+    if (r.pos + 4 <= r.end && memcmp(r.pos - 4, "META", 4) == 0) {
+        uint32_t meta_len;
+        r.read(meta_len);
+        std::string meta = (meta_len <= (uint32_t)(r.end - r.pos))
+            ? r.read_str(meta_len) : "";
+        std::string rule = json_get_str(meta, "sl_rule");
+        if (rule == "c")      model.sl_rule = 0;
+        else if (rule == "b") model.sl_rule = 1;
+        else if (rule == "p") model.sl_rule = 2;
+        else if (rule == "h") model.sl_rule = 3;
+        else if (rule == "e") model.sl_rule = 4;
+        model.sl_threshold   = (float)json_get_num(meta, "sl_threshold",   20.0);
+        model.sl_acc_decay   = (float)json_get_num(meta, "sl_acc_decay",   0.99);
+        model.sl_flip_every_n = (int)json_get_num(meta, "sl_flip_every_n", 5);
+        model.sl_logit_scale = (float)json_get_num(meta, "sl_logit_scale", 0.0625);
+        model.sl_lr_embedding = (float)json_get_num(meta, "sl_lr_embedding", 1e-4);
+        model.sl_wd_embedding = (float)json_get_num(meta, "sl_wd_embedding", 0.1);
+        model.sl_block_size  = (int)json_get_num(meta, "sl_block_size",    128);
+        model.sl_enabled = true;
+        fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d\n",
+                rule.c_str(), model.sl_threshold, model.sl_acc_decay, model.sl_flip_every_n,
+                model.sl_logit_scale, model.sl_lr_embedding, model.sl_wd_embedding, model.sl_block_size);
+    }
     return model;
 }
 
@@ -664,13 +743,52 @@ struct KVCache {
         }
         pos = 0;
     }
+
+    void clear() {
+        for (auto& v : k_cache) std::fill(v.begin(), v.end(), 0.0f);
+        for (auto& v : v_cache) std::fill(v.begin(), v.end(), 0.0f);
+        for (auto& v : latent_cache) std::fill(v.begin(), v.end(), 0.0f);
+        for (auto& v : k_rope_cache) std::fill(v.begin(), v.end(), 0.0f);
+        for (auto& v : k_full_cache) std::fill(v.begin(), v.end(), 0.0f);
+        for (auto& v : v_full_cache) std::fill(v.begin(), v.end(), 0.0f);
+        pos = 0;
+    }
 };
+
+// ──────────────────────────────────────────────────────────────
+// Activation capture (for the self-learning runtime)
+// ──────────────────────────────────────────────────────────────
+
+struct LinearCapture {
+    std::string name;
+    int rows, cols;
+    std::vector<float> x;  // layer input  (cols)
+    std::vector<float> y;  // layer output (rows)
+};
+
+struct Capture {
+    std::vector<LinearCapture> layers;  // current position
+    std::vector<float> h;               // final normed hidden (H)
+};
+
+static void cap_fill(Capture* cap, const std::string& name,
+                     const float* x, int cols, const float* y, int rows) {
+    if (!cap) return;
+    LinearCapture lc;
+    lc.name = name;
+    lc.rows = rows;
+    lc.cols = cols;
+    lc.x.assign(x, x + cols);
+    lc.y.assign(y, y + rows);
+    cap->layers.push_back(std::move(lc));
+}
 
 // Forward pass - supports both decode (single token) and batch prefill (multiple tokens)
 static std::vector<float> forward(
     const Model& model,
     const std::vector<int>& tokens,
-    KVCache& cache
+    KVCache& cache,
+    Capture* cap = nullptr
 ) {
     int H  = model.header.hidden_dim;
     int L  = model.header.num_layers;
@@ -685,6 +803,10 @@ static std::vector<float> forward(
     int pos = cache.pos;
 
     if (decode) {
+        if (cap && model.is_mla) {
+            fprintf(stderr, "Capture not supported for MLA models\n");
+            cap = nullptr;
+        }
         std::vector<float> x(H), q(H), k(H), v(H);
         std::vector<float> attn_scores(model.header.max_seq_len);
         std::vector<float> attn_out(H);
@@ -796,6 +918,9 @@ static std::vector<float> forward(
                 ternary_matmul_auto(normed.data(), model.tw(qn), q.data(), x_scale, decode);
                 ternary_matmul_auto(normed.data(), model.tw(kn), k.data(), x_scale, decode);
                 ternary_matmul_auto(normed.data(), model.tw(vn), v.data(), x_scale, decode);
+                cap_fill(cap, std::string(pfx) + "attn.q_proj", normed.data(), H, q.data(), H);
+                cap_fill(cap, std::string(pfx) + "attn.k_proj", normed.data(), H, k.data(), H);
+                cap_fill(cap, std::string(pfx) + "attn.v_proj", normed.data(), H, v.data(), H);
 
                 for (int i = 0; i < H; i++) {
                     cache.k_cache[l][pos * H + i] = k[i];
@@ -825,6 +950,7 @@ static std::vector<float> forward(
                 std::vector<float> proj_out(H);
                 float o_scale = absmean(attn_out.data(), H);
                 ternary_matmul_auto(attn_out.data(), model.tw(on), proj_out.data(), o_scale, decode);
+                cap_fill(cap, std::string(pfx) + "attn.o_proj", attn_out.data(), H, proj_out.data(), H);
                 for (int i = 0; i < H; i++) x[i] += proj_out[i];
             }
 
@@ -838,15 +964,18 @@ static std::vector<float> forward(
 
             std::vector<float> fused(2 * FFN);
             ternary_matmul_auto(ffn_normed.data(), model.tw(fused_n), fused.data(), ffn_scale, decode);
+            cap_fill(cap, std::string(pfx) + "ffn.gate_up_proj", ffn_normed.data(), H, fused.data(), 2 * FFN);
             for (int i = 0; i < FFN; i++) { gate[i] = fused[i]; up[i] = fused[FFN + i]; }
             for (int i = 0; i < FFN; i++) hidden[i] = silu(gate[i]) * up[i];
 
             float h_scale = absmean(hidden.data(), FFN);
             ternary_matmul_auto(hidden.data(), model.tw(down_n), ffn_out.data(), h_scale, decode);
+            cap_fill(cap, std::string(pfx) + "ffn.down_proj", hidden.data(), FFN, ffn_out.data(), H);
             for (int i = 0; i < H; i++) x[i] += ffn_out[i];
         }
 
         rmsnorm(x.data(), model.fw_ptr("norm.weight"), H);
+        if (cap) cap->h.assign(x.data(), x.data() + H);
         std::vector<float> logits(V);
         {
             const auto& emb = model.fp32_weights.at("token_embedding.weight");
@@ -1162,6 +1291,150 @@ static int sample(const std::vector<float>& logits, float temperature, int top_k
     float cum = 0.0f;
     for (int i = 0; i < n; i++) { cum += scaled[i]; if (r < cum) return i; }
     return n - 1;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Self-learning kernels (v6)
+// ──────────────────────────────────────────────────────────────
+
+// Flip ternary bits where |accumulator| exceeds the threshold, in place.
+// Updates both the packed 2-bit data and the precomputed float rows and
+// resets flipped accumulator entries to zero (mirrors apply_bit_flips in the
+// PyTorch trainer). Returns the number of bits flipped.
+static int apply_bit_flips(TernaryWeightXNOR& w, float threshold) {
+    const int rows = w.rows, cols = w.cols;
+    const int row_bytes = (cols + 3) / 4;
+    int flips = 0;
+    for (int r = 0; r < rows; r++) {
+        float* prow = w.floats.data() + (size_t)r * cols;
+        uint8_t* packed_row = w.packed.data() + (size_t)r * row_bytes;
+        float* acc_row = w.accumulator.data() + (size_t)r * cols;
+        for (int c = 0; c < cols; c++) {
+            float a = acc_row[c];
+            if (a > threshold || a < -threshold) {
+                int dir = (a > threshold) ? 1 : -1;
+                float nv = prow[c] + (float)dir;
+                if (nv > 1.0f) nv = 1.0f;
+                else if (nv < -1.0f) nv = -1.0f;
+                prow[c] = nv;
+                int enc = (nv < -0.5f) ? 0 : ((nv > 0.5f) ? 2 : 1);
+                int byte_idx = c >> 2;
+                int shift = 6 - (c & 3) * 2;
+                packed_row[byte_idx] = (uint8_t)(
+                    (packed_row[byte_idx] & ~(3 << shift)) | (enc << shift));
+                acc_row[c] = 0.0f;
+                flips++;
+            }
+        }
+    }
+    return flips;
+}
+
+// Rule 'c' (predictive coding): feed one block's gradient into the weights.
+//   grad[o][i] += (y_t - y_{t-1})[o] * x_{t-1}[i]   over the block
+//   acc = acc * decay + (-sign(grad))
+static void sl_feed_predictive(TernaryWeightXNOR& w, const std::vector<float>& grad,
+                               float acc_decay) {
+    const size_t n = (size_t)w.rows * w.cols;
+    for (size_t j = 0; j < n; j++) {
+        float g = grad[j];
+        float d = (g > 0.0f) ? -1.0f : ((g < 0.0f) ? 1.0f : 0.0f);
+        w.accumulator[j] = w.accumulator[j] * acc_decay + d;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Atomic write-back (v6)
+// ──────────────────────────────────────────────────────────────
+
+static std::string build_sl_metadata(const Model& m) {
+    const char* rule = "c";
+    if (m.sl_rule == 1) rule = "b";
+    else if (m.sl_rule == 2) rule = "p";
+    else if (m.sl_rule == 3) rule = "h";
+    else if (m.sl_rule == 4) rule = "e";
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "{\"_export_version\":6,\"sl_rule\":\"%s\",\"sl_threshold\":%.4f,"
+        "\"sl_acc_decay\":%.4f,\"sl_flip_every_n\":%d,\"sl_logit_scale\":%.8f,"
+        "\"sl_lr_embedding\":%.8f,\"sl_wd_embedding\":%.4f,\"sl_block_size\":%d}",
+        rule, m.sl_threshold, m.sl_acc_decay, m.sl_flip_every_n, m.sl_logit_scale,
+        m.sl_lr_embedding, m.sl_wd_embedding, m.sl_block_size);
+    return std::string(buf);
+}
+
+// Serialize the (possibly mutated) model back to a v6 binary. Writes to a
+// .tmp sibling then atomically renames over the destination so a crash never
+// leaves a truncated file.
+static void save_model(Model& model, const char* path) {
+    std::string tmp = std::string(path) + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) { fprintf(stderr, "save_model: cannot open %s\n", tmp.c_str()); exit(1); }
+
+    const ModelHeader& H = model.header;
+    uint8_t hdr[64];
+    memset(hdr, 0, 64);
+    memcpy(hdr, "TETR", 4);
+    uint32_t ver = 6;
+    memcpy(hdr + 4, &ver, 4);
+    memcpy(hdr + 8,  &H.vocab_size, 4);
+    memcpy(hdr + 12, &H.hidden_dim, 4);
+    memcpy(hdr + 16, &H.num_layers, 4);
+    memcpy(hdr + 20, &H.num_heads, 4);
+    memcpy(hdr + 24, &H.ffn_dim, 4);
+    memcpy(hdr + 28, &H.max_seq_len, 4);
+    memcpy(hdr + 32, &H.ternary_params, 8);
+    memcpy(hdr + 40, &H.fp32_params, 8);
+    memcpy(hdr + 48, &H.flags, 2);
+    memcpy(hdr + 50, &H.kv_latent_dim, 2);
+    memcpy(hdr + 52, &H.rope_per_head, 2);
+    memcpy(hdr + 54, &H.group_size, 2);
+    fwrite(hdr, 1, 64, f);
+
+    for (auto& kv : model.ternary_weights) {
+        const std::string& name = kv.first;
+        TernaryWeightXNOR& w = kv.second;
+        uint32_t nl = (uint32_t)name.size();
+        uint16_t rows = (uint16_t)w.rows, cols = (uint16_t)w.cols;
+        uint16_t gs = (uint16_t)w.group_size, na = (uint16_t)w.alphas.size();
+        fwrite(&nl, 4, 1, f);
+        fwrite(name.data(), 1, nl, f);
+        fwrite(&rows, 2, 1, f); fwrite(&cols, 2, 1, f);
+        fwrite(&gs, 2, 1, f); fwrite(&na, 2, 1, f);
+        if (na) fwrite(w.alphas.data(), 4, na, f);
+        fwrite(w.packed.data(), 1, w.packed.size(), f);
+        if (!w.accumulator.empty())
+            fwrite(w.accumulator.data(), 4, w.accumulator.size(), f);
+    }
+
+    for (auto& kv : model.fp32_weights) {
+        const std::string& name = kv.first;
+        FP32Weight& w = kv.second;
+        uint32_t nl = (uint32_t)name.size();
+        uint8_t ndim = (uint8_t)w.shape.size();
+        uint8_t dtype = 0;  // write everything back as FP32
+        uint32_t dims[4] = {1, 1, 1, 1};
+        for (size_t i = 0; i < w.shape.size() && i < 4; i++) dims[i] = (uint32_t)w.shape[i];
+        fwrite(&nl, 4, 1, f);
+        fwrite(name.data(), 1, nl, f);
+        fwrite(&ndim, 1, 1, f); fwrite(&dtype, 1, 1, f);
+        fwrite(dims, 4, 4, f);
+        fwrite(w.data.data(), 4, w.data.size(), f);
+    }
+
+    std::string meta = build_sl_metadata(model);
+    fwrite("META", 1, 4, f);
+    uint32_t ml = (uint32_t)meta.size();
+    fwrite(&ml, 4, 1, f);
+    fwrite(meta.data(), 1, ml, f);
+    fclose(f);
+
+#ifdef _WIN32
+    MoveFileExA(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING);
+#else
+    ::remove(path);
+    ::rename(tmp.c_str(), path);
+#endif
 }
 
 }  // namespace tetra

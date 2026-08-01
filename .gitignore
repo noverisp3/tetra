@@ -14,12 +14,15 @@ build/
 data/*.txt
 data/*.bin
 data/*.json
+data/*.rar
 data_local/
 tinydata/
 
 # Checkpoints (large, regenerate)
 checkpoints/
 checkpoints_local/
+checkpoints_discrete_*/
+checkpoints_*/
 
 # Build artifacts
 *.obj

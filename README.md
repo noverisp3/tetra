@@ -208,10 +208,60 @@ Limited due to ultra-compact 3.14M ternary weight capacity (384 KB memory footpr
 > ```
 
 
+## Discrete Learning (Gradient-Free) Research
+
+A research track investigating whether a transformer can learn **without backpropagation**, using only local update rules, and whether that learning can continue **on-device in the C++ runtime**.
+
+### Local rules (Python, `train_discrete.py`)
+
+`DiscreteTrainer` trains a ternary discrete model with packed 2-bit weights and FP32 accumulators. No autograd — gradients are replaced by local, biologically-inspired rules computed from captured activations:
+
+| Rule | Update signal | Val CE | Train CE |
+|------|--------------|--------|----------|
+| **p** (target predictive coding) | `delta ∝ -sign(y_t - ŷ)·x` toward target ŷ | **7.05** | 7.15 |
+| **c** (temporal predictive coding) | `delta ∝ -sign(y_t - y_{t-1})·x` (self-prediction) | **7.16** | 7.31 |
+| **b** (forward-forward) | Hebbian-style on corrupted positives (corrupt 0.2) | **7.70** | 7.78 |
+| Random baseline | — | 9.01 | — |
+
+All three rules beat the random baseline (9.01 = ln(8192)) by a wide margin — the core claim (gradient-free learning works) is validated in PyTorch.
+
+Architecture: 6 layers, hidden 256, 8 heads, FFN 1024, vocab 8192 → 6,291,456 ternary params (2-bit packed), tied embedding.
+
+### Self-learning C++ runtime (`inference/selflearn.cpp`)
+
+The exported model **continues learning in C++** on raw token streams, implementing rule `c`:
+
+- Per-layer local delta `-sign((y_t − y_{t-1})^T x_{t-1})` fed into a **leaky accumulator** (`acc *= 0.99`)
+- **Bit-flip kernel**: weight flips ±1 when `|acc| > threshold` (default 20), applied every 5 blocks
+- Tied embedding updated with local SGD: per-row gradient clip (norm<1 → normalize) + decoupled weight decay (`lr=1e-4`, `wd=0.1`)
+- **Atomic write-back**: `.tmp` file + `MoveFileEx` rename (crash-safe save)
+
+### Binary format v6
+
+v6 = v5 + one **FP32 accumulator** (`rows×cols`) appended to every ternary entry + a trailing `META` section containing a JSON blob with the self-learning config (`sl_rule`, `sl_threshold`, `sl_acc_decay`, `sl_flip_every_n`, `sl_logit_scale`, `sl_lr_embedding`, `sl_wd_embedding`, `sl_block_size`, `_export_version`). Export via `export_model.py ... --self-learning`.
+
+### Validation results
+
+| Check | Result |
+|-------|--------|
+| C++ inference CE vs PyTorch (held-out) | 7.137 vs 7.16 — matches, C++ numerics correct |
+| 60 blocks C++ self-learning on held-out | **7.1373 → 7.1127** (generalizes, not overfitting) |
+| Bit-flips applied | ~20K–2.8M per flip step |
+| Round-trip (save → reload → continue) | Works, CE keeps decreasing |
+| `tetra.exe` generation on learned model | Works |
+| Unit tests (`tests/test_discrete.py`) | 9/9 pass |
+
+**Known limitations / open questions:**
+1. C++ gain is small (~0.025 nats) — statistical significance needs a longer run.
+2. **No ablation yet**: an early bug (ternary name lookup) meant only the embedding update ran and CE still decreased → the flip contribution to learning is not yet quantified separately.
+3. **No backprop baseline** of the same architecture measured yet — CE ~7.1 is far from "good" text and the gap to backprop is unknown.
+4. Flip counts grow over time (up to ~2.8M/step) — needs checking whether this is signal or bit-churn.
+
 ## Project Structure
 
 ```
 train.py                    # Main entry point
+train_discrete.py           # Gradient-free training: local rules (p/c/b), DiscreteTrainer
 
 scripts/
   benchmark_speed.py        # Speed benchmark across presets
@@ -227,6 +277,7 @@ ternary_llm/
   ssm.py                    # Ternary SSM block (parallel-prefix scan)
   hybrid.py                 # Hybrid SSM-Attention transformer model
   transformer.py            # Full model, generate with KV cache, sample (includes StochasticMLABlock/StochasticMLAModel)
+  discrete.py               # DiscreteConfig, DiscreteTrainer, 5 local rules, accumulator bit-flips
   data.py                   # ChunkedDataset, MultiSourceChunkedDataset
   trainer.py                # TernaryTrainer + DMLAdamW
   int8.py                   # INT8 fake-quantization
@@ -236,9 +287,10 @@ ternary_llm/
     setup.py                # PyTorch extension build
 
 inference/
-  tetra.h                   # C++ inference engine (RMSNorm, SiLU, softmax, sampling, forward)
+  tetra.h                   # C++ inference engine (RMSNorm, SiLU, softmax, sampling, forward, v6 loader)
   tetra.cpp                 # CLI entry point, generation loop
-  export_model.py           # Checkpoint → binary format (v4, INT8 embedding)
+  selflearn.cpp             # C++ self-learning runtime (rule c, accumulator bit-flips, --eval mode)
+  export_model.py           # Checkpoint → binary format (v4/v6, INT8 embedding, --self-learning)
   run_inference.py          # Python wrapper around C++ inference
   benchmark_ppl.py          # Perplexity measurement
   build.bat                 # MSVC build script (auto-detects VS via vswhere)
@@ -249,6 +301,7 @@ tests/
   test_transformer.py
   test_prototype.py
   test_convergence.py
+  test_discrete.py          # 9 tests: rules, accumulators, bit-flips, checkpoint round-trip
 ```
 
 ## License
