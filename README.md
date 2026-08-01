@@ -135,7 +135,7 @@ Three alpha modes controlled by `group_size` and `num_alphas`:
 | Per-channel | 0 | rows | `rows × 4B` |
 | Per-group | >0 | rows × ceil(cols/group_size) | `rows × ceil(cols/group_size) × 4B` |
 
-Per-group (`--group-size N`): each output row chia thành blocks N chiều, mỗi block có FP32 alpha riêng. Overhead: với `group_size=64` (tiny 256-dim) thêm ~770 KB.
+Per-group (`--group-size N`): each output row is split into blocks of N dims, each block having its own FP32 alpha. Overhead: with `group_size=64` (tiny 256-dim) adds ~770 KB.
 
 ## Examples
 
