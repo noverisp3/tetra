@@ -22,6 +22,7 @@ tinydata/
 checkpoints/
 checkpoints_local/
 checkpoints_discrete_*/
+checkpoints_bp/
 checkpoints_*/
 
 # Build artifacts

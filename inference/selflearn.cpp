@@ -99,6 +99,19 @@ int main(int argc, char** argv) {
     int log_every  = (argc > 5) ? atoi(argv[5]) : 50;
     int save_every = (argc > 6) ? atoi(argv[6]) : 100;
 
+    // Ablation: pass "--no-ternary" as the FIRST argument to keep only the
+    // embedding local SGD (no ternary deltas, no bit flips).
+    bool no_ternary = false;
+    if (argc > 1 && strcmp(argv[1], "--no-ternary") == 0) {
+        no_ternary = true;
+        model_path = argv[2];
+        data_path  = argv[3];
+        out_path   = argv[4];
+        steps      = (argc > 5) ? atoi(argv[5]) : 200;
+        log_every  = (argc > 6) ? atoi(argv[6]) : 50;
+        save_every = (argc > 7) ? atoi(argv[7]) : 100;
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
     Model model = load_model(model_path);
     if (!model.sl_enabled) {
@@ -140,9 +153,10 @@ int main(int argc, char** argv) {
     std::vector<float> softmax_buf(V);
     auto t1 = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "Init in %.1f ms | block=%d thr=%.1f decay=%.3f flipEvery=%d "
-                    "scale=%.6f lrEmb=%.1e wdEmb=%.2f\n",
+                    "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
-            block, thr, decay, flip_every, scale, lr_emb, wd_emb);
+            block, thr, decay, flip_every, scale, lr_emb, wd_emb,
+            no_ternary ? " | embedding-only" : "");
 
     double ms_total = 0.0;
     for (int step = 0; step < steps; step++) {
@@ -229,10 +243,12 @@ int main(int argc, char** argv) {
 
         // Feed deltas into accumulators (rule 'c'). The capture names carry no
         // ".latent_weights" suffix; the weight map keys do.
-        for (size_t l = 0; l < names.size(); l++) {
-            auto it = model.ternary_weights.find(names[l] + ".latent_weights");
-            if (it == model.ternary_weights.end()) continue;
-            sl_feed_predictive(it->second, grads[l], decay);
+        if (!no_ternary) {
+            for (size_t l = 0; l < names.size(); l++) {
+                auto it = model.ternary_weights.find(names[l] + ".latent_weights");
+                if (it == model.ternary_weights.end()) continue;
+                sl_feed_predictive(it->second, grads[l], decay);
+            }
         }
 
         // Embedding local SGD: per-row clip (norm<1 -> normalize) + decoupled WD.
@@ -253,7 +269,7 @@ int main(int argc, char** argv) {
 
         // Bit flips every N steps.
         long long total_flips = 0;
-        if (flip_every > 0 && (step + 1) % flip_every == 0) {
+        if (!no_ternary && flip_every > 0 && (step + 1) % flip_every == 0) {
             for (auto& kv : model.ternary_weights) {
                 total_flips += apply_bit_flips(kv.second, thr);
             }

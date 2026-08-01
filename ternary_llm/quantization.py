@@ -383,7 +383,7 @@ class StochasticBitFlipLinear(torch.autograd.Function):
             grad_x = torch.mm(grad_y_scaled, w_raw).view(*x.shape[:-1], in_features)
             grad_w = torch.mm(grad_y_scaled.T, x.reshape(-1, in_features))
         else:
-            grad_y_raw = grad_output_flat * scale
+            grad_y_raw = grad_output_flat * ctx.scale
             grad_x = torch.mm(grad_y_raw, w_raw).view(*x.shape[:-1], in_features)
             grad_w = torch.mm(grad_y_raw.T, x.reshape(-1, in_features))
             grad_alpha = None

@@ -246,22 +246,41 @@ v6 = v5 + one **FP32 accumulator** (`rows×cols`) appended to every ternary entr
 |-------|--------|
 | C++ inference CE vs PyTorch (held-out) | 7.137 vs 7.16 — matches, C++ numerics correct |
 | 60 blocks C++ self-learning on held-out | **7.1373 → 7.1127** (generalizes, not overfitting) |
-| Bit-flips applied | ~20K–2.8M per flip step |
+| Bit-flips applied | ~20K–4M per flip step |
 | Round-trip (save → reload → continue) | Works, CE keeps decreasing |
 | `tetra.exe` generation on learned model | Works |
 | Unit tests (`tests/test_discrete.py`) | 9/9 pass |
 
+### Measured results (held-out slice, 20–40K positions)
+
+| Model | Held-out CE | Notes |
+|-------|-------------|-------|
+| Random baseline | 9.0109 | ln(8192) |
+| Discrete rule c, 250 steps (v6 export) | 7.137 | Python val 7.16 |
+| + 60 blocks C++ self-learning | 7.1127 | |
+| + 500 blocks C++ self-learning | **6.9964** | on-device, no backprop |
+| Backprop SBF baseline, 300 steps | **6.9020** | best at step 200, same architecture |
+| Embedding-only ablation (60 blocks) | 7.1209 | ternary flips off |
+
+Findings:
+
+1. **Continued on-device learning works and keeps improving**: held-out CE drops 7.137 → 6.997 across 500 blocks (~1.02M tokens) — no backprop, pure local rule `c` + embedding SGD.
+2. **Backprop is better but the gap is small**: at 60 blocks the local rule is ~0.21 nats behind a real optimizer on the same ternary architecture; after 500 blocks the gap shrinks to **~0.09 nats** (6.996 vs 6.902) at ~3.7× the token budget.
+3. **Ternary flips contribute, embedding dominates**: embedding-only gets 7.121 vs full 7.113 at 60 blocks — flips add ~1/3 of the total improvement.
+4. **Flip counts are high** (0.8–4M per flip step across 6.29M weights) — likely includes bit-churn; threshold/decay tuning is a candidate for further gains.
+
 **Known limitations / open questions:**
-1. C++ gain is small (~0.025 nats) — statistical significance needs a longer run.
-2. **No ablation yet**: an early bug (ternary name lookup) meant only the embedding update ran and CE still decreased → the flip contribution to learning is not yet quantified separately.
-3. **No backprop baseline** of the same architecture measured yet — CE ~7.1 is far from "good" text and the gap to backprop is unknown.
-4. Flip counts grow over time (up to ~2.8M/step) — needs checking whether this is signal or bit-churn.
+1. Gap to backprop is ~0.09 nats at 3.7× the token budget — a longer/tuned backprop run (or a proper AdamW schedule without early overfitting) may widen it.
+2. Backprop baseline showed late-training instability (LR decayed too fast → final CE rose to 8.0); its reported best (step 200) may understate what a tuned run achieves.
+3. **Flip churn is high** (0.8–4M flips per step) — need an analysis of whether flips that get flipped back (churn) dominate, and whether threshold/decay/`flip_every_n` tuning improves sample efficiency.
+4. Still no standard-quality generation (CE ~7 → PPL ~1090) — gradient-free learning is proven effective but far from fluent text; scaling tokens/steps is untested.
 
 ## Project Structure
 
 ```
 train.py                    # Main entry point
 train_discrete.py           # Gradient-free training: local rules (p/c/b), DiscreteTrainer
+train_baseline_backprop.py  # Backprop baseline (same architecture, AdamW, eval on same slice)
 
 scripts/
   benchmark_speed.py        # Speed benchmark across presets
