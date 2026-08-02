@@ -63,7 +63,7 @@ def main():
     parser.add_argument("--val-split", type=float, default=0.05)
     parser.add_argument("--data-cache", type=str, default="tinydata")
     parser.add_argument("--eval-slice", type=str,
-                        default="checkpoints_discrete_c2/sliceEval100k.bin")
+                        default="examples/discrete/sliceEval100k.bin")
     parser.add_argument("--eval-positions", type=int, default=20000)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--min-lr", type=float, default=3e-5)

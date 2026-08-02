@@ -299,9 +299,10 @@ The saturation wall is itself the fixable bottleneck: the **toggle** flip rule (
 Everything below runs on a CPU (Python ~1–2 min/step at 250–500 steps; C++ self-learning ~0.3 s/block).
 
 ```bash
-# 0. Data slices used by every result below (uint16 BPE token ids):
-#      slice100k.bin      = first 100K tokens of the tinydata chunk cache (training stream)
-#      sliceEval100k.bin  = next 100K tokens (held-out; evals read the first 40K positions)
+# 0. Data slices used by every result below (uint16 BPE token ids) — committed in
+#      examples/discrete/ so the research is reproducible without re-downloading data:
+#      slice100k.bin      = training stream (100K tokens)
+#      sliceEval100k.bin  = held-out (next 100K; evals read the first 40K positions)
 
 # 1. Python training runs (findings #8/#9)
 python train_discrete.py --preset base --rule c --steps 250  --data-cache tinydata --seed 0   # base: 7.371 (collapse: −1=98.7%, rank-1, #11)
@@ -309,7 +310,7 @@ python train_discrete.py --preset base --rule c --steps 250  --data-cache tinyda
 python train_discrete.py --preset base --rule c --steps 500  --data-cache tinydata --toggle    # toggle 500: 6.435/6.433 (2 seeds) — beats backprop
 python train_discrete.py --preset base --rule c --steps 250  --data-cache tinydata --init balanced   # control: 8.76–9.24
 python train_discrete.py --preset base --rule c --steps 250  --data-cache tinydata --zero-center 0.1 # control: no gain (tog_zc 7.241/7.396)
-python train_baseline_backprop.py --steps 300 --data-cache tinydata --eval-slice checkpoints_discrete_c2/sliceEval100k.bin   # backprop baseline: 6.902 (best at step 200)
+python train_baseline_backprop.py --steps 300 --data-cache tinydata --eval-slice examples/discrete/sliceEval100k.bin   # backprop baseline: 6.902 (best at step 200)
 
 # 2. Export for on-device learning (v6 binary with accumulators + SL metadata)
 python inference/export_model.py checkpoints_discrete_c3/exp_tog_s0/checkpoint_000250.pt -o checkpoints_discrete_c3/exp_tog_s0_v6.bin \
@@ -319,24 +320,24 @@ python inference/export_model.py checkpoints_discrete_c3/exp_tog_s0/checkpoint_0
 
 # 3. On-device self-learning in C++ (findings #9/#10)
 cd inference && cmd /c build.bat avx2
-.\selflearn_avx2.exe ..\checkpoints_discrete_c3\exp_tog_s0_v6.bin ..\checkpoints_discrete_c2\slice100k.bin ..\checkpoints_discrete_c3\tog500.bin 500 50 100 20 0.99 5 1
+.\selflearn_avx2.exe ..\checkpoints_discrete_c3\exp_tog_s0_v6.bin ..\examples\discrete\slice100k.bin ..\checkpoints_discrete_c3\tog500.bin 500 50 100 20 0.99 5 1
 #   positional args: steps log_every save_every threshold acc_decay flip_every_n toggle(0/1)
 #   flags: --eval <bin> <sliceEval100k.bin> 40000   eval held-out CE/PPL
 #          --flip-only                              freeze embedding (embedding-ablation control)
-.\selflearn_avx2.exe --eval ..\checkpoints_discrete_c3\tog500.bin ..\checkpoints_discrete_c2\sliceEval100k.bin 40000
+.\selflearn_avx2.exe --eval ..\checkpoints_discrete_c3\tog500.bin ..\examples\discrete\sliceEval100k.bin 40000
 
 # 4. Parity check — C++ flip loop vs Python mirror (findings #10/#11)
 cd ..
-.\inference\selflearn_avx2.exe --flip-only checkpoints_discrete_c3\exp_tog_s0_v6.bin checkpoints_discrete_c2\slice100k.bin checkpoints_discrete_c3\parity5.bin 5 100 0 20 0.99 5 1
+.\inference\selflearn_avx2.exe --flip-only checkpoints_discrete_c3\exp_tog_s0_v6.bin examples\discrete\slice100k.bin checkpoints_discrete_c3\parity5.bin 5 100 0 20 0.99 5 1
 python inference/parity_check.py checkpoints_discrete_c3/exp_tog_s0/checkpoint_000250.pt \
        checkpoints_discrete_c3/exp_tog_s0_v6.bin checkpoints_discrete_c3/parity5.bin \
-       checkpoints_discrete_c2\slice100k.bin 5 --toggle
+       examples\discrete\slice100k.bin 5 --toggle
 #   expect "PARITY OK (numerics-limited)": weight mismatch ~0.01% (float-rounding noise in
 #   deep layers, |g| ~ 1e-3–1). Do NOT use the base checkpoint here — it is rank-1 degenerate (#11).
 
 # 5. Cut-the-tail ablation (finding #5/#7): learned vs random ternary, frozen trained embedding
 python eval_ternary_ablation.py --checkpoint checkpoints_discrete_c3/exp_base_s0/checkpoint_000250.pt \
-       --slice checkpoints_discrete_c2/sliceEval100k.bin --ternary-mode learned    # 7.157
+       --slice examples/discrete/sliceEval100k.bin --ternary-mode learned    # 7.157
 python eval_ternary_ablation.py --checkpoint ... --ternary-mode random             # ~8.12 (avg 3 seeds)
 python eval_ternary_ablation.py --checkpoint ... --ternary-mode histmatch          # ~7.86 (2 seeds)
 

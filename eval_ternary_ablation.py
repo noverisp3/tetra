@@ -99,7 +99,7 @@ def main():
     parser.add_argument("--checkpoint", type=str,
                         default="checkpoints_discrete_c2/checkpoint_000250.pt")
     parser.add_argument("--slice", type=str,
-                        default="checkpoints_discrete_c2/sliceEval100k.bin")
+                        default="examples/discrete/sliceEval100k.bin")
     parser.add_argument("--positions", type=int, default=20000)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
