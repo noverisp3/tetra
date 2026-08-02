@@ -991,9 +991,7 @@ static std::vector<float> forward(
         return logits;
     }
 
-    // ============================================================
     // Prefill path (seq_len > 1)
-    // ============================================================
     std::vector<float> x(seq_len * H);
 
     if (model.is_mla) {
