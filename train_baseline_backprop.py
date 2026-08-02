@@ -71,6 +71,9 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--threshold", type=float, default=20.0)
+    parser.add_argument("--no-flips", action="store_true",
+                        help="Freeze ternary weights (skip apply_bit_flips) — "
+                             "ablation: backprop only trains embedding/lm_head")
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--save-dir", type=str, default="checkpoints_bp")
@@ -103,6 +106,7 @@ def main():
     eval_tokens = load_eval_tokens(args.eval_slice, args.eval_positions)
     print(f"Eval slice: {args.eval_slice} ({len(eval_tokens)} tokens, "
           f"{args.eval_positions} positions)")
+    print(f"Mode: ternary flips {'DISABLED (frozen)' if args.no_flips else 'ENABLED'}")
 
     # Held-out (last 5%) reference at init.
     val_tokens = tokens[int(len(tokens) * (1 - args.val_split)):]
@@ -139,7 +143,8 @@ def main():
         opt.step()
         sched.step()
         # SBF: flip ternary bits where the accumulated gradient exceeds threshold.
-        model.apply_bit_flips()
+        if not args.no_flips:
+            model.apply_bit_flips()
         losses.append(loss.item())
 
         if step % 10 == 0 or step == args.steps:
