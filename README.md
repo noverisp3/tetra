@@ -277,7 +277,8 @@ Findings:
 7. **Statistical source of the 1-nat gain (histogram-matched control)**: after 250 steps the learned ternary collapses to **−1=98.1%, 0=0.1%, +1=1.8%** (init was 75/25/0). Shuffling ternary positions while preserving each matrix's exact counts gives CE ~7.86 (2 seeds: 7.76, 7.96) — better than random init (8.12) but still ~0.6–0.8 nats behind learned. Decomposition of the total 0.96-nat gain: **~0.26 nats from the distribution collapse toward −1** (statistical bias) and **~0.70 nats from positional structure** (which specific positions are +1, matched to the embedding). The learned ternary gain is *dominantly structural (~70%)* — genuine positional knowledge, not just histogram statistics.
 8. **Mechanism experiments (250 steps, 2 seeds each, held-out CE @10K)**: the saturation bottleneck from #3/#4 is real and fixable. The **toggle rule** (flip a saturated ±1 weight to its opposite value instead of no-op) breaks the collapse: it keeps −1≈74%/+1≈25% diversity and records **7.036/7.117** — the best short-run numbers, beating base (7.371/7.630), which collapses to −1=98.7% within ~50 steps. A balanced 75/25 init (like the 0.6-histogram) hurts: bal variants score 8.76–9.24 (the +1s are the wrong +1s; structure must be learned, not initialized). Zero-center with l1−l0 penalty reaches 33–44% zeros but with no (tog_zc: 7.241/7.396 vs toggle; zc: 7.504/8.221 vs base) or negative (bal_zc) value: pruning before the positional signal is learned destroys it.
 9. **Toggle rescues the collapse AND beats backprop on held-out CE**: 500-step toggle runs (fresh or continued from a collapsed checkpoint) reach **6.43** held-out slice CE (fresh, 6.435/6.433 2 seeds; continued-from-collapsed: 6.394) vs the 6.902 backprop baseline and 6.996 best non-toggle on-device. The +1/−1 flip kicks at the saturation wall (a −20 accumulator on a −1 weight flips it to +1) act as a noisy local search that re-allocates the sparse +1s — the mechanism-level fix for the "starved" learning in #3.
-10. **On-device (C++) toggle parity and the accumulator-state pitfall**: the C++ `sl_feed_predictive` toggle path is bit-identical to Python (parity test: 0 mismatches over 3 full flip passes). From a zeroed accumulator state it reaches **6.838** (best on-device, beats the 6.996 no-toggle learned500). BUT loading the exported Python accumulator state with toggle is catastrophic (CE 12.13): the state has 98.7% of accs ≤5 but a long tail at 11–16; ~25 consecutive d=−1 blocks push ~6.1M entries over the ±20 threshold at once → the whole matrix inverts (mass +1). Same state + no toggle is safe (7.368) and zeroed-state + toggle is safe — **export zeroed accumulators when running toggled on device** (the Python acc state is transient and unsafe to replay).
+10. **On-device (C++) toggle parity and the accumulator-state pitfall**: the C++ toggle path implements the exact same kernel as Python (`apply_bit_flips`: same packed format, sign logic, threshold/decay). A full-loop parity harness (Python forward + hook capture mirroring the C++ `sl_feed_predictive` loop, `inference/parity_check.py`) measured **484/6,291,456 weight disagreements (0.01%) after a full flip pass on the full-rank toggle checkpoint** — the verdict is **PARITY OK (numerics-limited)**: both engines compute the same local rule, and residual mismatch is float-rounding noise (AVX2+FMA vs torch), amplified in deep layers where |g| ~ 1e-3–1 makes the sign of `-sign(g)` a coin flip (layer-0 |g| ~ 100–3000 agrees bit-exact ~98.6%). The earlier "0 mismatches" claim was made on a structurally degenerate checkpoint where it was a lucky alignment — the rank scan (#11) explains why that checkpoint cannot be parity-tested meaningfully. From a zeroed accumulator state the C++ run reaches **6.838** (best on-device, beats the 6.996 no-toggle learned500). BUT loading the exported Python accumulator state with toggle is catastrophic (CE 12.13): the state has 98.7% of accs ≤5 but a long tail at 11–16; ~25 consecutive d=−1 blocks push ~6.1M entries over the ±20 threshold at once → the whole matrix inverts (mass +1). Same state + no toggle is safe (7.368) and zeroed-state + toggle is safe — **export zeroed accumulators when running toggled on device** (`--sl-reset-acc`; the Python acc state is transient and unsafe to replay).
+11. **The base collapse is structural (rank-1), not just distributional**: a matrix-rank scan (unique rows per matrix) of the 250-step checkpoints shows the base run is *dead* in 5 of 6 layers: layers 1–5 have **all** matrices (q/k/v/o/gate/up/down) with `unique_rows = 1` — every row identical, so each layer is a constant-output map with zero real capacity; layer 0 keeps only q/k/v healthy (256 unique rows) while o_proj and down_proj are rank-1. Activations confirm: o_proj outputs are uniform (−2338.08), gate_up uniform (255.9999), down output −67108860, and layer-1 input is x = (−1.0000, −1.0000, −1.0000) with std 0. The toggle checkpoint is **full-rank everywhere (256 unique rows, all 42 matrices)**. Mechanism: the ±20-wall crossing is decided by the column signal x[i] (shared across rows) while the per-row signal (output deltas, weak in deep layers) gets swamped — so the same columns flip in every row → identical rows → uniform outputs → constant input for the next layer → cascade. The toggle kick re-randomizes row histories at the wall and preserves rank. This reframes #7: the base model's "0.70 nats of positional structure" is carried almost entirely by layer 0 + the head; 5 of 6 layers are rank-1 broadcasters after 250 steps.
 
 ### Hyperparameter sweep (100 blocks, held-out CE @10K positions)
 
@@ -291,7 +292,70 @@ Findings:
 
 Threshold/decay/flip frequency move held-out CE by <0.02 nats — within noise. The bottleneck is not flip frequency but weight saturation, so tuning these parameters cannot unlock more ternary learning.
 
-The saturation wall is itself the fixable bottleneck: the **toggle** flip rule (findings #8–#10) converts the wall into a search step and records the best numbers so far (6.43 held-out Python, 6.838 on-device), while balanced inits and zero-centering both fail (8.76–9.24 and no/negative gain respectively).
+The saturation wall is itself the fixable bottleneck: the **toggle** flip rule (findings #8–#11) converts the wall into a search step and records the best numbers so far (6.43 held-out Python, 6.838 on-device), while balanced inits and zero-centering both fail (8.76–9.24 and no/negative gain respectively).
+
+### Reproducing the toggle research
+
+Everything below runs on a CPU (Python ~1–2 min/step at 250–500 steps; C++ self-learning ~0.3 s/block).
+
+```bash
+# 0. Data slices used by every result below (uint16 BPE token ids):
+#      slice100k.bin      = first 100K tokens of the tinydata chunk cache (training stream)
+#      sliceEval100k.bin  = next 100K tokens (held-out; evals read the first 40K positions)
+
+# 1. Python training runs (findings #8/#9)
+python train_discrete.py --preset base --rule c --steps 250  --data-cache tinydata --seed 0   # base: 7.371 (collapse: −1=98.7%, rank-1, #11)
+python train_discrete.py --preset base --rule c --steps 250  --data-cache tinydata --toggle    # toggle: 7.036 (diversity kept, full rank)
+python train_discrete.py --preset base --rule c --steps 500  --data-cache tinydata --toggle    # toggle 500: 6.435/6.433 (2 seeds) — beats backprop
+python train_discrete.py --preset base --rule c --steps 250  --data-cache tinydata --init balanced   # control: 8.76–9.24
+python train_discrete.py --preset base --rule c --steps 250  --data-cache tinydata --zero-center 0.1 # control: no gain (tog_zc 7.241/7.396)
+python train_baseline_backprop.py --steps 300 --data-cache tinydata --eval-slice checkpoints_discrete_c2/sliceEval100k.bin   # backprop baseline: 6.902 (best at step 200)
+
+# 2. Export for on-device learning (v6 binary with accumulators + SL metadata)
+python inference/export_model.py checkpoints_discrete_c3/exp_tog_s0/checkpoint_000250.pt -o checkpoints_discrete_c3/exp_tog_s0_v6.bin \
+       --self-learning --sl-toggle --sl-reset-acc -q
+#   --sl-reset-acc is REQUIRED for toggled on-device runs: replaying the exported Python
+#   accumulator state with toggle inverts the matrix (finding #10, CE 12.13).
+
+# 3. On-device self-learning in C++ (findings #9/#10)
+cd inference && cmd /c build.bat avx2
+.\selflearn_avx2.exe ..\checkpoints_discrete_c3\exp_tog_s0_v6.bin ..\checkpoints_discrete_c2\slice100k.bin ..\checkpoints_discrete_c3\tog500.bin 500 50 100 20 0.99 5 1
+#   positional args: steps log_every save_every threshold acc_decay flip_every_n toggle(0/1)
+#   flags: --eval <bin> <sliceEval100k.bin> 40000   eval held-out CE/PPL
+#          --flip-only                              freeze embedding (embedding-ablation control)
+.\selflearn_avx2.exe --eval ..\checkpoints_discrete_c3\tog500.bin ..\checkpoints_discrete_c2\sliceEval100k.bin 40000
+
+# 4. Parity check — C++ flip loop vs Python mirror (findings #10/#11)
+cd ..
+.\inference\selflearn_avx2.exe --flip-only checkpoints_discrete_c3\exp_tog_s0_v6.bin checkpoints_discrete_c2\slice100k.bin checkpoints_discrete_c3\parity5.bin 5 100 0 20 0.99 5 1
+python inference/parity_check.py checkpoints_discrete_c3/exp_tog_s0/checkpoint_000250.pt \
+       checkpoints_discrete_c3/exp_tog_s0_v6.bin checkpoints_discrete_c3/parity5.bin \
+       checkpoints_discrete_c2\slice100k.bin 5 --toggle
+#   expect "PARITY OK (numerics-limited)": weight mismatch ~0.01% (float-rounding noise in
+#   deep layers, |g| ~ 1e-3–1). Do NOT use the base checkpoint here — it is rank-1 degenerate (#11).
+
+# 5. Cut-the-tail ablation (finding #5/#7): learned vs random ternary, frozen trained embedding
+python eval_ternary_ablation.py --checkpoint checkpoints_discrete_c3/exp_base_s0/checkpoint_000250.pt \
+       --slice checkpoints_discrete_c2/sliceEval100k.bin --ternary-mode learned    # 7.157
+python eval_ternary_ablation.py --checkpoint ... --ternary-mode random             # ~8.12 (avg 3 seeds)
+python eval_ternary_ablation.py --checkpoint ... --ternary-mode histmatch          # ~7.86 (2 seeds)
+
+# 6. Rank scan (finding #11) — unique rows per ternary matrix, printed per layer
+python -c "
+import torch, numpy as np
+from ternary_llm.quantization import unpack_ternary_tensor
+ck = torch.load('checkpoints_discrete_c3/exp_tog_s0/checkpoint_000250.pt', map_location='cpu', weights_only=False)
+for n, b in ck['model_state_dict'].items():
+    if not n.endswith('.packed_weights'): continue
+    shape = (2048, 256) if 'gate_up' in n else (256, 1024 if 'down_proj' in n else 256)
+    rows = np.unique(unpack_ternary_tensor(b, shape).numpy(), axis=0).shape[0]
+    print(f'{n:42s} unique_rows={rows}')
+"
+#   base checkpoint: layers 1–5 all matrices unique_rows=1, layer-0 o_proj/down_proj = 1
+#   toggle checkpoint: every matrix unique_rows=256 (full rank)
+```
+
+**What this does not cover**: runs past 1000+ toggle steps (mass-kick stability on device, open question #3), and CUDA-scale scaling tests of the toggle rule.
 
 **Known limitations / open questions:**
 1. Gap to backprop is ~0.09 nats at 3.7× the token budget — a longer/tuned backprop run (or a proper AdamW schedule without early overfitting) may widen it.

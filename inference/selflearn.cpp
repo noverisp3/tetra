@@ -121,6 +121,24 @@ int main(int argc, char** argv) {
         every_override = (argc > 10) ? atoi(argv[10]) : 0;
     }
 
+    // Parity mode: full loop + bit flips, but the embedding is frozen. This
+    // makes the run bit-reproducible from the exported file alone — the Python
+    // mirror is inference/parity_check.py (finding #10, toggle parity).
+    bool flip_only = false;
+    if (argc > 1 && strcmp(argv[1], "--flip-only") == 0) {
+        flip_only = true;
+        model_path = argv[2];
+        data_path  = argv[3];
+        out_path   = argv[4];
+        steps      = (argc > 5) ? atoi(argv[5]) : 200;
+        log_every  = (argc > 6) ? atoi(argv[6]) : 50;
+        save_every = (argc > 7) ? atoi(argv[7]) : 100;
+        thr_override  = (argc > 8) ? (float)atof(argv[8]) : 0.0f;
+        decay_override = (argc > 9) ? (float)atof(argv[9]) : 0.0f;
+        every_override = (argc > 10) ? atoi(argv[10]) : 0;
+        toggle_override = (argc > 11) ? atoi(argv[11]) : -1;
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
     Model model = load_model(model_path);
     if (!model.sl_enabled) {
@@ -176,7 +194,7 @@ int main(int argc, char** argv) {
                     "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
             block, thr, decay, flip_every, toggle ? 1 : 0, scale, lr_emb, wd_emb,
-            no_ternary ? " | embedding-only" : "");
+            no_ternary ? " | embedding-only" : (flip_only ? " | flip-only" : ""));
 
     double ms_total = 0.0;
     for (int step = 0; step < steps; step++) {
@@ -272,6 +290,7 @@ int main(int argc, char** argv) {
         }
 
         // Embedding local SGD: per-row clip (norm<1 -> normalize) + decoupled WD.
+        if (!flip_only) {
         for (int v = 0; v < V; v++) {
             float* ge = gradE.data() + (size_t)v * H;
             float norm = 0.0f;
@@ -285,6 +304,7 @@ int main(int argc, char** argv) {
                 er[i] -= upd;
                 er[i] *= (1.0f - lr_emb * wd_emb);
             }
+        }
         }
 
         // Bit flips every N steps.

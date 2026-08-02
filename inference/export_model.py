@@ -405,13 +405,17 @@ def export_self_learning(
     model, output_path,
     rule="c", threshold=20.0, acc_decay=0.99, flip_every_n=5,
     logit_scale=1.0 / 16.0, lr_embedding=1e-4, wd_embedding=0.1,
-    block_size=128, toggle=False, metadata=None, verbose=True,
+    block_size=128, toggle=False, reset_accs=False, metadata=None, verbose=True,
 ):
     """Export a stochastic model to binary format v6 for the C++ self-learning runtime.
 
     v6 = v5 + per-ternary FP32 accumulators (learning state) + ``sl_*`` config
     in the metadata JSON. The token embedding is written as FP32 (mutable) so
     the runtime can keep applying its local SGD.
+
+    ``reset_accs`` zeroes every exported accumulator: the Python accumulator
+    state is transient and unsafe to replay on device (finding #10) — toggled
+    runs must start from zeroed accumulators.
     """
     model.eval()
     from ternary_llm.quantization import unpack_ternary_tensor as _unpack
@@ -437,6 +441,8 @@ def export_self_learning(
         print(f"  Logit scale:   {logit_scale:.6f}")
         print(f"  Emb lr/wd:     {lr_embedding} / {wd_embedding}")
         print(f"  Block size:    {block_size}")
+        print(f"  Toggle:        {toggle}")
+        print(f"  Acc state:     {'zeroed (--sl-reset-acc)' if reset_accs else 'exported from checkpoint'}")
         print(f"  Hidden:        {info['hidden_dim']}")
         print(f"  Layers:        {info['num_layers']}")
         print(f"  Heads:         {info['num_heads']}")
@@ -477,6 +483,8 @@ def export_self_learning(
             layer_idx = name.split(".")[1]
             is_ffn_gate = "gate_proj" in name and f"layers.{layer_idx}.ffn" in name
             acc = acc_buffers.get(prefix + ".accumulator")
+            if reset_accs and acc is not None:
+                acc = torch.zeros_like(acc)
 
             if is_ffn_gate:
                 up_name = name.replace("gate_proj", "up_proj")
@@ -682,6 +690,8 @@ Examples:
     parser.add_argument("--sl-block-size", type=int, default=128)
     parser.add_argument("--sl-toggle", action="store_true",
                         help="Anti-stiction toggle kicks in the C++ self-learning runtime")
+    parser.add_argument("--sl-reset-acc", action="store_true",
+                        help="Write zeroed accumulators (safe default for toggled runs; the Python acc state is transient — finding #10)")
     args = parser.parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -729,6 +739,7 @@ Examples:
             wd_embedding=args.sl_wd_embedding,
             block_size=args.sl_block_size,
             toggle=args.sl_toggle,
+            reset_accs=args.sl_reset_acc,
             metadata=metadata,
             verbose=not args.quiet,
         )
