@@ -27,10 +27,27 @@ import torch.nn.functional as F
 
 from ternary_llm.transformer import StochasticTransformerModel
 from ternary_llm.layers import StochasticTernaryLinear, init_ternary_weight
+from ternary_llm.quantization import unpack_ternary_tensor, pack_ternary_tensor
 
 
 def load_eval_tokens(path: str, n: int) -> np.ndarray:
     return np.fromfile(path, dtype=np.uint16)[:n]
+
+
+def ternary_distribution(model) -> dict:
+    """Count {-1,0,+1} across all ternary weights (global, per matrix)."""
+    counts = {-1: 0, 0: 0, 1: 0}
+    per_matrix = []
+    for m in model.modules():
+        if isinstance(m, StochasticTernaryLinear):
+            w = unpack_ternary_tensor(m.packed_weights, (m.out_features, m.in_features))
+            c = {-1: 0, 0: 0, 1: 0}
+            for v, n in zip(*(torch.unique(w, return_counts=True))):
+                c[int(v)] = int(n)
+            per_matrix.append(c)
+            for v, n in c.items():
+                counts[v] += n
+    return counts, per_matrix
 
 
 @torch.no_grad()
@@ -62,6 +79,21 @@ def randomize_ternary(model, seed: int = 0):
             m._w_raw_cache = None
 
 
+def histmatch_ternary(model, seed: int = 0):
+    """Histogram-matched random: shuffle ternary positions within each matrix,
+    preserving the exact per-matrix {-1,0,+1} counts of the learned weights.
+    """
+    torch.manual_seed(seed)
+    for m in model.modules():
+        if isinstance(m, StochasticTernaryLinear):
+            w = unpack_ternary_tensor(m.packed_weights, (m.out_features, m.in_features))
+            wf = w.flatten()
+            perm = torch.randperm(wf.numel())
+            shuffled = wf[perm].reshape_as(w)
+            m.packed_weights.copy_(pack_ternary_tensor(shuffled))
+            m._w_raw_cache = None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str,
@@ -71,6 +103,11 @@ def main():
     parser.add_argument("--positions", type=int, default=20000)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ternary-mode", type=str, default="histmatch",
+                        choices=["learned", "random", "histmatch"],
+                        help="Ternary weights to evaluate: learned (checkpoint), "
+                             "random (fresh init), histmatch (per-matrix counts preserved, "
+                             "positions shuffled)")
     args = parser.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -91,20 +128,31 @@ def main():
     print(f"Checkpoint step {ckpt.get('step')}: rule={cfg['rule']} "
           f"| scale={scale:.5f} | slice {args.slice} | {len(tokens)} tokens")
 
+    counts, _ = ternary_distribution(model)
+    total = sum(counts.values())
+    print(f"Learned ternary distribution: "
+          f"-1={counts[-1]/total*100:.1f}% 0={counts[0]/total*100:.1f}% "
+          f"+1={counts[1]/total*100:.1f}% (sparsity={counts[0]/total*100:.1f}%)")
+
     ce_learned = eval_ce(model, tokens, args.block_size, args.positions, scale)
 
-    model_random = copy.deepcopy(model)
-    randomize_ternary(model_random, seed=args.seed)
-    ce_random = eval_ce(model_random, tokens, args.block_size, args.positions, scale)
+    if args.ternary_mode == "learned":
+        model_target = copy.deepcopy(model)
+        mode_name = "LEARNED"
+    elif args.ternary_mode == "random":
+        model_target = copy.deepcopy(model)
+        randomize_ternary(model_target, seed=args.seed)
+        mode_name = "RANDOM"
+    else:
+        model_target = copy.deepcopy(model)
+        histmatch_ternary(model_target, seed=args.seed)
+        mode_name = "HISTMATCH-RANDOM"
+    ce_target = eval_ce(model_target, tokens, args.block_size, args.positions, scale)
 
-    delta = ce_random - ce_learned
-    print(f"\nTernary LEARNED : CE {ce_learned:.4f}")
-    print(f"Ternary RANDOM  : CE {ce_random:.4f}")
-    print(f"Delta (random - learned): {delta:+.4f} nats "
-          f"({'RANDOM BETTER' if delta < 0 else 'LEARNED BETTER'})")
-    verdict = ("ternary is decorative (no structural benefit)" if abs(delta) < 0.05
-               else "ternary carries learned structure")
-    print(f"Interpretation: {verdict}")
+    delta = ce_target - ce_learned
+    print(f"\nTernary {mode_name} : CE {ce_target:.4f}")
+    print(f"Ternary LEARNED : CE {ce_learned:.4f}")
+    print(f"Delta ({mode_name.lower()} - learned): {delta:+.4f} nats")
 
 
 if __name__ == "__main__":

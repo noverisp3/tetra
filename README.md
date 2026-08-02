@@ -264,6 +264,7 @@ v6 = v5 + one **FP32 accumulator** (`rows×cols`) appended to every ternary entr
 | Embedding-only ablation (60 blocks) | 7.1209 | ternary flips off |
 | **Cut-the-tail**: learned ternary + frozen trained embedding | **7.157** | rule-c checkpoint 250 |
 | **Cut-the-tail**: random ternary + same frozen embedding | **8.120** | avg of 3 seeds |
+| **Cut-the-tail**: histmatch-random ternary + same frozen embedding | **~7.86** | per-matrix counts preserved, positions shuffled (2 seeds) |
 
 Findings:
 
@@ -273,6 +274,7 @@ Findings:
 4. **No bit churn — flips are mostly saturation no-ops** (diagnostic, 200 blocks): 94–100% of counted flips do not change the weight (already saturated at ±1); only ~0.18% of the 6.29M weights ever change value, and weights flipped ≥4 times are 0.00%. The huge per-step "flip counts" reported earlier were a measurement artifact of counting no-op saturation flips.
 5. **Cut-the-tail ablation: the learned ternary weights carry real structure, worth ~1 nat.** With a *frozen trained embedding*, swapping the rule-c ternary (250 steps) for a random one (same init distribution) degrades held-out CE by **+0.96 nats** (7.157 vs 8.120, consistent over 3 seeds). The ternary core is *not* decoration.
 6. **How to reconcile with the frozen-ternary backprop result**: backprop trains the embedding/lm_head *from scratch*, so it adapts the FP32 readout to whatever ternary projection it gets — it compensates for random ternary (6.889) and never needs the ternary to learn. But the co-adapted (embedding, ternary) pair from local rules is worth ~1 nat over (embedding, random ternary). So: the FP32 parts dominate the raw CE number, yet the ternary projection is a genuine learned substrate.
+7. **Statistical source of the 1-nat gain (histogram-matched control)**: after 250 steps the learned ternary collapses to **−1=98.1%, 0=0.1%, +1=1.8%** (init was 75/25/0). Shuffling ternary positions while preserving each matrix's exact counts gives CE ~7.86 (2 seeds: 7.76, 7.96) — better than random init (8.12) but still ~0.6–0.8 nats behind learned. Decomposition of the total 0.96-nat gain: **~0.26 nats from the distribution collapse toward −1** (statistical bias) and **~0.70 nats from positional structure** (which specific positions are +1, matched to the embedding). The learned ternary gain is *dominantly structural (~70%)* — genuine positional knowledge, not just histogram statistics.
 
 ### Hyperparameter sweep (100 blocks, held-out CE @10K positions)
 
