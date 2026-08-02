@@ -262,6 +262,8 @@ v6 = v5 + one **FP32 accumulator** (`rows×cols`) appended to every ternary entr
 | Backprop SBF baseline, 300 steps | **6.9020** | best at step 200, same architecture |
 | Backprop SBF, **ternary frozen** | **6.8891** | same run, `--no-flips` — only embedding/lm_head trained |
 | Embedding-only ablation (60 blocks) | 7.1209 | ternary flips off |
+| **Cut-the-tail**: learned ternary + frozen trained embedding | **7.157** | rule-c checkpoint 250 |
+| **Cut-the-tail**: random ternary + same frozen embedding | **8.120** | avg of 3 seeds |
 
 Findings:
 
@@ -269,7 +271,8 @@ Findings:
 2. **Backprop is better but the gap is small**: at 60 blocks the local rule is ~0.21 nats behind a real optimizer on the same ternary architecture; after 500 blocks the gap shrinks to **~0.09 nats** (6.996 vs 6.902) at ~3.7× the token budget.
 3. **Ternary flips contribute, embedding dominates**: embedding-only gets 7.121 vs full 7.113 at 60 blocks — flips add ~1/3 of the total improvement.
 4. **No bit churn — flips are mostly saturation no-ops** (diagnostic, 200 blocks): 94–100% of counted flips do not change the weight (already saturated at ±1); only ~0.18% of the 6.29M weights ever change value, and weights flipped ≥4 times are 0.00%. The huge per-step "flip counts" reported earlier were a measurement artifact of counting no-op saturation flips.
-5. **Decisive ablation: the ternary weights contribute essentially nothing.** Backprop SBF with ternary frozen (`--no-flips`, random ternary init, only embedding+lm_head trained) reaches **6.889**, slightly *better* than the full backprop run (6.902). Combined with #3 (local-rule flips add only ~0.008 nats), this shows the model's predictive capability lives almost entirely in the FP32 embedding + lm_head over a fixed (effectively random) ternary feature projection — the ternary weights carry little learned information in either training regime.
+5. **Cut-the-tail ablation: the learned ternary weights carry real structure, worth ~1 nat.** With a *frozen trained embedding*, swapping the rule-c ternary (250 steps) for a random one (same init distribution) degrades held-out CE by **+0.96 nats** (7.157 vs 8.120, consistent over 3 seeds). The ternary core is *not* decoration.
+6. **How to reconcile with the frozen-ternary backprop result**: backprop trains the embedding/lm_head *from scratch*, so it adapts the FP32 readout to whatever ternary projection it gets — it compensates for random ternary (6.889) and never needs the ternary to learn. But the co-adapted (embedding, ternary) pair from local rules is worth ~1 nat over (embedding, random ternary). So: the FP32 parts dominate the raw CE number, yet the ternary projection is a genuine learned substrate.
 
 ### Hyperparameter sweep (100 blocks, held-out CE @10K positions)
 
@@ -287,7 +290,7 @@ Threshold/decay/flip frequency move held-out CE by <0.02 nats — within noise. 
 1. Gap to backprop is ~0.09 nats at 3.7× the token budget — a longer/tuned backprop run (or a proper AdamW schedule without early overfitting) may widen it.
 2. Backprop baseline showed late-training instability (LR decayed too fast → final CE rose to 8.0); its reported best (step 200) may understate what a tuned run achieves.
 3. **Ternary learning is starved by saturation**: 94–100% of flips are no-ops on ±1-saturated weights; only ~0.18% of weights change over 200 blocks. To make bit-flips drive real learning the mechanism must change (e.g., allow moving past saturation, toggle-based flips, or a less-saturated init) — hyperparameter tuning alone does not help.
-4. **The research claim needs reframing**: since frozen-ternary backprop ≈ full backprop (6.889 vs 6.902), the ternary weights are not currently demonstrated to be a useful learning substrate — a random fixed ternary projection + a trained FP32 readout already achieves the same CE. The honest claims to keep are (a) local-rule SGD can train the embedding without backprop, and (b) continued on-device learning improves held-out CE. Demonstrating *ternary weight learning that matters* (e.g., comparing random vs learned ternary init at fixed embedding) is the open core question.
+4. **The ternary substrate learns, but its on-device headroom is small**: cut-the-tail shows the ternary learned during Python training is worth ~1 nat over random, but continued C++ flips add only ~0.008 nats (only 0.18% of weights move). The open question is whether a better on-device mechanism (less-saturated init, toggle flips, or a mechanism that moves the co-adapted embedding+ternary pair) can reproduce more of that 1-nat gain at runtime.
 5. Still no standard-quality generation (CE ~7 → PPL ~1090) — gradient-free learning is proven effective but far from fluent text; scaling tokens/steps is untested.
 
 ## Project Structure
@@ -296,6 +299,7 @@ Threshold/decay/flip frequency move held-out CE by <0.02 nats — within noise. 
 train.py                    # Main entry point
 train_discrete.py           # Gradient-free training: local rules (p/c/b), DiscreteTrainer
 train_baseline_backprop.py  # Backprop baseline (same architecture, AdamW, eval on same slice)
+eval_ternary_ablation.py    # Cut-the-tail: learned vs random ternary with frozen embedding
 
 scripts/
   benchmark_speed.py        # Speed benchmark across presets
