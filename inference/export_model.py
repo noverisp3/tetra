@@ -405,7 +405,7 @@ def export_self_learning(
     model, output_path,
     rule="c", threshold=20.0, acc_decay=0.99, flip_every_n=5,
     logit_scale=1.0 / 16.0, lr_embedding=1e-4, wd_embedding=0.1,
-    block_size=128, metadata=None, verbose=True,
+    block_size=128, toggle=False, metadata=None, verbose=True,
 ):
     """Export a stochastic model to binary format v6 for the C++ self-learning runtime.
 
@@ -522,6 +522,7 @@ def export_self_learning(
             "sl_threshold": float(threshold),
             "sl_acc_decay": float(acc_decay),
             "sl_flip_every_n": int(flip_every_n),
+            "sl_toggle": int(toggle),
             "sl_logit_scale": float(logit_scale),
             "sl_lr_embedding": float(lr_embedding),
             "sl_wd_embedding": float(wd_embedding),
@@ -679,6 +680,8 @@ Examples:
     parser.add_argument("--sl-lr-embedding", type=float, default=1e-4)
     parser.add_argument("--sl-wd-embedding", type=float, default=0.1)
     parser.add_argument("--sl-block-size", type=int, default=128)
+    parser.add_argument("--sl-toggle", action="store_true",
+                        help="Anti-stiction toggle kicks in the C++ self-learning runtime")
     args = parser.parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -725,6 +728,7 @@ Examples:
             lr_embedding=args.sl_lr_embedding,
             wd_embedding=args.sl_wd_embedding,
             block_size=args.sl_block_size,
+            toggle=args.sl_toggle,
             metadata=metadata,
             verbose=not args.quiet,
         )

@@ -88,10 +88,10 @@ int main(int argc, char** argv) {
 
     if (argc < 4) {
         fprintf(stderr,
-            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every]\n",
+            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every] [toggle]\n",
             argv[0]);
         fprintf(stderr,
-            "  thr/decay/flip_every override the v6 metadata (0 = keep metadata value)\n");
+            "  thr/decay/flip_every/toggle override the v6 metadata (0 = keep metadata value; -1 for toggle = keep metadata)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -103,6 +103,7 @@ int main(int argc, char** argv) {
     float thr_override  = (argc > 7) ? (float)atof(argv[7]) : 0.0f;
     float decay_override = (argc > 8) ? (float)atof(argv[8]) : 0.0f;
     int   every_override = (argc > 9) ? atoi(argv[9]) : 0;
+    int   toggle_override = (argc > 10) ? atoi(argv[10]) : -1;
 
     // Ablation: pass "--no-ternary" as the FIRST argument to keep only the
     // embedding local SGD (no ternary deltas, no bit flips).
@@ -146,6 +147,7 @@ int main(int argc, char** argv) {
     const float thr = thr_override > 0.0f ? thr_override : model.sl_threshold;
     const float decay = decay_override > 0.0f ? decay_override : model.sl_acc_decay;
     const int flip_every = every_override > 0 ? every_override : model.sl_flip_every_n;
+    const bool toggle = toggle_override >= 0 ? (toggle_override != 0) : (model.sl_toggle != 0);
     const float scale = model.sl_logit_scale;
     const float lr_emb = model.sl_lr_embedding;
     const float wd_emb = model.sl_wd_embedding;
@@ -170,10 +172,10 @@ int main(int argc, char** argv) {
 
     std::vector<float> softmax_buf(V);
     auto t1 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "Init in %.1f ms | block=%d thr=%.1f decay=%.3f flipEvery=%d "
+    fprintf(stderr, "Init in %.1f ms | block=%d thr=%.1f decay=%.3f flipEvery=%d toggle=%d "
                     "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
-            block, thr, decay, flip_every, scale, lr_emb, wd_emb,
+            block, thr, decay, flip_every, toggle ? 1 : 0, scale, lr_emb, wd_emb,
             no_ternary ? " | embedding-only" : "");
 
     double ms_total = 0.0;
@@ -289,13 +291,27 @@ int main(int argc, char** argv) {
         long long total_flips = 0;
         long long real_changes = 0;
         if (!no_ternary && flip_every > 0 && (step + 1) % flip_every == 0) {
+            long long acc_over20 = 0, acc_over15 = 0;
+            double acc_max = 0;
+            for (size_t wi = 0; wi < wlist.size(); wi++) {
+                TernaryWeightXNOR& w = *wlist[wi];
+                for (size_t i = 0; i < w.accumulator.size(); i++) {
+                    float a = w.accumulator[i];
+                    double aa = fabs((double)a);
+                    if (aa > acc_max) acc_max = aa;
+                    if (aa > 20.0) acc_over20++;
+                    else if (aa > 15.0) acc_over15++;
+                }
+            }
+            fprintf(stderr, "  [acc stats] max=%.4f >20=%lld in(15,20]=%lld\n",
+                    acc_max, acc_over20, acc_over15);
             for (size_t wi = 0; wi < wlist.size(); wi++) {
                 TernaryWeightXNOR& w = *wlist[wi];
                 auto& hist = hists[wi];
                 const size_t n = w.floats.size();
                 std::vector<float> before(n);
                 memcpy(before.data(), w.floats.data(), n * sizeof(float));
-                total_flips += apply_bit_flips(w, thr);
+                total_flips += apply_bit_flips(w, thr, toggle);
                 const float* f = w.floats.data();
                 for (size_t i = 0; i < n; i++)
                     if (f[i] != before[i]) { hist[i]++; real_changes++; }

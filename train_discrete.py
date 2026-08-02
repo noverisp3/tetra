@@ -55,6 +55,13 @@ def main():
     parser.add_argument("--flip-every-n", type=int, default=5)
     parser.add_argument("--acc-decay", type=float, default=0.99,
                         help="Leaky accumulator decay per step (0.99 recommended)")
+    parser.add_argument("--init", type=str, default="default",
+                        choices=["default", "balanced"],
+                        help="Ternary init: default (75%/-1) or balanced (33/33/33)")
+    parser.add_argument("--toggle", action="store_true",
+                        help="Anti-stiction: kick saturated weights to opposite extreme")
+    parser.add_argument("--zero-center", type=float, default=0.0, metavar="FRAC",
+                        help="Release +/-1 weights with |acc| < FRAC*threshold back to 0")
     parser.add_argument("--no-train-embedding", action="store_true",
                         help="Freeze the FP32 embedding (not recommended)")
     parser.add_argument("--lr-embedding", type=float, default=1e-4)
@@ -72,6 +79,12 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    # Seed BEFORE loaders/model so data order + embedding/ternary init are
+    # reproducible across runs (trainer re-seeds internally, but the model is
+    # built at construction, after the samplers are created otherwise).
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
     config = DiscreteConfig(
         rule=args.rule,
         block_size=args.block_size,
@@ -83,6 +96,9 @@ def main():
         threshold_decay_to=args.threshold_decay_to,
         flip_every_n_steps=args.flip_every_n,
         acc_decay=args.acc_decay,
+        toggle=args.toggle,
+        zero_center=args.zero_center,
+        init_mode=args.init,
         train_embedding=not args.no_train_embedding,
         lr_embedding=args.lr_embedding,
         wd_embedding=args.wd_embedding,
@@ -125,7 +141,8 @@ def main():
 
     print(f"Rule: {config.rule} | Threshold: {config.threshold} "
           f"-> {config.threshold_decay_to} | flip every {config.flip_every_n_steps} "
-          f"| acc decay {config.acc_decay}")
+          f"| acc decay {config.acc_decay} | init {config.init_mode} "
+          f"| toggle {config.toggle} | zero-center {config.zero_center}")
     print(f"Model: hidden={config.hidden_dim} layers={config.num_layers} "
           f"heads={config.num_heads} ffn={config.ffn_dim}")
 
@@ -142,6 +159,8 @@ def main():
         print("\nInterrupted, saving...")
 
     trainer.save_checkpoint(trainer.step)
+    print("Ternary distribution after training:")
+    trainer.report_distribution()
     if trainer.val_losses:
         print(f"Final val CE: {trainer.val_losses[-1]:.4f}")
     if trainer.train_losses:

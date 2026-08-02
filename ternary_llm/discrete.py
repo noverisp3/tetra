@@ -193,6 +193,13 @@ class DiscreteConfig:
     flip_every_n_steps: int = 5
     acc_decay: float = 0.99  # leaky accumulator: acc *= acc_decay each step
 
+    # Anti-collapse controls
+    toggle: bool = False       # kick saturated weights to opposite extreme
+    zero_center: float = 0.0   # per-pass sparsification: release up to this
+                               # fraction of each layer's saturated weights
+                               # (weakest |acc| first) back to 0
+    init_mode: str = "default" # "default" (75%/-1) or "balanced" (33/33/33)
+
     # Embedding (FP32, trained with plain local SGD since it is not ternary)
     train_embedding: bool = True
     lr_embedding: float = 1e-4
@@ -221,7 +228,7 @@ class DiscreteConfig:
 
 def build_model_from_config(config: DiscreteConfig) -> StochasticTransformerModel:
     """Build a fresh stochastic bit-flip model from a DiscreteConfig."""
-    return StochasticTransformerModel(
+    model = StochasticTransformerModel(
         vocab_size=config.vocab_size,
         hidden_dim=config.hidden_dim,
         num_layers=config.num_layers,
@@ -230,6 +237,15 @@ def build_model_from_config(config: DiscreteConfig) -> StochasticTransformerMode
         max_seq_len=config.max_seq_len,
         threshold=config.threshold,
     )
+    if config.init_mode == "balanced":
+        from .quantization import init_ternary_weight
+        for m in model.modules():
+            if isinstance(m, StochasticTernaryLinear):
+                packed = init_ternary_weight(
+                    m.out_features, m.in_features, balanced=True)
+                m.packed_weights.copy_(packed)
+                m._w_raw_cache = None
+    return model
 
 
 def random_token_array(n_tokens: int, vocab_size: int, seed: int = 0) -> np.ndarray:
@@ -548,7 +564,55 @@ class DiscreteTrainer:
             t = (self.config.threshold_decay_to
                  + (self.config.threshold - self.config.threshold_decay_to) * cosine)
             self.model.set_thresholds(t)
-        self.model.apply_bit_flips()
+        self._flip_pass()
+
+    @torch.no_grad()
+    def _flip_pass(self):
+        """Per-layer bit flips with optional toggle / zero-centering."""
+        from .quantization import apply_bit_flips, pack_ternary_tensor
+        cfg = self.config
+        for m in self._linear_map.values():
+            apply_bit_flips(
+                m.packed_weights, m.accumulator, m.threshold, m.scale,
+                (m.out_features, m.in_features), toggle=cfg.toggle)
+            m._w_raw_cache = None
+            if cfg.zero_center > 0:
+                w = m.get_ternary_weights().float()
+                sat = w.abs() > 0.5
+                if sat.any():
+                    n_release = max(1, int(cfg.zero_center * w.numel()))
+                    if sat.sum() > n_release:
+                        # Exact budget via argsort (topk by value explodes on
+                        # ties at |acc|==0).
+                        sat_pos = torch.nonzero(sat, as_tuple=False)
+                        acc_sat = m.accumulator.abs()[sat]
+                        order = torch.argsort(acc_sat, stable=True)[:n_release]
+                        release = torch.zeros_like(sat)
+                        release[sat_pos[order, 0], sat_pos[order, 1]] = True
+                    else:
+                        release = sat
+                    if release.any():
+                        w = w.clone()
+                        w[release] = 0.0
+                        m.packed_weights.copy_(
+                            pack_ternary_tensor(w).to(m.packed_weights.device))
+                        m._w_raw_cache = None
+
+    def report_distribution(self) -> None:
+        """Print per-layer and global ternary value distribution."""
+        tot = {0: 0, 1: 0, 2: 0}
+        for name, m in self._linear_map.items():
+            w = m.get_ternary_weights()
+            cnt = {v: int((w == v).sum()) for v in (-1.0, 0.0, 1.0)}
+            n = w.numel()
+            tot[-1] = tot.get(-1, 0) + cnt[-1.0]
+            tot[0] = tot.get(0, 0) + cnt[0.0]
+            tot[1] = tot.get(1, 0) + cnt[1.0]
+            print(f"  {name:<40s} -1={cnt[-1.0]/n*100:6.2f}% "
+                  f"0={cnt[0.0]/n*100:6.2f}% +1={cnt[1.0]/n*100:6.2f}%")
+        n = sum(tot.values())
+        print(f"  GLOBAL  -1={tot[-1]/n*100:6.2f}% "
+              f"0={tot[0]/n*100:6.2f}% +1={tot[1]/n*100:6.2f}%")
 
     def train(self, resume_step: int = 0):
         self.step = resume_step

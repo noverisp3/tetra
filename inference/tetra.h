@@ -471,6 +471,7 @@ struct Model {
     float sl_lr_embedding = 1e-4f;
     float sl_wd_embedding = 0.1f;
     int sl_block_size = 128;
+    int sl_toggle = 0;            // anti-stiction toggle kicks
     bool sl_enabled = false;      // true when a v6 self-learning model was loaded
 };
 
@@ -710,10 +711,11 @@ static Model load_model(const char* path) {
         model.sl_lr_embedding = (float)json_get_num(meta, "sl_lr_embedding", 1e-4);
         model.sl_wd_embedding = (float)json_get_num(meta, "sl_wd_embedding", 0.1);
         model.sl_block_size  = (int)json_get_num(meta, "sl_block_size",    128);
+        model.sl_toggle      = (int)json_get_num(meta, "sl_toggle",        0);
         model.sl_enabled = true;
-        fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d\n",
+        fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d toggle=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d\n",
                 rule.c_str(), model.sl_threshold, model.sl_acc_decay, model.sl_flip_every_n,
-                model.sl_logit_scale, model.sl_lr_embedding, model.sl_wd_embedding, model.sl_block_size);
+                model.sl_toggle, model.sl_logit_scale, model.sl_lr_embedding, model.sl_wd_embedding, model.sl_block_size);
     }
     return model;
 }
@@ -1301,7 +1303,10 @@ static int sample(const std::vector<float>& logits, float temperature, int top_k
 // Updates both the packed 2-bit data and the precomputed float rows and
 // resets flipped accumulator entries to zero (mirrors apply_bit_flips in the
 // PyTorch trainer). Returns the number of bits flipped.
-static int apply_bit_flips(TernaryWeightXNOR& w, float threshold) {
+// toggle=true: anti-stiction mode — a weight already saturated in the push
+// direction (+1 pushed up / -1 pushed down) is kicked to the opposite
+// extreme instead of staying a no-op.
+static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = false) {
     const int rows = w.rows, cols = w.cols;
     const int row_bytes = (cols + 3) / 4;
     int flips = 0;
@@ -1313,9 +1318,14 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold) {
             float a = acc_row[c];
             if (a > threshold || a < -threshold) {
                 int dir = (a > threshold) ? 1 : -1;
-                float nv = prow[c] + (float)dir;
-                if (nv > 1.0f) nv = 1.0f;
-                else if (nv < -1.0f) nv = -1.0f;
+                float nv;
+                if (toggle && ((prow[c] > 0.5f && dir > 0) || (prow[c] < -0.5f && dir < 0))) {
+                    nv = -prow[c];  // kick to opposite extreme
+                } else {
+                    nv = prow[c] + (float)dir;
+                    if (nv > 1.0f) nv = 1.0f;
+                    else if (nv < -1.0f) nv = -1.0f;
+                }
                 prow[c] = nv;
                 int enc = (nv < -0.5f) ? 0 : ((nv > 0.5f) ? 2 : 1);
                 int byte_idx = c >> 2;
@@ -1356,9 +1366,11 @@ static std::string build_sl_metadata(const Model& m) {
     char buf[512];
     snprintf(buf, sizeof(buf),
         "{\"_export_version\":6,\"sl_rule\":\"%s\",\"sl_threshold\":%.4f,"
-        "\"sl_acc_decay\":%.4f,\"sl_flip_every_n\":%d,\"sl_logit_scale\":%.8f,"
+        "\"sl_acc_decay\":%.4f,\"sl_flip_every_n\":%d,\"sl_toggle\":%d,"
+        "\"sl_logit_scale\":%.8f,"
         "\"sl_lr_embedding\":%.8f,\"sl_wd_embedding\":%.4f,\"sl_block_size\":%d}",
-        rule, m.sl_threshold, m.sl_acc_decay, m.sl_flip_every_n, m.sl_logit_scale,
+        rule, m.sl_threshold, m.sl_acc_decay, m.sl_flip_every_n, m.sl_toggle,
+        m.sl_logit_scale,
         m.sl_lr_embedding, m.sl_wd_embedding, m.sl_block_size);
     return std::string(buf);
 }

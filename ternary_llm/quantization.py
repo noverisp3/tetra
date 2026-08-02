@@ -266,21 +266,31 @@ def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple) -> torch.Tensor:
     return flat.float().reshape(shape)
 
 
-def init_ternary_weight(out_features: int, in_features: int, sparsity: float = 0.5) -> torch.Tensor:
+def init_ternary_weight(out_features: int, in_features: int, sparsity: float = 0.5,
+                        balanced: bool = False) -> torch.Tensor:
     """Initialize packed ternary weights with given sparsity.
 
     sparsity=0.5 -> 50% zeros, 25% +1, 25% -1 (kaiming-like).
+    balanced=True -> equal 1/3 each of {-1, 0, +1} (33/33/33).
     Returns flat uint8 packed tensor.
     """
     n = out_features * in_features
-    nz = int(n * (1 - sparsity))  # non-zero count
     w = torch.zeros(n, dtype=torch.uint8)
-    if nz > 0:
-        pos = nz // 2
-        neg = nz - pos
+    if balanced:
+        each = n // 3
+        w = torch.full((n,), 1, dtype=torch.uint8)  # 1 = value 0
         idx = torch.randperm(n)
-        w[idx[:pos]] = 2   # +1
-        w[idx[pos:pos + neg]] = 0  # -1 (encoded as 0, i.e. value -1+1=0)
+        w[idx[:each]] = 2  # +1
+        w[idx[each:2 * each]] = 0  # -1
+        # remaining third stays 1 (= 0)
+    else:
+        nz = int(n * (1 - sparsity))  # non-zero count
+        if nz > 0:
+            pos = nz // 2
+            neg = nz - pos
+            idx = torch.randperm(n)
+            w[idx[:pos]] = 2   # +1
+            w[idx[pos:pos + neg]] = 0  # -1 (encoded as 0, i.e. value -1+1=0)
     # Pad and pack
     padded = (n + 3) // 4 * 4
     if padded != n:
@@ -484,6 +494,7 @@ def apply_bit_flips(
     threshold: float,
     scale: float,
     shape_w: tuple,
+    toggle: bool = False,
 ) -> None:
     """Check accumulators and flip bits where threshold exceeded.
 
@@ -496,6 +507,9 @@ def apply_bit_flips(
         threshold: flip threshold (accumulator values beyond ±threshold trigger flip)
         scale: weight scale factor (unused, kept for compatibility)
         shape_w: shape of the unpacked weight matrix (out_features, in_features)
+        toggle: anti-stiction mode — a weight already saturated in the push
+            direction (+1 pushed up / -1 pushed down) is kicked to the
+            opposite extreme instead of staying a no-op.
     """
     flip_up = accumulator > threshold
     flip_down = accumulator < -threshold
@@ -503,5 +517,12 @@ def apply_bit_flips(
         w_raw = unpack_ternary_tensor(packed_weights, shape_w)
         flip_dir = torch.where(flip_up, 1.0, 0.0) + torch.where(flip_down, -1.0, 0.0)
         w_new = (w_raw + flip_dir).clamp(-1, 1)
+        if toggle:
+            sat_up = (w_raw > 0.5) & flip_up
+            sat_down = (w_raw < -0.5) & flip_down
+            if sat_up.any() or sat_down.any():
+                w_new = torch.where(
+                    sat_up, torch.full_like(w_new, -1.0),
+                    torch.where(sat_down, torch.full_like(w_new, 1.0), w_new))
         packed_weights.copy_(pack_ternary_tensor(w_new).to(packed_weights.device))
         accumulator[flip_up | flip_down] = 0.0
