@@ -88,8 +88,10 @@ int main(int argc, char** argv) {
 
     if (argc < 4) {
         fprintf(stderr,
-            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every]\n",
+            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every]\n",
             argv[0]);
+        fprintf(stderr,
+            "  thr/decay/flip_every override the v6 metadata (0 = keep metadata value)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -98,6 +100,9 @@ int main(int argc, char** argv) {
     int steps      = (argc > 4) ? atoi(argv[4]) : 200;
     int log_every  = (argc > 5) ? atoi(argv[5]) : 50;
     int save_every = (argc > 6) ? atoi(argv[6]) : 100;
+    float thr_override  = (argc > 7) ? (float)atof(argv[7]) : 0.0f;
+    float decay_override = (argc > 8) ? (float)atof(argv[8]) : 0.0f;
+    int   every_override = (argc > 9) ? atoi(argv[9]) : 0;
 
     // Ablation: pass "--no-ternary" as the FIRST argument to keep only the
     // embedding local SGD (no ternary deltas, no bit flips).
@@ -110,6 +115,9 @@ int main(int argc, char** argv) {
         steps      = (argc > 5) ? atoi(argv[5]) : 200;
         log_every  = (argc > 6) ? atoi(argv[6]) : 50;
         save_every = (argc > 7) ? atoi(argv[7]) : 100;
+        thr_override  = (argc > 8) ? (float)atof(argv[8]) : 0.0f;
+        decay_override = (argc > 9) ? (float)atof(argv[9]) : 0.0f;
+        every_override = (argc > 10) ? atoi(argv[10]) : 0;
     }
 
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -135,9 +143,9 @@ int main(int argc, char** argv) {
     const int H = model.header.hidden_dim;
     const int V = model.header.vocab_size;
     const int block = model.sl_block_size;
-    const float thr = model.sl_threshold;
-    const float decay = model.sl_acc_decay;
-    const int flip_every = model.sl_flip_every_n;
+    const float thr = thr_override > 0.0f ? thr_override : model.sl_threshold;
+    const float decay = decay_override > 0.0f ? decay_override : model.sl_acc_decay;
+    const int flip_every = every_override > 0 ? every_override : model.sl_flip_every_n;
     const float scale = model.sl_logit_scale;
     const float lr_emb = model.sl_lr_embedding;
     const float wd_emb = model.sl_wd_embedding;
@@ -145,6 +153,16 @@ int main(int argc, char** argv) {
     // Per-block gradient buffers, keyed by layer name (filled from first capture).
     std::vector<std::string> names;
     std::vector<std::vector<float>> grads;
+
+    // Churn tracking: stable list of ternary weights + per-weight flip counters.
+    std::vector<TernaryWeightXNOR*> wlist;
+    std::vector<std::vector<uint32_t>> hists;
+    long long total_w = 0;
+    for (auto& kv : model.ternary_weights) {
+        wlist.push_back(&kv.second);
+        hists.emplace_back(kv.second.floats.size(), 0u);
+        total_w += (long long)kv.second.floats.size();
+    }
 
     // Embedding gradient buffer (V x H) and its flattened view.
     std::vector<float> gradE((size_t)V * H, 0.0f);
@@ -269,10 +287,34 @@ int main(int argc, char** argv) {
 
         // Bit flips every N steps.
         long long total_flips = 0;
+        long long real_changes = 0;
         if (!no_ternary && flip_every > 0 && (step + 1) % flip_every == 0) {
-            for (auto& kv : model.ternary_weights) {
-                total_flips += apply_bit_flips(kv.second, thr);
+            for (size_t wi = 0; wi < wlist.size(); wi++) {
+                TernaryWeightXNOR& w = *wlist[wi];
+                auto& hist = hists[wi];
+                const size_t n = w.floats.size();
+                std::vector<float> before(n);
+                memcpy(before.data(), w.floats.data(), n * sizeof(float));
+                total_flips += apply_bit_flips(w, thr);
+                const float* f = w.floats.data();
+                for (size_t i = 0; i < n; i++)
+                    if (f[i] != before[i]) { hist[i]++; real_changes++; }
             }
+            // Churn buckets: fraction of weights flipped at least 1/2/4/8 times cumulatively.
+            long long ever = 0, m2 = 0, m4 = 0, m8 = 0;
+            for (auto& h : hists)
+                for (auto c : h) {
+                    if (c) ever++;
+                    if (c >= 2) m2++;
+                    if (c >= 4) m4++;
+                    if (c >= 8) m8++;
+                }
+            double tot = (double)total_w;
+            fprintf(stderr, "  flips=%lld (real changes=%lld, %.1f%% no-op) | "
+                            "churn: ever=%.2f%% >=2=%.2f%% >=4=%.2f%% >=8=%.2f%%\n",
+                    total_flips, real_changes,
+                    total_flips > 0 ? 100.0 * (1.0 - (double)real_changes / total_flips) : 0.0,
+                    ever / tot * 100.0, m2 / tot * 100.0, m4 / tot * 100.0, m8 / tot * 100.0);
         }
 
         auto te = std::chrono::high_resolution_clock::now();

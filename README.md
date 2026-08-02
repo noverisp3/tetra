@@ -246,7 +246,7 @@ v6 = v5 + one **FP32 accumulator** (`rows×cols`) appended to every ternary entr
 |-------|--------|
 | C++ inference CE vs PyTorch (held-out) | 7.137 vs 7.16 — matches, C++ numerics correct |
 | 60 blocks C++ self-learning on held-out | **7.1373 → 7.1127** (generalizes, not overfitting) |
-| Bit-flips applied | ~20K–4M per flip step |
+| Bit-flips applied | 94–100% no-ops; only ~130–1.5K real changes per flip step |
 | Round-trip (save → reload → continue) | Works, CE keeps decreasing |
 | `tetra.exe` generation on learned model | Works |
 | Unit tests (`tests/test_discrete.py`) | 9/9 pass |
@@ -267,12 +267,24 @@ Findings:
 1. **Continued on-device learning works and keeps improving**: held-out CE drops 7.137 → 6.997 across 500 blocks (~1.02M tokens) — no backprop, pure local rule `c` + embedding SGD.
 2. **Backprop is better but the gap is small**: at 60 blocks the local rule is ~0.21 nats behind a real optimizer on the same ternary architecture; after 500 blocks the gap shrinks to **~0.09 nats** (6.996 vs 6.902) at ~3.7× the token budget.
 3. **Ternary flips contribute, embedding dominates**: embedding-only gets 7.121 vs full 7.113 at 60 blocks — flips add ~1/3 of the total improvement.
-4. **Flip counts are high** (0.8–4M per flip step across 6.29M weights) — likely includes bit-churn; threshold/decay tuning is a candidate for further gains.
+4. **No bit churn — flips are mostly saturation no-ops** (diagnostic, 200 blocks): 94–100% of counted flips do not change the weight (already saturated at ±1); only ~0.18% of the 6.29M weights ever change value, and weights flipped ≥4 times are 0.00%. The huge per-step "flip counts" reported earlier were a measurement artifact of counting no-op saturation flips.
+
+### Hyperparameter sweep (100 blocks, held-out CE @10K positions)
+
+| Variant | Held-out CE | Real weight changes |
+|---------|-------------|---------------------|
+| base (thr=20, decay=0.99, every=5) | 7.1195 | ~6K |
+| thr=40 | 7.1179 | fewer |
+| thr=10 | **7.1041** | more |
+| decay=0.95 | 7.1196 | 0 (never flips) |
+| flip every 1 block | 7.1245 | ~similar |
+
+Threshold/decay/flip frequency move held-out CE by <0.02 nats — within noise. The bottleneck is not flip frequency but weight saturation, so tuning these parameters cannot unlock more ternary learning.
 
 **Known limitations / open questions:**
 1. Gap to backprop is ~0.09 nats at 3.7× the token budget — a longer/tuned backprop run (or a proper AdamW schedule without early overfitting) may widen it.
 2. Backprop baseline showed late-training instability (LR decayed too fast → final CE rose to 8.0); its reported best (step 200) may understate what a tuned run achieves.
-3. **Flip churn is high** (0.8–4M flips per step) — need an analysis of whether flips that get flipped back (churn) dominate, and whether threshold/decay/`flip_every_n` tuning improves sample efficiency.
+3. **Ternary learning is starved by saturation**: 94–100% of flips are no-ops on ±1-saturated weights; only ~0.18% of weights change over 200 blocks. To make bit-flips drive real learning the mechanism must change (e.g., allow moving past saturation, toggle-based flips, or a less-saturated init) — hyperparameter tuning alone does not help.
 4. Still no standard-quality generation (CE ~7 → PPL ~1090) — gradient-free learning is proven effective but far from fluent text; scaling tokens/steps is untested.
 
 ## Project Structure
