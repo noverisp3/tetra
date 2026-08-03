@@ -88,12 +88,13 @@ int main(int argc, char** argv) {
 
     if (argc < 4) {
         fprintf(stderr,
-            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every] [toggle] [--toggle-window N]\n",
+            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every] [toggle] [--toggle-window N] [--thr-anneal RATE]\n",
             argv[0]);
         fprintf(stderr,
             "  thr/decay/flip_every/toggle override the v6 metadata (0 = keep metadata value; -1 for toggle = keep metadata)\n");
         fprintf(stderr,
-            "  --toggle-window N: only toggle for the first N blocks, then no-op flips (annealing, finding #12)\n");
+            "  --toggle-window N: only toggle for the first N blocks, then no-op flips (annealing, finding #12)\n"
+            "  --thr-anneal RATE: raise the flip threshold by RATE per pass (finding #12 refinement)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -151,6 +152,17 @@ int main(int argc, char** argv) {
             toggle_window = atoi(argv[i + 1]);
         }
     }
+    // "--thr-anneal RATE" (finding #12 refinement): effective flip threshold
+    // rises by RATE each flip pass (thr, thr+RATE, thr+2*RATE, ...). The goal
+    // is to make the saturation-wall crossing non-periodic: after a few passes
+    // the bar is too high for the residual accumulator drift to re-cross, so
+    // the model freezes instead of re-kicking every ~25 blocks.
+    float thr_anneal = 0.0f;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--thr-anneal") == 0) {
+            thr_anneal = (float)atof(argv[i + 1]);
+        }
+    }
 
     auto t0 = std::chrono::high_resolution_clock::now();
     Model model = load_model(model_path);
@@ -204,11 +216,12 @@ int main(int argc, char** argv) {
     std::vector<float> softmax_buf(V);
     auto t1 = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "Init in %.1f ms | block=%d thr=%.1f decay=%.3f flipEvery=%d toggle=%d%s "
-                    "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s\n",
+                    "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s%s\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
             block, thr, decay, flip_every, toggle ? 1 : 0,
-            toggle_window > 0 ? " (anneal off after block " + std::to_string(toggle_window) + ")" : "",
+            (toggle_window > 0 ? " (anneal off after block " + std::to_string(toggle_window) + ")" : "").c_str(),
             scale, lr_emb, wd_emb,
+            (thr_anneal > 0.0f ? " | thr-anneal +" + std::to_string(thr_anneal) + "/pass" : "").c_str(),
             no_ternary ? " | embedding-only" : (flip_only ? " | flip-only" : ""));
 
     double ms_total = 0.0;
@@ -340,14 +353,17 @@ int main(int argc, char** argv) {
             }
             fprintf(stderr, "  [acc stats] max=%.4f >20=%lld in(15,20]=%lld\n",
                     acc_max, acc_over20, acc_over15);
+            const float eff_thr = thr_anneal > 0.0f
+                    ? thr + thr_anneal * ((float)((step + 1) / flip_every) - 1.0f)
+                    : thr;
+            const bool eff_toggle = toggle && (toggle_window <= 0 || (int)step + 1 <= toggle_window);
             for (size_t wi = 0; wi < wlist.size(); wi++) {
                 TernaryWeightXNOR& w = *wlist[wi];
                 auto& hist = hists[wi];
                 const size_t n = w.floats.size();
                 std::vector<float> before(n);
                 memcpy(before.data(), w.floats.data(), n * sizeof(float));
-                const bool eff_toggle = toggle && (toggle_window <= 0 || (int)step + 1 <= toggle_window);
-                total_flips += apply_bit_flips(w, thr, eff_toggle);
+                total_flips += apply_bit_flips(w, eff_thr, eff_toggle);
                 const float* f = w.floats.data();
                 for (size_t i = 0; i < n; i++)
                     if (f[i] != before[i]) { hist[i]++; real_changes++; }
@@ -362,10 +378,11 @@ int main(int argc, char** argv) {
                     if (c >= 8) m8++;
                 }
             double tot = (double)total_w;
-            fprintf(stderr, "  flips=%lld (real changes=%lld, %.1f%% no-op) | "
+            fprintf(stderr, "  flips=%lld (real changes=%lld, %.1f%% no-op, eff_thr=%.1f) | "
                             "churn: ever=%.2f%% >=2=%.2f%% >=4=%.2f%% >=8=%.2f%%\n",
                     total_flips, real_changes,
                     total_flips > 0 ? 100.0 * (1.0 - (double)real_changes / total_flips) : 0.0,
+                    eff_thr,
                     ever / tot * 100.0, m2 / tot * 100.0, m4 / tot * 100.0, m8 / tot * 100.0);
 
             // Rescue-then-freeze (finding #12): at the toggle-window boundary,
