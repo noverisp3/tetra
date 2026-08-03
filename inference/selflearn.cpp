@@ -88,10 +88,12 @@ int main(int argc, char** argv) {
 
     if (argc < 4) {
         fprintf(stderr,
-            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every] [toggle]\n",
+            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every] [toggle] [--toggle-window N]\n",
             argv[0]);
         fprintf(stderr,
             "  thr/decay/flip_every/toggle override the v6 metadata (0 = keep metadata value; -1 for toggle = keep metadata)\n");
+        fprintf(stderr,
+            "  --toggle-window N: only toggle for the first N blocks, then no-op flips (annealing, finding #12)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -137,6 +139,17 @@ int main(int argc, char** argv) {
         decay_override = (argc > 9) ? (float)atof(argv[9]) : 0.0f;
         every_override = (argc > 10) ? atoi(argv[10]) : 0;
         toggle_override = (argc > 11) ? atoi(argv[11]) : -1;
+    }
+
+    // Optional annealing: "--toggle-window N" (any argv position) limits the
+    // toggle kick to the first N blocks, then falls back to no-op flips. This
+    // captures the saturation-wall rescue (finding #12) without the sustained
+    // churn that destroys structure past ~100 blocks.
+    int toggle_window = 0;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--toggle-window") == 0) {
+            toggle_window = atoi(argv[i + 1]);
+        }
     }
 
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -190,10 +203,12 @@ int main(int argc, char** argv) {
 
     std::vector<float> softmax_buf(V);
     auto t1 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "Init in %.1f ms | block=%d thr=%.1f decay=%.3f flipEvery=%d toggle=%d "
+    fprintf(stderr, "Init in %.1f ms | block=%d thr=%.1f decay=%.3f flipEvery=%d toggle=%d%s "
                     "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
-            block, thr, decay, flip_every, toggle ? 1 : 0, scale, lr_emb, wd_emb,
+            block, thr, decay, flip_every, toggle ? 1 : 0,
+            toggle_window > 0 ? " (anneal off after block " + std::to_string(toggle_window) + ")" : "",
+            scale, lr_emb, wd_emb,
             no_ternary ? " | embedding-only" : (flip_only ? " | flip-only" : ""));
 
     double ms_total = 0.0;
@@ -331,7 +346,8 @@ int main(int argc, char** argv) {
                 const size_t n = w.floats.size();
                 std::vector<float> before(n);
                 memcpy(before.data(), w.floats.data(), n * sizeof(float));
-                total_flips += apply_bit_flips(w, thr, toggle);
+                const bool eff_toggle = toggle && (toggle_window <= 0 || (int)step + 1 <= toggle_window);
+                total_flips += apply_bit_flips(w, thr, eff_toggle);
                 const float* f = w.floats.data();
                 for (size_t i = 0; i < n; i++)
                     if (f[i] != before[i]) { hist[i]++; real_changes++; }
@@ -351,6 +367,21 @@ int main(int argc, char** argv) {
                     total_flips, real_changes,
                     total_flips > 0 ? 100.0 * (1.0 - (double)real_changes / total_flips) : 0.0,
                     ever / tot * 100.0, m2 / tot * 100.0, m4 / tot * 100.0, m8 / tot * 100.0);
+
+            // Rescue-then-freeze (finding #12): at the toggle-window boundary,
+            // zero every accumulator so the mass-kick residual does not keep
+            // driving real flips for hundreds of blocks after toggle turns off.
+            if (toggle_window > 0 && (int)step + 1 == toggle_window) {
+                size_t nacc = 0;
+                for (size_t wi = 0; wi < wlist.size(); wi++)
+                    nacc += wlist[wi]->accumulator.size();
+                for (size_t wi = 0; wi < wlist.size(); wi++) {
+                    auto& accs = wlist[wi]->accumulator;
+                    std::fill(accs.begin(), accs.end(), 0.0f);
+                }
+                fprintf(stderr, "  >> toggle window ended at block %d: %zu accumulators zeroed\n",
+                        toggle_window, nacc);
+            }
         }
 
         auto te = std::chrono::high_resolution_clock::now();
