@@ -14,15 +14,16 @@
 
 \title{Gradient-Free Local Learning for Ternary Transformers:\\ A Predictive-Coding Rule and the Saturation Collapse}
 
-\author{Author Name \\[0.3em]
-Affiliation / Organization \\
-\texttt{email@example.com}
+\author{Ph\d{a}m Ph\'u Nguy\^en \\[0.3em]Thang Long High School, Vietnam \\
+\texttt{nguyenpham2044@gmail.com}
 }
 
-% \iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\iclrfinalcopy % Camera-ready: shows author names. Comment out for anonymous submission.
 \begin{document}
 
 \maketitle
+
+\lhead{}
 
 \begin{abstract}
 We study whether a ternary-quantized transformer can keep learning after deployment, using only local, gradient-free updates computed on device. We adopt a predictive-coding-style local rule that maintains per-weight accumulators and flips a weight when its accumulator crosses a threshold, plus embedding SGD. On a TinyStories-scale model (6 layers, hidden 256) continued on-device learning works: held-out CE drops 7.137$\rightarrow$6.997 over 500 blocks, closing the gap to a real backprop baseline to $\sim$ 0.09 nats at 3.7$\times$ the token budget. However, the local rule collapses: 94--100\% of flips are saturation no-ops, and after 250 steps 98\% of weights saturate at $-1$, and 5 of 6 layers reach a structural rank-1 collapse where every row is identical. The \emph{toggle rule} is introduced: instead of a no-op on an already-saturated weight, flip it to the opposite value. Toggle preserves weight diversity and full matrix rank, and reaches 6.43 held-out CE -- \emph{below} the 6.90 backprop baseline on the same architecture. Ablations quantify the learned ternary substrate at $\sim$ 1 nat over random, of which $\sim$ 0.70 nats is positional structure. A C++ on-device implementation reproduces the Python dynamics (parity 0.01\% weight mismatch, float-rounding level). The toggle is a \emph{transient rescue}, not a sustained learner: continued toggling past $\sim$ 500 blocks flips every weight at each periodic $\pm$20 wall crossing, erasing structure (9.42 held-out); no threshold/window annealing schedule rescues it. These findings delineate what gradient-free on-device learning can and cannot do.
