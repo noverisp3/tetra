@@ -1,0 +1,22 @@
+#version 450
+// mm_reduce.comp: out[ooff + r] = part[pbase + r*4 + 0..3] summed.
+// 64 lanes stride over rows; each row's 4 partials summed serially (4 FMAs).
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 5, std430) readonly buffer Partial { float part[]; };
+layout(set = 0, binding = 2, std430) buffer Act { float act[]; };
+layout(push_constant) uniform PC {
+    int pbase;
+    int ooff;
+    int rows;
+} pc;
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    int rows = pc.rows;
+    if (int(g) >= rows) return;
+    float s = 0.0;
+    s += part[pc.pbase + int(g) * 4 + 0];
+    s += part[pc.pbase + int(g) * 4 + 1];
+    s += part[pc.pbase + int(g) * 4 + 2];
+    s += part[pc.pbase + int(g) * 4 + 3];
+    act[pc.ooff + int(g)] = s;
+}

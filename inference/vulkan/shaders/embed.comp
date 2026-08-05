@@ -1,0 +1,18 @@
+#version 450
+// embed.comp: x[i] = token_emb[tok*H + i] + pos_emb[pos*H + i]
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 1, std430) readonly buffer FP32 { float fp[]; };
+layout(set = 0, binding = 2, std430) buffer Act { float act[]; };
+layout(push_constant) uniform PC {
+    int tok;
+    int pos;
+    int H;
+    int embOff;   // offset of token_embedding in fp
+    int posOff;   // offset of pos_embedding in fp
+} pc;
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    int H = pc.H;
+    if (int(g) >= H) return;
+    act[g] = fp[pc.embOff + pc.tok * H + int(g)] + fp[pc.posOff + pc.pos * H + int(g)];
+}

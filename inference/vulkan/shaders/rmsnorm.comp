@@ -1,0 +1,33 @@
+#version 450
+// rmsnorm.comp: o[i] = (x[i] / sqrt(mean(x^2)+eps)) * w[i]
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 2, std430) buffer Act { float act[]; };
+layout(set = 0, binding = 1, std430) readonly buffer FP32 { float fp[]; };
+layout(push_constant) uniform PC {
+    int xoff;
+    int ooff;
+    int woff;
+    int dim;
+    float eps;
+} pc;
+shared float red[64];
+void main() {
+    uint g = gl_LocalInvocationIndex;
+    int dim = pc.dim;
+    float s = 0.0;
+    for (int i = int(g); i < dim; i += 64) {
+        float v = act[pc.xoff + i];
+        s += v * v;
+    }
+    red[g] = s;
+    barrier();
+    if (g == 0) {
+        float sum = 0.0;
+        for (int i = 0; i < 64; i++) sum += red[i];
+        red[0] = 1.0 / sqrt(sum / float(dim) + pc.eps);
+    }
+    barrier();
+    float rinv = red[0];
+    for (int i = int(g); i < dim; i += 64)
+        act[pc.ooff + i] = (act[pc.xoff + i] * rinv) * fp[pc.woff + i];
+}

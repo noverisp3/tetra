@@ -1,0 +1,37 @@
+#version 450
+// mm_partial.comp: partial[r*K + k] = sum_{c in k-slice} x[xoff + c] * W[woff + r*cols + c]
+// K = 4 splits, one workgroup of 64 lanes per (row, split): each lane sums a
+// sub-chunk, then the workgroup reduces to a single float written to partial.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 2, std430) readonly buffer Act { float act[]; };
+layout(set = 0, binding = 0, std430) readonly buffer Wt { float W[]; };
+layout(set = 0, binding = 5, std430) buffer Partial { float part[]; };
+layout(push_constant) uniform PC {
+    int xoff;
+    int woff;
+    int pbase;    // partial base offset (row * K)
+    int rows;
+    int cols;
+    float alpha;
+} pc;
+shared float red[64];
+void main() {
+    uint g = gl_LocalInvocationIndex;
+    int rows = pc.rows, cols = pc.cols;
+    int r = int(gl_WorkGroupID.y);
+    int k = int(gl_WorkGroupID.x);   // 0..K-1
+    if (r >= rows || k >= 4) return;
+    int c0 = (k * cols) / 4;
+    int c1 = ((k + 1) * cols) / 4;
+    float s = 0.0;
+    int xb = pc.xoff;
+    for (int c = c0 + int(g); c < c1; c += 64)
+        s += act[xb + c] * W[pc.woff + r * cols + c];
+    red[g] = s;
+    barrier();
+    for (int step = 32; step > 0; step >>= 1) {
+        if (g < uint(step)) red[g] += red[g + uint(step)];
+        barrier();
+    }
+    if (g == 0) part[pc.pbase + r * 4 + k] = red[0] * pc.alpha;
+}

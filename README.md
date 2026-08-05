@@ -137,6 +137,57 @@ Three alpha modes controlled by `group_size` and `num_alphas`:
 
 Per-group (`--group-size N`): each output row is split into blocks of N dims, each block having its own FP32 alpha. Overhead: with `group_size=64` (tiny 256-dim) adds ~770 KB.
 
+## Vulkan Compute Engine (`inference/vulkan/`)
+
+A Vulkan compute port of the same forward pass for **on-device/GPU inference and self-learning** on the v6 binary format. Runs on Intel Iris Xe (DirectML-style iGPU) with host-visible coherent buffers (UMA). Zero Vulkan dependencies beyond the SDK loader — no Vulkan-Hpp, no glslang at runtime (SPIR-V precompiled via `glslc`).
+
+| Feature | Detail |
+|---------|--------|
+| **Shaders** | 11 compute shaders (`shaders/*.comp`): embed, rmsnorm, two-stage matmul (mm_partial 4-way column split + mm_reduce), causal attention (one 32-lane workgroup per head, shared-memory score softmax), SiLU, residual add, K/V cache store, plus SL: capture (activation history), rulec (predictive-coding grads), embgrad (tied-embedding grads) |
+| **Matmul** | 4 workgroups/row over 64 lanes → partial sums in a scratch buffer → reduce kernel; dispatch X=4 splits × Y=rows; dequantized FP32 ternary weights (25.2 MB) + embedding-as-LM-head in one buffer |
+| **KV cache** | Dedicated buffers (`L×seq×H`), zeroed by host at seq boundaries |
+| **Parity** | CE identical to C++/PyTorch (6.7661 @128 pos, 6.9383 @1000 pos — exact match) |
+| **Speed** | ~708 ms/block (128 tokens) on Intel Iris Xe — **~15% faster than the PyTorch CPU baseline (831.7 ms) and ~20% faster than C++ AVX2 (~900 ms)** |
+| **Build (Windows)** | `build_vulkan.bat` (auto-detects VS via vswhere; requires `VULKAN_SDK`, compiles shaders with `glslc` + links `vulkan-1.lib`) |
+
+Modes:
+
+```bash
+vulkan_forward.exe <model.bin> <tokens.bin> --eval [max_positions]   # avg CE, same math as selflearn --eval
+vulkan_forward.exe <model.bin> <tokens.bin> --bench N                # fresh-cache 128-token blocks, ms/block
+vulkan_forward.exe <model.bin> <tokens.bin> --dbg N                  # layer-by-layer intermediate dumps (parity debug)
+vulkan_forward.exe <model.bin> <tokens.bin> --sl <out.bin> [steps] [log_every] [save_every] \
+       [thr] [decay] [flip_every] [toggle] [--toggle-window N] [--thr-anneal RATE]
+       # rule-'c' self-learning loop, same args + update math as selflearn.exe
+```
+
+Implementation notes:
+- **Memory ordering**: cross-kernel dependencies on the shared partial buffer and act buffer require explicit `VkMemoryBarrier`s (TRANSFER|COMPUTE → COMPUTE) after every fill/dispatch — without them the iGPU driver races adjacent kernels (intermittently-zero matmul outputs). The SL capture stores need no barrier: history is only read by the grad kernels in a later command buffer (queue-idle sync).
+- **Numerics**: exact FP32 paths, no FMA contraction between engines; CE parity with C++ and PyTorch on the same token slices.
+- **SL loop**: per-position activations are captured into a 21.6 MB history buffer (3 new shaders: `capture`, `rulec`, `embgrad`); block gradients are computed GPU-side in a single command buffer, then bulk-copied to host RAM for the accumulator feed / bit flips / embedding SGD (scattered reads from the coherent mapping run at ~100 ns/element, so a one-shot memcpy staging is 4× faster).
+
+Self-learning parity (vs `selflearn_avx2.exe`, 100-block toggle run):
+- CE trajectory matches to 4 decimals for the first 24 blocks (bit-exact to ulp-level rounding); first toggle kick lands on block 25 in both engines.
+- Kick schedule identical across all 500 blocks (every 5 blocks), flip counts within 0.2–8.7% per kick.
+- After the first mass-kick the per-block CEs diverge chaotically (mean abs diff 0.85) — ulp-level matmul summation-order differences (AVX2 8-lane FMA chains vs 4-way GPU split) get amplified through flip decisions; both engines converge to the same statistical regime (held-out CE ~9.2–9.9 after 500 toggle blocks, finding #12).
+- Speed: ~0.81 s/block vs C++ 0.74 s/block (forward alone is ~15% faster on the GPU).
+
+Reproduce the parity + benchmark:
+
+```bash
+cd inference/vulkan && build_vulkan.bat
+# C++ reference CE
+..\selflearn_avx2.exe --eval ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin ..\..\examples\discrete\slice100k.bin 1000
+# Vulkan CE + timing
+vulkan_forward.exe ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin ..\..\examples\discrete\slice100k.bin --eval 1000
+vulkan_forward.exe ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin ..\..\examples\discrete\slice100k.bin --bench 5
+# PyTorch CPU baseline
+python ..\bench_torch.py ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin
+# SL loop parity: 20 toggle-free blocks, same trajectory as selflearn.exe
+vulkan_forward.exe ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin ..\..\examples\discrete\slice100k.bin --sl sl_vk.bin 20 1 0 20 0.99 5 0
+..\selflearn_avx2.exe ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin ..\..\examples\discrete\slice100k.bin sl_cpp.bin 20 1 0 20 0.99 5 0
+```
+
 ## Examples
 
 ### Tiny 8.5M on TinyStories (STE)

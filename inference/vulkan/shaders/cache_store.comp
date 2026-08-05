@@ -1,0 +1,19 @@
+#version 450
+// cache_store.comp: copy 256 floats from act temp (KA/VA) into the K/V cache
+//   slot for this layer+position.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 2, std430) readonly buffer Act { float act[]; };
+layout(set = 0, binding = 3, std430) buffer KCache { float kc[]; };
+layout(set = 0, binding = 4, std430) buffer VCache { float vc[]; };
+layout(push_constant) uniform PC {
+    int src;      // act offset of the k or v vector
+    int dstBase;  // cache base for this layer+position (l*seq*H + pos*H)
+    int which;    // 0 = k, 1 = v
+    int count;    // H
+} pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (int(i) >= pc.count) return;
+    if (pc.which == 0) kc[pc.dstBase + int(i)] = act[pc.src + int(i)];
+    else               vc[pc.dstBase + int(i)] = act[pc.src + int(i)];
+}

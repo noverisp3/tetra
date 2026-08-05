@@ -1,0 +1,26 @@
+#version 450
+// embgrad.comp: tied-embedding gradient.
+//   gradE[v][i] += (softmax_t[v] - onehot_t[v]) * h_t[i]   over t = 0..T-1
+// The (softmax - onehot) values are pre-folded into the sm slot by the host.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 6, std430) readonly buffer Hist { float hist[]; };
+layout(set = 0, binding = 7, std430) buffer Grad { float grad[]; };
+layout(push_constant) uniform PC {
+    int smBase;   // hist offset of softmax slot (T*V floats)
+    int hBase;    // hist offset of final hidden slot (T*H floats)
+    int gradOff;  // grad offset of gradE (V*H)
+    int V;
+    int Hh;
+    int T;
+} pc;
+void main() {
+    uint v = gl_GlobalInvocationID.x;
+    uint i = gl_GlobalInvocationID.y;
+    if (v >= uint(pc.V) || i >= uint(pc.Hh)) return;
+    float acc = 0.0;
+    for (int t = 0; t < pc.T; t++) {
+        acc += hist[pc.smBase + t * pc.V + int(v)]
+             * hist[pc.hBase + t * pc.Hh + int(i)];
+    }
+    grad[pc.gradOff + int(v) * pc.Hh + int(i)] = acc;
+}
