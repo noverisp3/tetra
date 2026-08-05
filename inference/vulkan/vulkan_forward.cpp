@@ -35,9 +35,7 @@ using namespace tetra;
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
     fprintf(stderr, "Vulkan error %d at %s:%d\n", (int)r_, __FILE__, __LINE__); exit(1); } } while (0)
 
-// ---------------------------------------------------------------------------
 // Vulkan context
-// ---------------------------------------------------------------------------
 struct Device {
     VkInstance inst = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
@@ -141,9 +139,7 @@ static void init_vulkan(Device& d) {
     VK_CHECK(vkAllocateDescriptorSets(d.dev, &dai, &d.dset));
 }
 
-// ---------------------------------------------------------------------------
 // Buffers (host-visible; Iris Xe is UMA)
-// ---------------------------------------------------------------------------
 struct GPUBuffer {
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -180,9 +176,7 @@ static void gpu_alloc(Device& d, GPUBuffer& b, VkDeviceSize size) {
     VK_CHECK(vkMapMemory(d.dev, b.mem, 0, size, 0, (void**)&b.host));
 }
 
-// ---------------------------------------------------------------------------
 // Kernels
-// ---------------------------------------------------------------------------
 struct Kernels {
     VkPipeline embed, rmsnorm, mm_partial, mm_reduce, attn, silu, add, cstore;
     VkPipeline capture, rulec, embgrad;
@@ -244,9 +238,7 @@ static void init_kernels(Device& d, Kernels& k) {
     VK_CHECK(vkAllocateCommandBuffers(d.dev, &cai, &k.cmd));
 }
 
-// ---------------------------------------------------------------------------
 // Weight staging
-// ---------------------------------------------------------------------------
 struct TensorMap {
     std::unordered_map<std::string, int> off, rows, cols;
     std::unordered_map<std::string, float> alpha;
@@ -652,9 +644,7 @@ static void dbg_layer0(Device& d, Kernels& k, GPUBuffer& ba, GPUBuffer& bf,
     }
 }
 
-// ---------------------------------------------------------------------------
 // Main
-// ---------------------------------------------------------------------------
 static double block_ce(float* logits, const std::vector<uint16_t>& tokens,
                        size_t t, float scale, std::vector<float>& softmax_buf) {
     const int V = (int)softmax_buf.size();
