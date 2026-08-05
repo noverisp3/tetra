@@ -1,0 +1,16 @@
+#version 450
+// silu.comp: fused[base + i] = silu(fused[base + i]) * fused[base + FFN + i]   (in-place)
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 2, std430) buffer Act { float act[]; };
+layout(push_constant) uniform PC {
+    int base;
+    int ffn;
+} pc;
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (int(g) >= pc.ffn) return;
+    float gate = act[pc.base + int(g)];
+    float up = act[pc.base + pc.ffn + int(g)];
+    float silu = gate / (1.0 + exp(-gate));
+    act[pc.base + int(g)] = silu * up;
+}

@@ -1,0 +1,62 @@
+#version 450
+// attention.comp: one workgroup (32 lanes = head dim) per head.
+//   scores[t] = clamp(dot(q_h, k[t,h]) * scale, -80, 80); softmax; out[d] = sum_t p[t] v[t,h,d]
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 2, std430) buffer Act { float act[]; };
+layout(set = 0, binding = 3, std430) readonly buffer KCache { float kc[]; };
+layout(set = 0, binding = 4, std430) readonly buffer VCache { float vc[]; };
+layout(push_constant) uniform PC {
+    int qoff;     // q[head*hd .. ]
+    int ooff;     // o[head*hd .. ]
+    int kcbase;   // k cache base for this layer (l*seq*H)
+    int vcbase;
+    int head;
+    int hd;
+    int H;
+    int seq;
+    int pos;
+    float scale;
+} pc;
+shared float scores[2048];
+shared float red[32];
+void main() {
+    uint g = gl_LocalInvocationIndex;
+    int h = int(gl_WorkGroupID.x), hd = pc.hd, H = pc.H, pos = pc.pos;
+    int qb = pc.qoff + h * hd, ob = pc.ooff + h * hd;
+    for (int t = int(g); t <= pos; t += 32) {
+        float s = 0.0;
+        for (int i = 0; i < hd; i++)
+            s += act[qb + i] * kc[pc.kcbase + t * H + h * hd + i];
+        scores[t] = clamp(s * pc.scale, -80.0, 80.0);
+    }
+    barrier();
+    float mx = -1e30;
+    for (int t = int(g); t <= pos; t += 32) mx = max(mx, scores[t]);
+    red[g] = mx;
+    barrier();
+    for (int s = 16; s > 0; s >>= 1) {
+        if (g < uint(s)) red[g] = max(red[g], red[g + uint(s)]);
+        barrier();
+    }
+    mx = red[0];
+    barrier();
+    float sum = 0.0;
+    for (int t = int(g); t <= pos; t += 32) {
+        scores[t] = exp(scores[t] - mx);
+        sum += scores[t];
+    }
+    red[g] = sum;
+    barrier();
+    for (int s = 16; s > 0; s >>= 1) {
+        if (g < uint(s)) red[g] += red[g + uint(s)];
+        barrier();
+    }
+    sum = red[0];
+    barrier();
+    float acc = 0.0;
+    for (int t = 0; t <= pos; t++) {
+        float p = scores[t] / sum;
+        acc += p * vc[pc.vcbase + t * H + h * hd + int(g)];
+    }
+    act[ob + int(g)] = acc;
+}

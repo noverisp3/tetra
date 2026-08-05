@@ -137,6 +137,45 @@ Three alpha modes controlled by `group_size` and `num_alphas`:
 
 Per-group (`--group-size N`): each output row is split into blocks of N dims, each block having its own FP32 alpha. Overhead: with `group_size=64` (tiny 256-dim) adds ~770 KB.
 
+## Vulkan Compute Engine (`inference/vulkan/`)
+
+A Vulkan compute port of the same forward pass for **on-device/GPU inference and self-learning** on the v6 binary format. Runs on Intel Iris Xe (DirectML-style iGPU) with host-visible coherent buffers (UMA). Zero Vulkan dependencies beyond the SDK loader — no Vulkan-Hpp, no glslang at runtime (SPIR-V precompiled via `glslc`).
+
+| Feature | Detail |
+|---------|--------|
+| **Shaders** | 8 compute shaders (`shaders/*.comp`): embed, rmsnorm, two-stage matmul (mm_partial 4-way column split + mm_reduce), causal attention (one 32-lane workgroup per head, shared-memory score softmax), SiLU, residual add, K/V cache store |
+| **Matmul** | 4 workgroups/row over 64 lanes → partial sums in a scratch buffer → reduce kernel; dispatch X=4 splits × Y=rows; dequantized FP32 ternary weights (25.2 MB) + embedding-as-LM-head in one buffer |
+| **KV cache** | Dedicated buffers (`L×seq×H`), zeroed by host at seq boundaries |
+| **Parity** | CE identical to C++/PyTorch (6.7661 @128 pos, 6.9383 @1000 pos — exact match) |
+| **Speed** | ~708 ms/block (128 tokens) on Intel Iris Xe — **~15% faster than the PyTorch CPU baseline (831.7 ms) and ~20% faster than C++ AVX2 (~900 ms)** |
+| **Build (Windows)** | `build_vulkan.bat` (auto-detects VS via vswhere; requires `VULKAN_SDK`, compiles shaders with `glslc` + links `vulkan-1.lib`) |
+
+Modes:
+
+```bash
+vulkan_forward.exe <model.bin> <tokens.bin> --eval [max_positions]   # avg CE, same math as selflearn --eval
+vulkan_forward.exe <model.bin> <tokens.bin> --bench N                # fresh-cache 128-token blocks, ms/block
+vulkan_forward.exe <model.bin> <tokens.bin> --dbg N                  # layer-by-layer intermediate dumps (parity debug)
+```
+
+Implementation notes:
+- **Memory ordering**: cross-kernel dependencies on the shared partial buffer and act buffer require explicit `VkMemoryBarrier`s (TRANSFER|COMPUTE → COMPUTE) after every fill/dispatch — without them the iGPU driver races adjacent kernels (intermittently-zero matmul outputs).
+- **Numerics**: exact FP32 paths, no FMA contraction between engines; bit-exact CE parity with C++ and PyTorch on the same token slices.
+- SL loop (rule-c gradients, flip passes, embedding SGD) is the next port target; the forward path is already fully parity-tested.
+
+Reproduce the parity + benchmark:
+
+```bash
+cd inference/vulkan && build_vulkan.bat
+# C++ reference CE
+..\selflearn_avx2.exe --eval ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin ..\..\examples\discrete\slice100k.bin 1000
+# Vulkan CE + timing
+vulkan_forward.exe ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin ..\..\examples\discrete\slice100k.bin --eval 1000
+vulkan_forward.exe ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin ..\..\examples\discrete\slice100k.bin --bench 5
+# PyTorch CPU baseline
+python ..\bench_torch.py ..\..\checkpoints_discrete_c3\exp_tog_s0_zacc.bin
+```
+
 ## Examples
 
 ### Tiny 8.5M on TinyStories (STE)

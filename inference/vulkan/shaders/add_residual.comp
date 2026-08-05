@@ -1,0 +1,14 @@
+#version 450
+// add_residual.comp: act[dst + i] += act[src + i]
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 2, std430) buffer Act { float act[]; };
+layout(push_constant) uniform PC {
+    int dst;
+    int src;
+    int dim;
+} pc;
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    if (int(g) >= pc.dim) return;
+    act[pc.dst + int(g)] += act[pc.src + int(g)];
+}
