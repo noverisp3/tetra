@@ -9,6 +9,12 @@
 //       avg CE over the token slice, identical math to selflearn.exe --eval
 //   vulkan_forward.exe <model.bin> <tokens.bin> --bench N
 //       N fresh-cache 128-token blocks, reports ms/block + block CE
+//   vulkan_forward.exe <model.bin> <tokens.bin> --sl <out.bin> [steps] [log_every]
+//       [save_every] [thr] [decay] [flip_every] [toggle]
+//       [--toggle-window N] [--thr-anneal RATE]
+//       rule-'c' self-learning loop: GPU forward + activation capture + rule-c /
+//       embedding gradients, host accumulator feed / bit flips / embedding SGD
+//       (same update math as selflearn.exe)
 //
 // Build: build_vulkan.bat   (needs VULKAN_SDK env var)
 
@@ -93,8 +99,8 @@ static void init_vulkan(Device& d) {
     cpci.queueFamilyIndex = d.qidx;
     VK_CHECK(vkCreateCommandPool(d.dev, &cpci, nullptr, &d.pool));
 
-    std::vector<VkDescriptorSetLayoutBinding> binds(6);
-    for (int i = 0; i < 6; i++) {
+    std::vector<VkDescriptorSetLayoutBinding> binds(8);
+    for (int i = 0; i < 8; i++) {
         binds[i].binding = (uint32_t)i;
         binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binds[i].descriptorCount = 1;
@@ -120,7 +126,7 @@ static void init_vulkan(Device& d) {
 
     VkDescriptorPoolSize ps{};
     ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    ps.descriptorCount = 6;
+    ps.descriptorCount = 8;
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.maxSets = 1;
@@ -179,6 +185,7 @@ static void gpu_alloc(Device& d, GPUBuffer& b, VkDeviceSize size) {
 // ---------------------------------------------------------------------------
 struct Kernels {
     VkPipeline embed, rmsnorm, mm_partial, mm_reduce, attn, silu, add, cstore;
+    VkPipeline capture, rulec, embgrad;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
 };
 
@@ -226,6 +233,9 @@ static void init_kernels(Device& d, Kernels& k) {
     k.silu = make_pipeline(d, "shaders/silu.spv");
     k.add = make_pipeline(d, "shaders/add_residual.spv");
     k.cstore = make_pipeline(d, "shaders/cache_store.spv");
+    k.capture = make_pipeline(d, "shaders/capture.spv");
+    k.rulec = make_pipeline(d, "shaders/rulec.spv");
+    k.embgrad = make_pipeline(d, "shaders/embgrad.spv");
     VkCommandBufferAllocateInfo cai{};
     cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cai.commandPool = d.pool;
@@ -278,16 +288,31 @@ struct Weights {
     int lmRows = 0, lmCols = 0, lmOff = 0;   // lm_head = token_embedding (in wtBuf)
 };
 
+// SL capture layout: per captured ternary weight (sorted name order) a y slot
+// (Tmax*rows) then an x slot (Tmax*cols) in the history buffer, followed by the
+// softmax slot (Tmax*V), the final hidden slot (Tmax*H), and the embedding
+// gradient (V*H) in the gradient buffer.
+struct SLCapture {
+    int Tmax = 0;
+    std::unordered_map<std::string, std::pair<int, int>> capBase; // name -> (yBase, xBase)
+    std::unordered_map<std::string, int> gradOff;                 // name -> grad offset
+    int smBase = 0, hBase = 0, gradE_off = 0;
+    int histFloats = 0, gradFloats = 0;
+};
+
 static void submit_and_wait(Device& d, Kernels& k);
 
 // Record one token's forward into k.cmd. If caps != nullptr, capture points
 // (act offsets + labels) are appended; the caller must read ba.host after submit.
 // If dbg_layer >= 0, the command buffer is submitted right after that layer and
 // its intermediates are printed (for parity debugging).
+// If sl != nullptr, the per-linear x/y activations are copied into the history
+// buffer slots (position `pos`), and the final normed hidden goes to sl->hBase.
 static void record_forward(Device& d, Kernels& k, int tok, int pos,
                            const Weights& W, const Model& model,
                            std::vector<std::pair<int, const char*>>* caps = nullptr,
-                           int dbg_layer = -1, GPUBuffer* ba = nullptr) {
+                           int dbg_layer = -1, GPUBuffer* ba = nullptr,
+                           SLCapture* sl = nullptr) {
     const int H = model.header.hidden_dim;
     const int L = model.header.num_layers;
     const int NH = model.header.num_heads;
@@ -315,6 +340,14 @@ static void record_forward(Device& d, Kernels& k, int tok, int pos,
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     };
+    auto store = [&](int src, int dst, int count) {
+        struct { int src, dst, count; } pc = { src, dst, count };
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k.capture);
+        push(&pc, sizeof(pc));
+        vkCmdDispatch(cb, (uint32_t)((count + 63) / 64), 1, 1);
+        // No barrier: hist is only read by the grad kernels, which run in a
+        // separate command buffer after submit_and_wait (queue-idle sync).
+    };
     auto mm = [&](const char* name, int xoff, int ooff, float alpha) {
         int woff = W.tm.off.at(name);
         int rows = W.tm.rows.at(name), cols = W.tm.cols.at(name);
@@ -331,6 +364,13 @@ static void record_forward(Device& d, Kernels& k, int tok, int pos,
         push(&rpc, sizeof(rpc));
         vkCmdDispatch(cb, (uint32_t)((rows + 63) / 64), 1, 1);
         bar();
+        if (sl) {
+            auto it = sl->capBase.find(name);
+            if (it != sl->capBase.end()) {
+                store(xoff, it->second.second + pos * cols, cols);
+                store(ooff, it->second.first + pos * rows, rows);
+            }
+        }
     };
     auto rmsnorm = [&](int xoff, int ooff, const char* normname) {
         struct { int xoff, ooff, woff, dim; float eps; } pc =
@@ -425,6 +465,7 @@ static void record_forward(Device& d, Kernels& k, int tok, int pos,
 
     // Final norm + LM head (embedding as weights)
     rmsnorm(XA, XNORM, "norm.weight");
+    if (sl) store(XNORM, sl->hBase + pos * H, H);
     {
         struct { int xoff, woff, pbase, rows, cols; float alpha; } pc =
             { XNORM, W.lmOff, 0, W.lmRows, W.lmCols, 1.0f };
@@ -466,6 +507,40 @@ static void clear_cache(Device& d, Kernels& k, const GPUBuffer& bk, const GPUBuf
 
 // Record + submit one kernel, then dump 8 floats. Used by --dbg.
 struct OneKernel { Device* d; Kernels* k; const Model* model; GPUBuffer* ba; };
+
+// Record all rule-c gradients + the embedding gradient into ONE command buffer
+// and submit it once (was 37 separate submits before).
+static void record_grads(Device& d, Kernels& k, const SLCapture& sl,
+                         const TensorMap& tm, int V, int H, int T) {
+    VkCommandBuffer cb = k.cmd;
+    VkCommandBufferBeginInfo cbi{};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    VK_CHECK(vkBeginCommandBuffer(cb, &cbi));
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.pl, 0, 1, &d.dset, 0, nullptr);
+    auto push = [&](const void* data, size_t size) {
+        vkCmdPushConstants(cb, d.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)size, data);
+    };
+    for (auto& kv : sl.gradOff) {
+        const std::string& name = kv.first;
+        int rows = tm.rows.at(name), cols = tm.cols.at(name);
+        auto cb2 = sl.capBase.at(name);
+        struct { int yBase, xBase, gradOff, rows, cols, T; } pc =
+            { cb2.first, cb2.second, kv.second, rows, cols, T };
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k.rulec);
+        push(&pc, sizeof(pc));
+        vkCmdDispatch(cb, (uint32_t)((rows + 7) / 8), (uint32_t)((cols + 7) / 8), 1);
+    }
+    {
+        struct { int smBase, hBase, gradOff, V, Hh, T; } pc =
+            { sl.smBase, sl.hBase, sl.gradE_off, V, H, T };
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k.embgrad);
+        push(&pc, sizeof(pc));
+        vkCmdDispatch(cb, (uint32_t)((V + 7) / 8), (uint32_t)((H + 7) / 8), 1);
+    }
+    VK_CHECK(vkEndCommandBuffer(cb));
+    submit_and_wait(d, k);
+}
+
 static void submit1(Device& d, Kernels& k, VkPipeline p, const void* pcdata, size_t pcs, int gx) {
     VkCommandBuffer cb = k.cmd;
     VkCommandBufferBeginInfo cbi{};
@@ -597,7 +672,9 @@ static double block_ce(float* logits, const std::vector<uint16_t>& tokens,
 int main(int argc, char** argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: vulkan_forward.exe <model.bin> <tokens.bin> --eval [maxpos]\n"
-                        "   or: vulkan_forward.exe <model.bin> <tokens.bin> --bench N\n");
+                        "   or: vulkan_forward.exe <model.bin> <tokens.bin> --bench N\n"
+                        "   or: vulkan_forward.exe <model.bin> <tokens.bin> --sl <out.bin> [steps] [log_every]\n"
+                        "       [save_every] [thr] [decay] [flip_every] [toggle] [--toggle-window N] [--thr-anneal RATE]\n");
         return 1;
     }
     Model model = load_model(argv[1]);
@@ -673,15 +750,45 @@ int main(int argc, char** argv) {
     gpu_alloc(d, bp, (size_t)(4 * 8192) * 4);   // max rows = lm_head 8192
     g_partial = bp;
 
+    // ---- SL capture layout (allocated unconditionally; --sl uses it) ----
+    SLCapture sl;
+    sl.Tmax = model.sl_block_size;
+    {
+        std::vector<std::string> ks;
+        for (auto& kv : model.ternary_weights) ks.push_back(kv.first);
+        std::sort(ks.begin(), ks.end());
+        for (auto& name : ks) {
+            int rows = tm.rows.at(name), cols = tm.cols.at(name);
+            sl.gradOff[name] = sl.gradFloats;
+            sl.gradFloats += rows * cols;
+            sl.capBase[name] = { sl.histFloats, 0 };
+            sl.histFloats += sl.Tmax * rows;
+            sl.capBase[name].second = sl.histFloats;
+            sl.histFloats += sl.Tmax * cols;
+        }
+        sl.smBase = sl.histFloats;
+        sl.histFloats += sl.Tmax * V;
+        sl.hBase = sl.histFloats;
+        sl.histFloats += sl.Tmax * H;
+        sl.gradE_off = sl.gradFloats;
+        sl.gradFloats += V * H;
+        fprintf(stderr, "SL layout: hist=%d floats (%.1f MB), grad=%d floats (%.1f MB)\n",
+                sl.histFloats, sl.histFloats * 4.0 / 1e6,
+                sl.gradFloats, sl.gradFloats * 4.0 / 1e6);
+    }
+    GPUBuffer bh, bg;
+    gpu_alloc(d, bh, (size_t)sl.histFloats * 4);
+    gpu_alloc(d, bg, (size_t)sl.gradFloats * 4);
+
     // ---- Descriptor set ----
-    VkDescriptorBufferInfo dbi[6] = {};
-    VkBuffer bufs[6] = { bw.buf, bf.buf, ba.buf, bk.buf, bv.buf, bp.buf };
-    for (int i = 0; i < 6; i++) {
+    VkDescriptorBufferInfo dbi[8] = {};
+    VkBuffer bufs[8] = { bw.buf, bf.buf, ba.buf, bk.buf, bv.buf, bp.buf, bh.buf, bg.buf };
+    for (int i = 0; i < 8; i++) {
         dbi[i].buffer = bufs[i];
         dbi[i].range = VK_WHOLE_SIZE;
     }
-    VkWriteDescriptorSet wds[6] = {};
-    for (int i = 0; i < 6; i++) {
+    VkWriteDescriptorSet wds[8] = {};
+    for (int i = 0; i < 8; i++) {
         wds[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wds[i].dstSet = d.dset;
         wds[i].dstBinding = (uint32_t)i;
@@ -689,7 +796,7 @@ int main(int argc, char** argv) {
         wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         wds[i].pBufferInfo = &dbi[i];
     }
-    vkUpdateDescriptorSets(d.dev, 6, wds, 0, nullptr);
+    vkUpdateDescriptorSets(d.dev, 8, wds, 0, nullptr);
 
     std::vector<float> softmax_buf(V);
 
@@ -759,6 +866,224 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 12; i++) printf(" %.4f", lg[i]);
             printf("\n");
         }
+    } else if (mode == "--sl") {
+        if (argc < 5) { fprintf(stderr, "--sl needs <out.bin>\n"); return 1; }
+        const char* out_path = argv[4];
+        int steps      = (argc > 5) ? atoi(argv[5]) : 200;
+        int log_every  = (argc > 6) ? atoi(argv[6]) : 50;
+        int save_every = (argc > 7) ? atoi(argv[7]) : 100;
+        float thr_override   = (argc > 8) ? (float)atof(argv[8]) : 0.0f;
+        float decay_override = (argc > 9) ? (float)atof(argv[9]) : 0.0f;
+        int every_override   = (argc > 10) ? atoi(argv[10]) : 0;
+        int toggle_override  = (argc > 11) ? atoi(argv[11]) : -1;
+        int toggle_window = 0;
+        float thr_anneal = 0.0f;
+        for (int i = 1; i + 1 < argc; i++) {
+            if (strcmp(argv[i], "--toggle-window") == 0) toggle_window = atoi(argv[i + 1]);
+            if (strcmp(argv[i], "--thr-anneal") == 0) thr_anneal = (float)atof(argv[i + 1]);
+        }
+        if (model.is_mla) {
+            fprintf(stderr, "ERROR: self-learning is only supported for standard attention.\n");
+            return 1;
+        }
+        if (model.sl_rule != 0) {
+            fprintf(stderr, "ERROR: only rule 'c' (predictive coding) is implemented so far (sl_rule=%d).\n",
+                    model.sl_rule);
+            return 1;
+        }
+        const int block = model.sl_block_size;
+        const float thr = thr_override > 0.0f ? thr_override : model.sl_threshold;
+        const float decay = decay_override > 0.0f ? decay_override : model.sl_acc_decay;
+        const int flip_every = every_override > 0 ? every_override : model.sl_flip_every_n;
+        const bool toggle = toggle_override >= 0 ? (toggle_override != 0) : (model.sl_toggle != 0);
+        const float lr_emb = model.sl_lr_embedding;
+        const float wd_emb = model.sl_wd_embedding;
+        float* emb = model.fp32_weights.at("token_embedding.weight").data.data();
+
+        // Churn tracking (same bookkeeping as selflearn.cpp).
+        std::vector<TernaryWeightXNOR*> wlist;
+        std::vector<std::vector<uint32_t>> hists;
+        std::vector<std::string> wnames;
+        long long total_w = 0;
+        for (auto& kv : model.ternary_weights) {
+            wlist.push_back(&kv.second);
+            wnames.push_back(kv.first);
+            hists.emplace_back(kv.second.floats.size(), 0u);
+            total_w += (long long)kv.second.floats.size();
+        }
+
+        fprintf(stderr, "SL: block=%d thr=%.1f decay=%.3f flipEvery=%d toggle=%d "
+                        "lrEmb=%.1e wdEmb=%.2f%s%s\n",
+                block, thr, decay, flip_every, toggle ? 1 : 0, lr_emb, wd_emb,
+                (toggle_window > 0 ? " | toggle-window " + std::to_string(toggle_window) : "").c_str(),
+                (thr_anneal > 0.0f ? " | thr-anneal +" + std::to_string(thr_anneal) + "/pass" : "").c_str());
+
+        double ms_total = 0.0;
+        // Host staging copy of the gradient buffer: the GPU coherent read path
+        // is ~100ns/element, so bulk-copy once (memcpy) instead of scattered
+        // reads inside the feed/SGD loops.
+        std::vector<float> grads_host((size_t)sl.gradFloats);
+        for (int step = 0; step < steps; step++) {
+            auto ts = std::chrono::high_resolution_clock::now();
+            memset(bg.host, 0, (size_t)sl.gradFloats * 4);
+            clear_cache(d, k, bk, bv);
+            size_t start = ((size_t)step * block) % (tokens.size() - 1);
+            size_t end = (std::min)(tokens.size() - 1, start + block);
+            size_t T = end - start;
+            if (T < 2) { fprintf(stderr, "token stream too short\n"); return 1; }
+
+            double block_loss = 0.0;
+            int valid_positions = 0;
+            for (size_t t = start; t < end; t++) {
+                int pos = (int)(t - start);
+                record_forward(d, k, tokens[t], pos, W, model, nullptr, -1, &ba, &sl);
+                submit_and_wait(d, k);
+                if (pos == 0) {
+                    // C++ selflearn skips the first block position entirely:
+                    // no CE, no rule-c, and zero embedding gradient.
+                    memset(bh.host + sl.smBase, 0, (size_t)V * 4);
+                    continue;
+                }
+                // Softmax of scaled logits; fold (softmax - onehot) into the
+                // history slot so embgrad only has to do a dot product.
+                float* lg = ba.host + LOGITS;
+                float mx = -1e30f;
+                for (int i = 0; i < V; i++) { float s = lg[i] * scale; if (s > mx) mx = s; }
+                double sum = 0.0;
+                for (int i = 0; i < V; i++) {
+                    softmax_buf[i] = (float)std::exp((double)lg[i] * scale - mx);
+                    sum += softmax_buf[i];
+                }
+                if (sum > 0) for (int i = 0; i < V; i++) softmax_buf[i] /= (float)sum;
+                int target = tokens[t + 1];
+                block_loss += -std::log((double)(softmax_buf[target] + 1e-12));
+                valid_positions++;
+                float* sm = bh.host + sl.smBase + (size_t)pos * V;
+                for (int i = 0; i < V; i++) sm[i] = softmax_buf[i] - (i == target ? 1.0f : 0.0f);
+            }
+
+            // Rule-c gradients + embedding gradient, one command buffer.
+            record_grads(d, k, sl, tm, V, H, (int)T);
+            memcpy(grads_host.data(), bg.host, (size_t)sl.gradFloats * 4);
+
+            // Feed deltas into accumulators (rule 'c'), reading grads from the
+            // host staging copy (same math as sl_feed_predictive).
+            for (size_t wi = 0; wi < wlist.size(); wi++) {
+                auto git = sl.gradOff.find(wnames[wi]);
+                if (git == sl.gradOff.end()) continue;
+                TernaryWeightXNOR& w = *wlist[wi];
+                const float* g = grads_host.data() + git->second;
+                const size_t n = (size_t)w.rows * w.cols;
+                for (size_t j = 0; j < n; j++) {
+                    float gg = g[j];
+                    float d = (gg > 0.0f) ? -1.0f : ((gg < 0.0f) ? 1.0f : 0.0f);
+                    w.accumulator[j] = w.accumulator[j] * decay + d;
+                }
+            }
+
+            // Embedding local SGD: per-row clip + decoupled WD.
+            {
+                const float* ge0 = grads_host.data() + sl.gradE_off;
+                for (int v = 0; v < V; v++) {
+                    const float* ge = ge0 + (size_t)v * H;
+                    float norm = 0.0f;
+                    for (int i = 0; i < H; i++) norm += ge[i] * ge[i];
+                    norm = sqrtf(norm);
+                    float s = 1.0f;
+                    if (norm > 0.0f && norm < 1.0f) s = 1.0f / norm;
+                    float* er = emb + (size_t)v * H;
+                    for (int i = 0; i < H; i++) {
+                        float upd = lr_emb * (ge[i] * s);
+                        er[i] -= upd;
+                        er[i] *= (1.0f - lr_emb * wd_emb);
+                    }
+                }
+                memcpy(bf.host + W.embOff, emb, (size_t)V * H * 4);
+                memcpy(bw.host + W.lmOff, emb, (size_t)V * H * 4);
+            }
+
+            // Bit flips every N steps (same bookkeeping as selflearn.cpp).
+            long long total_flips = 0;
+            long long real_changes = 0;
+            if (flip_every > 0 && (step + 1) % flip_every == 0) {
+                long long acc_over20 = 0, acc_over15 = 0;
+                double acc_max = 0;
+                for (size_t wi = 0; wi < wlist.size(); wi++) {
+                    TernaryWeightXNOR& w = *wlist[wi];
+                    for (size_t i = 0; i < w.accumulator.size(); i++) {
+                        double aa = fabs((double)w.accumulator[i]);
+                        if (aa > acc_max) acc_max = aa;
+                        if (aa > 20.0) acc_over20++;
+                        else if (aa > 15.0) acc_over15++;
+                    }
+                }
+                fprintf(stderr, "  [acc stats] max=%.4f >20=%lld in(15,20]=%lld\n",
+                        acc_max, acc_over20, acc_over15);
+                const float eff_thr = thr_anneal > 0.0f
+                        ? thr + thr_anneal * ((float)((step + 1) / flip_every) - 1.0f)
+                        : thr;
+                const bool eff_toggle = toggle && (toggle_window <= 0 || step + 1 <= toggle_window);
+                for (size_t wi = 0; wi < wlist.size(); wi++) {
+                    TernaryWeightXNOR& w = *wlist[wi];
+                    auto& hist = hists[wi];
+                    const size_t n = w.floats.size();
+                    std::vector<float> before(n);
+                    memcpy(before.data(), w.floats.data(), n * sizeof(float));
+                    total_flips += apply_bit_flips(w, eff_thr, eff_toggle);
+                    const float* f = w.floats.data();
+                    for (size_t i = 0; i < n; i++)
+                        if (f[i] != before[i]) { hist[i]++; real_changes++; }
+                }
+                long long ever = 0, m2 = 0, m4 = 0, m8 = 0;
+                for (auto& h : hists)
+                    for (auto c : h) {
+                        if (c) ever++;
+                        if (c >= 2) m2++;
+                        if (c >= 4) m4++;
+                        if (c >= 8) m8++;
+                    }
+                double tot = (double)total_w;
+                fprintf(stderr, "  flips=%lld (real changes=%lld, %.1f%% no-op, eff_thr=%.1f) | "
+                                "churn: ever=%.2f%% >=2=%.2f%% >=4=%.2f%% >=8=%.2f%%\n",
+                        total_flips, real_changes,
+                        total_flips > 0 ? 100.0 * (1.0 - (double)real_changes / total_flips) : 0.0,
+                        eff_thr,
+                        ever / tot * 100.0, m2 / tot * 100.0, m4 / tot * 100.0, m8 / tot * 100.0);
+                if (toggle_window > 0 && step + 1 == toggle_window) {
+                    size_t nacc = 0;
+                    for (size_t wi = 0; wi < wlist.size(); wi++)
+                        nacc += wlist[wi]->accumulator.size();
+                    for (size_t wi = 0; wi < wlist.size(); wi++) {
+                        auto& accs = wlist[wi]->accumulator;
+                        std::fill(accs.begin(), accs.end(), 0.0f);
+                    }
+                    fprintf(stderr, "  >> toggle window ended at block %d: %zu accumulators zeroed\n",
+                            toggle_window, nacc);
+                }
+                // Refresh GPU weights after flips (floats changed in place).
+                for (auto& name : wnames) {
+                    const auto& w = model.ternary_weights.at(name);
+                    memcpy(bw.host + tm.off.at(name), w.floats.data(), w.floats.size() * 4);
+                }
+            }
+
+            auto te = std::chrono::high_resolution_clock::now();
+            ms_total += std::chrono::duration<double, std::milli>(te - ts).count();
+
+            if (log_every > 0 && (step + 1) % log_every == 0) {
+                double ce = valid_positions > 0 ? block_loss / valid_positions : 0.0;
+                fprintf(stderr, "step %4d | block CE %.4f | %lld flips | %.1f ms/block\n",
+                        step + 1, ce, total_flips, ms_total / (step + 1));
+            }
+            if (save_every > 0 && (step + 1) % save_every == 0) {
+                save_model(model, out_path);
+                fprintf(stderr, "Saved %s\n", out_path);
+            }
+        }
+        save_model(model, out_path);
+        double tot_ms = ms_total;
+        fprintf(stderr, "Done. %d blocks in %.1f ms (%.2f ms/block). Wrote %s\n",
+                steps, tot_ms, tot_ms / steps, out_path);
     }
 
     return 0;

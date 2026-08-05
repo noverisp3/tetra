@@ -1,0 +1,28 @@
+#version 450
+// rulec.comp: one captured linear layer's rule-c gradient.
+//   grad[o][i] += (y_t[o] - y_{t-1}[o]) * x_{t-1}[i]   over t = 1..T-1
+// Same per-element accumulation order as the C++ loop (t ascending), so the
+// float results are bit-identical.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 6, std430) readonly buffer Hist { float hist[]; };
+layout(set = 0, binding = 7, std430) buffer Grad { float grad[]; };
+layout(push_constant) uniform PC {
+    int yBase;    // hist offset of y slot (T*rows floats)
+    int xBase;    // hist offset of x slot (T*cols floats)
+    int gradOff;  // grad offset of this layer (rows*cols)
+    int rows;     // y dim = weight rows
+    int cols;     // x dim = weight cols
+    int T;        // positions in this block
+} pc;
+void main() {
+    uint o = gl_GlobalInvocationID.x;
+    uint i = gl_GlobalInvocationID.y;
+    if (o >= uint(pc.rows) || i >= uint(pc.cols)) return;
+    float acc = 0.0;
+    for (int t = 1; t < pc.T; t++) {
+        float e = hist[pc.yBase + t * pc.rows + int(o)]
+                - hist[pc.yBase + (t - 1) * pc.rows + int(o)];
+        acc += e * hist[pc.xBase + (t - 1) * pc.cols + int(i)];
+    }
+    grad[pc.gradOff + int(o) * pc.cols + int(i)] = acc;
+}

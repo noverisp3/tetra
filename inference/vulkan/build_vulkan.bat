@@ -37,7 +37,7 @@ if %errorlevel% neq 0 (
 )
 
 echo == Compiling shaders ==
-for %%s in (shaders\embed shaders\rmsnorm shaders\mm_partial shaders\mm_reduce shaders\attention shaders\silu shaders\add_residual shaders\cache_store) do (
+for %%s in (shaders\embed shaders\rmsnorm shaders\mm_partial shaders\mm_reduce shaders\attention shaders\silu shaders\add_residual shaders\cache_store shaders\capture shaders\rulec shaders\embgrad) do (
     "%VULKAN_SDK%\Bin\glslc.exe" -O %%s.comp -o %%s.spv
     if errorlevel 1 (
         echo glslc failed on %%s.comp
