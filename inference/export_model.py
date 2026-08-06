@@ -325,16 +325,24 @@ def detect_model_info(model) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 def export_ste(f, model, quantize_int8=False):
-    """Export STE-mode ternary weights."""
+    """Export STE-mode ternary weights (per-channel Δ + per-group alphas)."""
     from ternary_llm.quantization import TernaryQuantizer
 
     for name, param in model.named_parameters():
         is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
         if not is_ternary:
             continue
-        w_ternary = TernaryQuantizer.apply(param.data)
+        mod_path = name.rsplit(".latent_weights", 1)[0]
+        mod = model
+        for part in mod_path.split("."):
+            mod = getattr(mod, part)
+        if getattr(mod, "per_channel", False):
+            delta = param.detach().abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * mod.ternary_scale
+            w_ternary = (param.detach() / delta).clamp(-1, 1).round()
+        else:
+            w_ternary = TernaryQuantizer.apply(param.data)
         w_ternary = w_ternary.to(torch.int8)
-        write_ternary_entry(f, w_ternary, name)
+        write_ternary_entry(f, w_ternary, name, mod)
 
     for name, param in model.named_parameters():
         is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)

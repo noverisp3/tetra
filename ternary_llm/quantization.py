@@ -156,26 +156,64 @@ class FusedTernaryLinear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, latent_weights: torch.Tensor,
-                scale: float = 0.7, per_channel: bool = False) -> torch.Tensor:
+                scale: float = 0.7, per_channel: bool = False,
+                alphas: Optional[torch.Tensor] = None,
+                group_size: int = 0) -> torch.Tensor:
         if per_channel:
             delta = latent_weights.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * scale
         else:
             delta = latent_weights.abs().mean().clamp(min=1e-6) * scale
         w_ternary = (latent_weights / delta).clamp(-1, 1).round().to(x.dtype)
-        ctx.save_for_backward(x, w_ternary.detach())
+        ctx.save_for_backward(x, w_ternary.detach(), alphas.detach() if alphas is not None else alphas)
+        ctx.group_size = group_size
+        if alphas is not None and group_size > 0:
+            in_features = x.size(-1)
+            num_groups = (in_features + group_size - 1) // group_size
+            ctx.num_groups = num_groups
+            alphas_expanded = torch.repeat_interleave(alphas, group_size, dim=1)
+            if in_features % group_size != 0:
+                alphas_expanded = alphas_expanded[:, :in_features]
+            w_scaled = w_ternary * alphas_expanded
+            return F.linear(x, w_scaled)
+        elif alphas is not None:
+            return F.linear(x, w_ternary) * alphas.unsqueeze(0)
         return F.linear(x, w_ternary)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x, w_ternary = ctx.saved_tensors
+        x, w_ternary, alphas = ctx.saved_tensors
         w_ternary = w_ternary.to(grad_output.dtype)
         x = x.to(grad_output.dtype)
-        grad_x = F.linear(grad_output, w_ternary.T)
-        grad_w = torch.mm(
-            grad_output.reshape(-1, grad_output.size(-1)).T,
-            x.reshape(-1, x.size(-1))
-        )
-        return grad_x, grad_w.float(), None, None
+        in_features = x.size(-1)
+        out_features = grad_output.size(-1)
+        grad_output_flat = grad_output.reshape(-1, out_features)
+        x_flat = x.reshape(-1, in_features)
+
+        if alphas is not None and ctx.group_size > 0:
+            num_groups = ctx.num_groups
+            alphas_expanded = torch.repeat_interleave(alphas, ctx.group_size, dim=1)
+            if in_features % ctx.group_size != 0:
+                alphas_expanded = alphas_expanded[:, :in_features]
+            w_scaled = w_ternary * alphas_expanded
+            grad_x = torch.mm(grad_output_flat, w_scaled).view(*x.shape[:-1], in_features)
+            grad_w_scaled = torch.mm(grad_output_flat.T, x_flat)
+            grad_w = grad_w_scaled * alphas_expanded
+            grad_alpha = torch.zeros(out_features, num_groups, device=x.device)
+            for g in range(num_groups):
+                start = g * ctx.group_size
+                end = min(start + ctx.group_size, in_features)
+                grad_alpha[:, g] = (grad_w_scaled[:, start:end] * w_ternary[:, start:end]).sum(dim=1)
+            grad_alpha = grad_alpha.detach()
+        elif alphas is not None:
+            grad_y_scaled = grad_output_flat * alphas.unsqueeze(0)
+            grad_alpha = (grad_output_flat * torch.mm(x_flat, w_ternary.T)).sum(dim=0).detach()
+            grad_x = torch.mm(grad_y_scaled, w_ternary).view(*x.shape[:-1], in_features)
+            grad_w = torch.mm(grad_y_scaled.T, x_flat)
+        else:
+            grad_x = F.linear(grad_output, w_ternary.T)
+            grad_w = torch.mm(grad_output_flat.T, x_flat)
+            grad_alpha = None
+        return grad_x, grad_w.float(), None, None, grad_alpha, None
 
 
 def ternary_quantize(weights: torch.Tensor) -> torch.Tensor:

@@ -224,6 +224,28 @@ Limited but coherent — expected for 8.5M ternary params trained for 15k steps 
 > python train.py --preset tiny --steps 15000 --dtype float16 --graph --data-cache tinydata --hybrid --mode ste
 > ```
 
+### STE robustness options (rank-collapse fixes, finding #11)
+
+The base STE checkpoint was rank-1 degenerate (every matrix `unique_rows=1`). These flags
+counteract the collapse; use them in the run above:
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--init balanced` | kaiming | Latent init = balanced ternary {-1,0,+1}×0.1 → quantize gives exactly 33/33/33 (vs 50%-zero kaiming) |
+| `--ortho-reg LAMBDA` | 0 | Add `LAMBDA × mean(|cos|−0.3)+` over sampled latent-row pairs to the loss |
+| `--rank-monitor-interval N` | 500 | Every N steps report unique ternary rows per matrix (`[Rank] layers.0.attn.q_proj:256/256 …`) |
+| `--rank-halt` | off | Stop training if any matrix collapses (`unique_rows ≤ rows/4`) |
+| `--save-best` | off | Keep `checkpoint_best.pt` (lowest val loss) instead of only the last step |
+| `--group-size N` | 0 | Learn per-group alphas (like SBF); alphas are exported into the v4/v6 alpha table |
+
+Example (STE with anti-collapse + learned per-group alphas):
+
+> ```bash
+> python train.py --preset tiny --steps 15000 --data-cache tinydata --hybrid --mode ste \
+>   --init balanced --ortho-reg 0.01 --rank-monitor-interval 500 --rank-halt --save-best \
+>   --group-size 32
+> ```
+
 ### Tiny 5.3M on TinyStories (SBF)
 
 Trained for 15,000 steps on Intel Iris Xe (DirectML) in ~9.4 hours:

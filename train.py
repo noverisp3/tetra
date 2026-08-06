@@ -129,7 +129,17 @@ def main():
     parser.add_argument("--per-channel", action="store_true",
                         help="[STE] Per-channel quantization threshold (instead of per-tensor)")
     parser.add_argument("--group-size", type=int, default=0,
-                        help="[Stochastic] Block size for per-group scaling alphas (default: 0 = off)")
+                        help="Block size for per-group scaling alphas (STE + Stochastic) (default: 0 = off)")
+    parser.add_argument("--init", type=str, default="kaiming", choices=["kaiming", "balanced"],
+                        help="[STE] Latent init: kaiming (default) or balanced 33/33/33 ternary (anti rank-collapse)")
+    parser.add_argument("--ortho-reg", type=float, default=0.0, metavar="LAMBDA",
+                        help="[STE] Orthogonalization penalty weight on latent rows (0 = off)")
+    parser.add_argument("--rank-monitor-interval", type=int, default=500,
+                        help="Report unique ternary rows per matrix every N steps (0 = off)")
+    parser.add_argument("--rank-halt", action="store_true",
+                        help="Halt training when a matrix collapses (unique_rows <= rows/4)")
+    parser.add_argument("--save-best", action="store_true",
+                        help="Keep checkpoint_best.pt (lowest validation loss)")
     parser.add_argument("--threshold", type=float, default=None,
                         help="[Stochastic] Bit-flip threshold (default: 20.0 / scale, auto-computed)")
     parser.add_argument("--threshold-decay-to", type=float, default=None,
@@ -230,6 +240,11 @@ def main():
     config.ternary_scale = args.ternary_scale
     config.per_channel = args.per_channel
     config.group_size = args.group_size
+    config.init_mode = args.init
+    config.ortho_reg = args.ortho_reg
+    config.rank_monitor_interval = args.rank_monitor_interval
+    config.rank_halt = args.rank_halt
+    config.save_best = args.save_best
     config.flip_every_n_steps = args.flip_every_n_steps
     config.threshold = args.threshold if args.threshold is not None else 20.0
     if args.threshold_decay_to is not None:
@@ -364,6 +379,8 @@ def main():
             ternary_scale=config.ternary_scale,
             per_channel=config.per_channel,
             topk=args.topk if args.topk is not None else 1.0,
+            group_size=config.group_size,
+            init_mode=config.init_mode,
         )
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -392,6 +409,9 @@ def main():
             if "latent_weights" in name
         )
         print(f"Mode: STE (latent weights)")
+        print(f"Init: {config.init_mode} | ortho-reg: {config.ortho_reg} | "
+              f"group-size: {config.group_size} | rank-monitor: {config.rank_monitor_interval}"
+              f"{' (halt)' if config.rank_halt else ''} | save-best: {config.save_best}")
         print(f"Total params: {total_params:,}")
         print(f"Ternary params: {ternary_params:,} ({ternary_params * 2 / 8 / 1024:.0f} KB packed)")
         print(f"FP32 params: {total_params - ternary_params:,} ({(total_params - ternary_params) * 4 / 1024:.0f} KB)")
@@ -456,6 +476,7 @@ def main():
     n_gen = output.size(1) - n_prompt
     generated = enc.decode(output[0].tolist())
     print(f"Prompt: {n_prompt} tokens -> Generated: {n_gen} tokens in {gen_time:.2f}s ({n_gen/gen_time:.1f} tok/s)")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print(f"\n{generated}\n")
 
 
