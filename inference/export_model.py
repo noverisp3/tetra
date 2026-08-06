@@ -38,7 +38,8 @@ from ternary_llm.transformer import (
     TernaryTransformerModel, StochasticTransformerModel, StochasticMLAModel,
 )
 
-TERNARY_ENCODING = {-1: 0b00, 0: 0b01, 1: 0b10}
+# v7: ±2 outliers map to code 11 (sign in the side-channel blob).
+TERNARY_ENCODING = {-1: 0b00, 0: 0b01, 1: 0b10, 2: 0b11, -2: 0b11}
 
 HEADER_V5_SIZE = 64
 METADATA_MAGIC = b"META"
@@ -49,7 +50,11 @@ METADATA_MAGIC = b"META"
 # ──────────────────────────────────────────────────────────────
 
 def pack_ternary(weights: torch.Tensor) -> bytes:
-    """Pack ternary weights {-1, 0, 1} into 2-bit encoding."""
+    """Pack ternary weights {-2, -1, 0, 1, 2} into 2-bit encoding.
+
+    ±2 outliers (v7) map to code 11; the sign lives in the side-channel
+    blob. v6 values never reach ±2, so v6 output is unchanged.
+    """
     flat = weights.cpu().numpy().astype(np.int8).flatten()
     n = len(flat)
     packed_len = (n + 3) // 4
@@ -186,12 +191,17 @@ def write_header_v5(f, *, vocab_size, hidden_dim, num_layers, num_heads,
     f.write(header)
 
 
-def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None, accumulator=None):
+def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None, accumulator=None,
+                        outlier_blob=None):
     """Write a ternary weight entry.
 
     When ``accumulator`` (FP32, rows*cols) is given the entry is written in
     v6 form: the FP32 accumulator follows the packed ternary data. This is the
     learning state that lets the C++ runtime keep self-learning across runs.
+
+    When ``outlier_blob`` (dense sign bits for code-11 ±2 weights, row-major
+    MSB-first) is given the entry is written in v7 form: a uint32 outlier
+    count followed by the sign blob is appended at the end of the entry.
     """
     nb = new_name.encode("utf-8")
     f.write(struct.pack("<I", len(nb)))
@@ -218,6 +228,46 @@ def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None, accumulator=
         acc = (accumulator.detach().float().cpu().numpy()
                if hasattr(accumulator, "cpu") else np.asarray(accumulator, dtype=np.float32))
         f.write(acc.reshape(-1).astype(np.float32).tobytes())
+
+    if outlier_blob is not None:
+        n_outliers = int((tensor.abs() > 1.5).sum())
+        f.write(struct.pack("<I", n_outliers))
+        # Fused gate+up blobs are concatenated per-sub-blob byte-padded; the
+        # dense outlier bits (MSB-first) are repacked so the blob is exactly
+        # ceil(n_outliers/8) bytes. No-op for single-module blobs.
+        bits = np.unpackbits(np.frombuffer(outlier_blob, dtype=np.uint8))
+        blob = np.packbits(bits[:n_outliers]).tobytes()
+        f.write(blob)
+
+
+def count_outliers_in_packed(packed: torch.Tensor) -> int:
+    """Count code-11 (outlier) weights in a packed uint8 tensor (per 2-bit code).
+
+    NOTE: bool ``+`` is OR for both torch and numpy tensors, so the four
+    comparisons are cast to integer before summing to get per-weight counts.
+    """
+    arr = packed.detach().cpu().numpy().astype(np.uint16)
+    c0 = (arr >> 6) & 3
+    c1 = (arr >> 4) & 3
+    c2 = (arr >> 2) & 3
+    c3 = arr & 3
+    return int(((c0 == 3).astype(np.int64) + (c1 == 3).astype(np.int64)
+                + (c2 == 3).astype(np.int64) + (c3 == 3).astype(np.int64)).sum())
+
+
+def _fuse_blobs(gate_blob: bytes, up_blob: bytes, g_n: int, u_n: int) -> bytes:
+    """Concatenate two dense sign blobs, stripping per-blob byte padding.
+
+    Each sub-blob is byte-padded, so a raw concat misaligns the second stream
+    whenever the first ends mid-byte. Only the first ``g_n``/``u_n`` bits are
+    valid; the fused blob is exactly ``ceil((g_n + u_n) / 8)`` bytes.
+    """
+    bits = np.unpackbits(np.frombuffer(gate_blob, dtype=np.uint8))[:g_n]
+    bits = np.concatenate([
+        bits,
+        np.unpackbits(np.frombuffer(up_blob, dtype=np.uint8))[:u_n],
+    ])
+    return np.packbits(bits).tobytes()
 
 
 def write_fp32_entry(f, name, param, quantize_int8=False):
@@ -324,9 +374,13 @@ def detect_model_info(model) -> dict:
 # Export: STE mode
 # ──────────────────────────────────────────────────────────────
 
-def export_ste(f, model, quantize_int8=False):
-    """Export STE-mode ternary weights (per-channel Δ + per-group alphas)."""
-    from ternary_llm.quantization import TernaryQuantizer
+def export_ste(f, model, quantize_int8=False, v7=False):
+    """Export STE-mode ternary weights (per-channel Δ + per-group alphas).
+
+    v7: |W| > 1.5Δ weights are exported as ±2 outliers (code 11) with their
+    signs in a per-entry side-channel blob.
+    """
+    from ternary_llm.quantization import TernaryQuantizer, pack_sign_blob
 
     for name, param in model.named_parameters():
         is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
@@ -338,11 +392,12 @@ def export_ste(f, model, quantize_int8=False):
             mod = getattr(mod, part)
         if getattr(mod, "per_channel", False):
             delta = param.detach().abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * mod.ternary_scale
-            w_ternary = (param.detach() / delta).clamp(-1, 1).round()
+            w_ternary = (param.detach() / delta).round().clamp(-2, 2)
         else:
             w_ternary = TernaryQuantizer.apply(param.data)
+        blob = pack_sign_blob(w_ternary) if v7 else None
         w_ternary = w_ternary.to(torch.int8)
-        write_ternary_entry(f, w_ternary, name, mod)
+        write_ternary_entry(f, w_ternary, name, mod, outlier_blob=blob)
 
     for name, param in model.named_parameters():
         is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
@@ -355,9 +410,35 @@ def export_ste(f, model, quantize_int8=False):
 # Export: Stochastic mode
 # ──────────────────────────────────────────────────────────────
 
-def export_stochastic(f, model, quantize_int8=False):
-    """Export stochastic-mode ternary weights with gate+up fusion."""
+def export_stochastic(f, model, quantize_int8=False, v7=False):
+    """Export stochastic-mode ternary weights with gate+up fusion.
+
+    v7: code-11 outlier signs are written per entry from the module's
+    side-channel buffer. v6/v7 entries always carry a zero FP32 accumulator so
+    the binary layout is uniform (packed + accumulator + optional blob) and
+    the C++ reader never has to guess whether the accumulator is present.
+    """
     from ternary_llm.quantization import unpack_ternary_tensor as _unpack
+
+    def _zero_acc(shape) -> torch.Tensor:
+        n = int(shape[0]) * int(shape[1])
+        return torch.zeros(n, dtype=torch.float32)
+
+    def _blob_of(mod) -> bytes | None:
+        """Trimmed sign bits for the module's actual outlier count.
+
+        In v7 mode always returns bytes (possibly empty) so every v7 ternary
+        entry carries a trailing uint32 outlier count + blob.
+        """
+        if mod is None or not hasattr(mod, "outlier_signs"):
+            return None
+        if not v7:
+            return None
+        n = count_outliers_in_packed(mod.packed_weights)
+        if n == 0:
+            return b""
+        nb = (n + 7) // 8
+        return mod.outlier_signs.detach().cpu().numpy()[:nb].tobytes()
 
     buffers = dict(model.named_buffers())
     written = set()
@@ -379,25 +460,36 @@ def export_stochastic(f, model, quantize_int8=False):
                 continue
             written.add(up_name)
             s = get_stochastic_shape(model, name)
-            gate_w = _unpack(buf, s)
-            up_w = _unpack(buffers[up_name], s)
-            fused = torch.cat([gate_w, up_w], dim=0).to(torch.int8)
-            new_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
             gate_mod = get_stochastic_module(model, name)
             up_mod = get_stochastic_module(model, up_name)
+            gate_w = _unpack(buf, s, gate_mod.outlier_signs if v7 else None)
+            up_w = _unpack(buffers[up_name], s, up_mod.outlier_signs if v7 else None)
+            fused = torch.cat([gate_w, up_w], dim=0).to(torch.int8)
+            new_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
+            fused_blob = None
+            if v7:
+                gb, ub = _blob_of(gate_mod), _blob_of(up_mod)
+                fused_blob = _fuse_blobs(
+                    gb or b"", ub or b"",
+                    count_outliers_in_packed(gate_mod.packed_weights),
+                    count_outliers_in_packed(up_mod.packed_weights),
+                )
             if gate_mod.alphas is not None:
                 combined = torch.cat([gate_mod.alphas, up_mod.alphas])
-                write_ternary_entry(fused, new_name, alphas=combined)
+                write_ternary_entry(fused, new_name, alphas=combined,
+                                    accumulator=_zero_acc(fused.shape), outlier_blob=fused_blob)
             else:
-                write_ternary_entry(fused, new_name)
+                write_ternary_entry(f, fused, new_name, accumulator=_zero_acc(fused.shape),
+                                    outlier_blob=fused_blob)
         elif "up_proj" in name and f"layers.{layer_idx}.ffn" in name:
             continue
         else:
             s = get_stochastic_shape(model, name)
-            w = _unpack(buf, s).to(torch.int8)
-            new_name = prefix + ".latent_weights"
             mod = get_stochastic_module(model, name)
-            write_ternary_entry(f, w, new_name, mod)
+            w = _unpack(buf, s, mod.outlier_signs if v7 else None).to(torch.int8)
+            new_name = prefix + ".latent_weights"
+            write_ternary_entry(f, w, new_name, mod, accumulator=_zero_acc(w.shape),
+                                outlier_blob=_blob_of(mod))
 
     for name, param in model.named_parameters():
         if name == "lm_head.weight":
@@ -414,12 +506,16 @@ def export_self_learning(
     rule="c", threshold=20.0, acc_decay=0.99, flip_every_n=5,
     logit_scale=1.0 / 16.0, lr_embedding=1e-4, wd_embedding=0.1,
     block_size=128, toggle=False, reset_accs=False, metadata=None, verbose=True,
+    v7=False,
 ):
-    """Export a stochastic model to binary format v6 for the C++ self-learning runtime.
+    """Export a stochastic model to binary format v6/v7 for the C++ self-learning runtime.
 
     v6 = v5 + per-ternary FP32 accumulators (learning state) + ``sl_*`` config
     in the metadata JSON. The token embedding is written as FP32 (mutable) so
     the runtime can keep applying its local SGD.
+
+    v7 = v6 + code-11 outlier signs (dense side-channel blob per entry).
+    The C++ runtime resolves the outlier magnitude (±2α) at staging time.
 
     ``reset_accs`` zeroes every exported accumulator: the Python accumulator
     state is transient and unsafe to replay on device (finding #10) — toggled
@@ -427,6 +523,22 @@ def export_self_learning(
     """
     model.eval()
     from ternary_llm.quantization import unpack_ternary_tensor as _unpack
+
+    def _blob_of(mod) -> bytes | None:
+        """Trimmed sign bits for the module's actual outlier count.
+
+        In v7 mode always returns bytes (possibly empty) so every v7 ternary
+        entry carries a trailing uint32 outlier count + blob.
+        """
+        if mod is None or not hasattr(mod, "outlier_signs"):
+            return None
+        if not v7:
+            return None
+        n = count_outliers_in_packed(mod.packed_weights)
+        if n == 0:
+            return b""
+        nb = (n + 7) // 8
+        return mod.outlier_signs.detach().cpu().numpy()[:nb].tobytes()
 
     info = detect_model_info(model)
     ternary_count = info["ternary_count"]
@@ -440,7 +552,7 @@ def export_self_learning(
 
     if verbose:
         print(f"\n{'='*50}")
-        print(f"  Tetra Export v6 (self-learning)")
+        print(f"  Tetra Export v{'7' if v7 else '6'} (self-learning)")
         print(f"{'='*50}")
         print(f"  Rule:          {rule}  (c=predictive coding)")
         print(f"  Threshold:     {threshold}")
@@ -476,7 +588,7 @@ def export_self_learning(
             rope_per_head=info.get("rope_per_head", 0),
             group_size=info.get("group_size", 0),
             int8_embeddings=False,
-            version=6,
+            version=7 if v7 else 6,
         )
 
         written = set()
@@ -500,28 +612,38 @@ def export_self_learning(
                     continue
                 written.add(up_name)
                 s = get_stochastic_shape(model, name)
-                gate_w = _unpack(buf, s)
-                up_w = _unpack(buffers[up_name], s)
+                gate_mod = get_stochastic_module(model, name)
+                up_mod = get_stochastic_module(model, up_name)
+                gate_w = _unpack(buf, s, gate_mod.outlier_signs if v7 else None)
+                up_w = _unpack(buffers[up_name], s, up_mod.outlier_signs if v7 else None)
                 fused = torch.cat([gate_w, up_w], dim=0).to(torch.int8)
                 new_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
                 up_acc = acc_buffers.get(prefix.replace("gate_proj", "up_proj") + ".accumulator")
                 fused_acc = (torch.cat([acc, up_acc], dim=0) if acc is not None and up_acc is not None else None)
-                gate_mod = get_stochastic_module(model, name)
-                up_mod = get_stochastic_module(model, up_name)
+                fused_blob = None
+                if v7:
+                    gb, ub = _blob_of(gate_mod), _blob_of(up_mod)
+                    fused_blob = _fuse_blobs(
+                        gb or b"", ub or b"",
+                        count_outliers_in_packed(gate_mod.packed_weights),
+                        count_outliers_in_packed(up_mod.packed_weights),
+                    )
                 if gate_mod.alphas is not None:
                     combined = torch.cat([gate_mod.alphas, up_mod.alphas])
                     write_ternary_entry(f, fused, new_name, alphas=combined,
-                                        accumulator=fused_acc)
+                                        accumulator=fused_acc, outlier_blob=fused_blob)
                 else:
-                    write_ternary_entry(f, fused, new_name, accumulator=fused_acc)
+                    write_ternary_entry(f, fused, new_name, accumulator=fused_acc,
+                                        outlier_blob=fused_blob)
             elif "up_proj" in name and f"layers.{layer_idx}.ffn" in name:
                 continue
             else:
                 s = get_stochastic_shape(model, name)
-                w = _unpack(buf, s).to(torch.int8)
-                new_name = prefix + ".latent_weights"
                 mod = get_stochastic_module(model, name)
-                write_ternary_entry(f, w, new_name, mod, accumulator=acc)
+                w = _unpack(buf, s, mod.outlier_signs if v7 and mod.outlier_signs.numel() else None).to(torch.int8)
+                new_name = prefix + ".latent_weights"
+                write_ternary_entry(f, w, new_name, mod, accumulator=acc,
+                                    outlier_blob=_blob_of(mod))
 
         # FP32 weights (embedding must stay FP32 for local SGD)
         for name, param in model.named_parameters():
@@ -531,8 +653,13 @@ def export_self_learning(
             write_fp32_entry(f, name, param, quantize_int8=False if is_embed else False)
 
         meta = dict(metadata) if metadata else {}
+        outlier_mult = 3.0
+        for m in model.modules():
+            if hasattr(m, "outlier_thr_mult"):
+                outlier_mult = float(m.outlier_thr_mult)
+                break
         meta.update({
-            "_export_version": 6,
+            "_export_version": 7 if v7 else 6,
             "_export_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "sl_rule": rule,
             "sl_threshold": float(threshold),
@@ -543,6 +670,7 @@ def export_self_learning(
             "sl_lr_embedding": float(lr_embedding),
             "sl_wd_embedding": float(wd_embedding),
             "sl_block_size": int(block_size),
+            "sl_outlier_mult": float(outlier_mult),
             "_info": {k: v for k, v in info.items() if k != "mode"},
         })
         write_metadata(f, meta)
@@ -561,7 +689,7 @@ def export_self_learning(
 # ──────────────────────────────────────────────────────────────
 
 def export_model(model, output_path, mode="ste", quantize_int8=False,
-                 metadata=None, verbose=True):
+                 metadata=None, verbose=True, v7=False):
     """Export model weights to binary format.
 
     Args:
@@ -571,6 +699,7 @@ def export_model(model, output_path, mode="ste", quantize_int8=False,
         quantize_int8: quantize all FP32 weights to INT8
         metadata: optional dict to store as JSON metadata section
         verbose: print detailed stats
+        v7: write code-11 outlier side-channel (format version 7)
     """
     model.eval()
 
@@ -617,18 +746,19 @@ def export_model(model, output_path, mode="ste", quantize_int8=False,
             rope_per_head=info.get("rope_per_head", 0),
             group_size=info.get("group_size", 0),
             int8_embeddings=info.get("int8_embeddings", False),
+            version=7 if v7 else 5,
         )
 
         # Write ternary + FP32 weights
         if mode == "stochastic":
-            export_stochastic(f, model, quantize_int8=quantize_int8)
+            export_stochastic(f, model, quantize_int8=quantize_int8, v7=v7)
         else:
-            export_ste(f, model, quantize_int8=quantize_int8)
+            export_ste(f, model, quantize_int8=quantize_int8, v7=v7)
 
         # Write metadata section
         if metadata:
             meta = dict(metadata)
-            meta["_export_version"] = 5
+            meta["_export_version"] = 7 if v7 else 5
             meta["_export_time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             meta["_info"] = {
                 k: v for k, v in info.items()
@@ -700,6 +830,8 @@ Examples:
                         help="Anti-stiction toggle kicks in the C++ self-learning runtime")
     parser.add_argument("--sl-reset-acc", action="store_true",
                         help="Write zeroed accumulators (safe default for toggled runs; the Python acc state is transient — finding #10)")
+    parser.add_argument("--v7", action="store_true",
+                        help="Write v7 format: code-11 outlier (±2) side-channel blobs (header version 7)")
     args = parser.parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -725,7 +857,7 @@ Examples:
             topk=config.get("topk", 1.0),
             group_size=config.get("group_size", 0),
         )
-        model.load_state_dict(sd)
+        model.load_state_dict(sd, strict=False)
 
         logit_scale = 1.0 / (config["hidden_dim"] ** 0.5)
         metadata = dict(config) if not args.no_metadata else {}
@@ -750,6 +882,7 @@ Examples:
             reset_accs=args.sl_reset_acc,
             metadata=metadata,
             verbose=not args.quiet,
+            v7=args.v7,
         )
         return
 
@@ -831,6 +964,7 @@ Examples:
         quantize_int8=args.quantize_int8,
         metadata=metadata,
         verbose=not args.quiet,
+        v7=args.v7,
     )
 
     # Auto-verify

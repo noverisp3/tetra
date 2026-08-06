@@ -148,6 +148,8 @@ def main():
                         help="[Stochastic] Use INT8 forward matmul (quantize activations to int8)")
     parser.add_argument("--topk", type=float, default=None,
                         help="Keep top-k fraction of activations after norm (e.g. 0.2 = 20%%, default: 1.0 = off)")
+    parser.add_argument("--outlier-thr-mult", type=float, default=3.0,
+                        help="[Stochastic] Promote weight to ±2 outlier when |acc| exceeds this × threshold (default: 3.0)")
     parser.add_argument("--flip-every-n-steps", type=int, default=5,
                         help="[Stochastic] Check threshold & flip bits every N optimizer steps (default: 5)")
     parser.add_argument("--graph", action="store_true",
@@ -352,6 +354,7 @@ def main():
                 group_size=config.group_size,
                 kv_latent_dim=args.kv_latent_dim,
                 rope_per_head=args.rope_per_head,
+                outlier_thr_mult=args.outlier_thr_mult,
             )
         else:
             model = StochasticTransformerModel(
@@ -367,6 +370,7 @@ def main():
                 topk=args.topk if args.topk is not None else 1.0,
                 per_channel=config.per_channel,
                 group_size=config.group_size,
+                outlier_thr_mult=args.outlier_thr_mult,
             )
     else:
         model = TernaryTransformerModel(

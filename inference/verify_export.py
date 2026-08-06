@@ -15,7 +15,20 @@ from ternary_llm.transformer import (
 )
 
 
-TERNARY_REVERSE = {0b00: -1, 0b01: 0, 0b10: 1, 0b11: 0}
+# v7: code 11 = outlier ±2 (magnitude 2; sign lives in the side-channel blob,
+# re-derived from the .pt checkpoint during comparison). v6 files never emit
+# code 11, so mapping it to 2 is safe for both.
+TERNARY_REVERSE = {0b00: -1, 0b01: 0, 0b10: 1, 0b11: 2}
+
+
+def apply_sign_blob(flat: np.ndarray, blob: bytes, n_outliers: int) -> np.ndarray:
+    """Apply v7 dense sign bits (MSB-first, 1 = positive) to code-11 entries."""
+    bits = np.unpackbits(np.frombuffer(blob, dtype=np.uint8))[:n_outliers]
+    signs = bits.astype(np.float32) * 2.0 - 1.0
+    out = flat.copy()
+    mask = np.abs(out) > 1.5
+    out[mask] = out[mask] * signs
+    return out
 
 
 def unpack_ternary(data: bytes, n: int) -> np.ndarray:
@@ -74,10 +87,11 @@ def load_binary_model(path: str) -> tuple[dict, dict]:
 
         # Ternary weights: peek name suffix to distinguish from FP32
         ternary_count_loaded = 0
-        while f.tell() < f.seek(0, 2) - 4:
-            f.seek(0)
-            f.seek(f.tell())  # noop, just checking position
+        while True:
             peek_pos = f.tell()
+            if peek_pos >= f.seek(0, 2):
+                break
+            f.seek(peek_pos)
             name_len_data = f.read(4)
             if len(name_len_data) < 4:
                 break
@@ -112,6 +126,21 @@ def load_binary_model(path: str) -> tuple[dict, dict]:
             packed_size = (rows * cols + 3) // 4
             packed_data = f.read(packed_size)
             arr = unpack_ternary(packed_data, rows * cols).reshape(rows, cols)
+
+            if version >= 6:
+                f.read(rows * cols * 4)  # skip FP32 accumulator (v6/v7)
+
+            if version >= 7:
+                # v7: trailing uint32 outlier count + dense sign blob (MSB-first,
+                # row-major scan order, 1 = positive). Signs resolve code-11 ±2.
+                n_outliers = struct.unpack("<I", f.read(4))[0]
+                if n_outliers > 0:
+                    nbytes = (n_outliers + 7) // 8
+                    blob = f.read(nbytes)
+                    flat = arr.reshape(-1)
+                    flat = apply_sign_blob(flat, blob, n_outliers)
+                    arr = flat.reshape(rows, cols)
+
             weights[name] = arr
             ternary_count_loaded += 1
 
@@ -212,7 +241,7 @@ def verify_export(checkpoint_path: str, binary_path: str, mode: str = None,
         )
         print(f"Mode: STE")
 
-    model.load_state_dict(sd)
+    model.load_state_dict(sd, strict=False)
     model.eval()
 
     # Load binary
@@ -243,18 +272,21 @@ def verify_export(checkpoint_path: str, binary_path: str, mode: str = None,
                 up_name = name.replace("gate_proj", "up_proj")
                 if up_name not in buffers:
                     continue
-                from inference.export_model import get_stochastic_shape
+                from inference.export_model import get_stochastic_shape, get_stochastic_module
                 s = get_stochastic_shape(model, name)
-                gate_w = _unpack(buf, s)
-                up_w = _unpack(buffers[up_name], s)
+                gate_mod = get_stochastic_module(model, name)
+                up_mod = get_stochastic_module(model, up_name)
+                gate_w = _unpack(buf, s, gate_mod.outlier_signs if header_info.get("version", 0) >= 7 else None)
+                up_w = _unpack(buffers[up_name], s, up_mod.outlier_signs if header_info.get("version", 0) >= 7 else None)
                 fused = torch.cat([gate_w, up_w], dim=0).to(torch.int8)
                 bin_name = prefix.replace("gate_proj", "gate_up_proj") + ".latent_weights"
             elif "up_proj" in name and f"layers.{layer_idx}.ffn" in name:
                 continue
             else:
-                from inference.export_model import get_stochastic_shape
+                from inference.export_model import get_stochastic_shape, get_stochastic_module
                 s = get_stochastic_shape(model, name)
-                fused = _unpack(buf, s).to(torch.int8)
+                mod = get_stochastic_module(model, name)
+                fused = _unpack(buf, s, mod.outlier_signs if header_info.get("version", 0) >= 7 else None).to(torch.int8)
                 bin_name = prefix + ".latent_weights"
 
             if bin_name not in bin_weights:

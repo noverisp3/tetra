@@ -363,7 +363,7 @@ int main(int argc, char** argv) {
                 const size_t n = w.floats.size();
                 std::vector<float> before(n);
                 memcpy(before.data(), w.floats.data(), n * sizeof(float));
-                total_flips += apply_bit_flips(w, eff_thr, eff_toggle);
+                total_flips += apply_bit_flips(w, eff_thr, eff_toggle, model.sl_outlier_mult);
                 const float* f = w.floats.data();
                 for (size_t i = 0; i < n; i++)
                     if (f[i] != before[i]) { hist[i]++; real_changes++; }

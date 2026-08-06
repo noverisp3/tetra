@@ -120,7 +120,7 @@ def main():
         ffn_dim=cfg["ffn_dim"], max_seq_len=cfg["max_seq_len"],
         threshold=cfg["threshold"],
     )
-    model.load_state_dict(sd)
+    model.load_state_dict(sd, strict=False)
     model.eval()
     scale = 1.0 / math.sqrt(cfg["hidden_dim"])
 

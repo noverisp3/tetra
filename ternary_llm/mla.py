@@ -97,6 +97,7 @@ class StochasticMLAAttention(nn.Module):
         group_size: int = 0,
         kv_latent_dim: Optional[int] = None,
         rope_per_head: Optional[int] = None,
+        outlier_thr_mult: float = 3.0,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -118,31 +119,31 @@ class StochasticMLAAttention(nn.Module):
         # 7 ternary projections per layer (vs 4 in standard attention)
         self.q_proj = StochasticTernaryLinear(
             hidden_dim, hidden_dim, scale=scale, threshold=threshold,
-            int8=int8, per_channel=per_channel, group_size=group_size,
+            int8=int8, per_channel=per_channel, group_size=group_size, outlier_thr_mult=outlier_thr_mult,
         )
         self.kv_down_proj = StochasticTernaryLinear(
             hidden_dim, self.kv_latent_dim, scale=scale, threshold=threshold,
-            int8=int8, per_channel=per_channel, group_size=group_size,
+            int8=int8, per_channel=per_channel, group_size=group_size, outlier_thr_mult=outlier_thr_mult,
         )
         self.k_up_proj = StochasticTernaryLinear(
             self.kv_latent_dim, hidden_dim, scale=scale, threshold=threshold,
-            int8=int8, per_channel=per_channel, group_size=group_size,
+            int8=int8, per_channel=per_channel, group_size=group_size, outlier_thr_mult=outlier_thr_mult,
         )
         self.v_up_proj = StochasticTernaryLinear(
             self.kv_latent_dim, hidden_dim, scale=scale, threshold=threshold,
-            int8=int8, per_channel=per_channel, group_size=group_size,
+            int8=int8, per_channel=per_channel, group_size=group_size, outlier_thr_mult=outlier_thr_mult,
         )
         self.q_rope_proj = StochasticTernaryLinear(
             hidden_dim, self.rope_dim, scale=scale, threshold=threshold,
-            int8=int8, per_channel=per_channel, group_size=group_size,
+            int8=int8, per_channel=per_channel, group_size=group_size, outlier_thr_mult=outlier_thr_mult,
         )
         self.k_rope_proj = StochasticTernaryLinear(
             hidden_dim, self.rope_dim, scale=scale, threshold=threshold,
-            int8=int8, per_channel=per_channel, group_size=group_size,
+            int8=int8, per_channel=per_channel, group_size=group_size, outlier_thr_mult=outlier_thr_mult,
         )
         self.o_proj = StochasticTernaryLinear(
             hidden_dim, hidden_dim, scale=scale, threshold=threshold,
-            int8=int8, per_channel=per_channel, group_size=group_size,
+            int8=int8, per_channel=per_channel, group_size=group_size, outlier_thr_mult=outlier_thr_mult,
         )
         self.attn_dropout = nn.Dropout(dropout)
         self.register_buffer("freqs_cis", None, persistent=False)

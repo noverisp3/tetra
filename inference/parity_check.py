@@ -104,7 +104,7 @@ def main():
         topk=config.get("topk", 1.0),
         group_size=config.get("group_size", 0),
     )
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
     buffers = dict(model.named_buffers())
 
