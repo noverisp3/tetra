@@ -60,18 +60,41 @@ class TernaryLinear(nn.Module):
         bias: bool = False,
         ternary_scale: float = 0.7,
         per_channel: bool = False,
+        group_size: int = 0,
+        init_mode: str = "kaiming",
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.ternary_scale = ternary_scale
         self.per_channel = per_channel
+        self.group_size = group_size
+        self.num_groups = (in_features + group_size - 1) // group_size if group_size > 0 else 0
 
         # Latent weights (FP32) - shadow weights for gradient updates
         self.latent_weights = nn.Parameter(
             torch.empty(out_features, in_features)
         )
-        nn.init.kaiming_uniform_(self.latent_weights, a=math.sqrt(5))
+        if init_mode == "balanced":
+            # Latent = balanced ternary {-1, 0, +1} x 0.1 so quantize gives
+            # exactly 33/33/33 instead of the sparse 50%-zero kaiming init
+            # that collapses to rank-1 (finding #11).
+            t = torch.zeros(out_features * in_features, dtype=torch.float32)
+            each = (out_features * in_features) // 3
+            idx = torch.randperm(out_features * in_features)
+            t[idx[:each]] = 0.1
+            t[idx[each:2 * each]] = -0.1
+            self.latent_weights.data.copy_(t.view(out_features, in_features))
+        else:
+            nn.init.kaiming_uniform_(self.latent_weights, a=math.sqrt(5))
+
+        # Per-group / per-channel scaling alphas (FP32, trainable)
+        if group_size > 0:
+            self.alphas = nn.Parameter(torch.ones(out_features, self.num_groups))
+        elif per_channel:
+            self.alphas = nn.Parameter(torch.ones(out_features))
+        else:
+            self.register_parameter("alphas", None)
 
         # No bias following BitNet design
         if bias:
@@ -88,7 +111,10 @@ class TernaryLinear(nn.Module):
         Returns:
             Output tensor (..., out_features)
         """
-        output = FusedTernaryLinear.apply(x, self.latent_weights, self.ternary_scale, self.per_channel)
+        output = FusedTernaryLinear.apply(
+            x, self.latent_weights, self.ternary_scale, self.per_channel,
+            self.alphas, self.group_size,
+        )
         if self.bias is not None:
             output = output + self.bias
         return output

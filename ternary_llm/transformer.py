@@ -56,6 +56,8 @@ class TernaryTransformerBlock(nn.Module):
         ternary_scale: float = 0.7,
         per_channel: bool = False,
         topk: float = 1.0,
+        group_size: int = 0,
+        init_mode: str = "kaiming",
     ):
         super().__init__()
 
@@ -67,6 +69,8 @@ class TernaryTransformerBlock(nn.Module):
             dropout=dropout,
             ternary_scale=ternary_scale,
             per_channel=per_channel,
+            group_size=group_size,
+            init_mode=init_mode,
         )
 
         self.ffn_norm = RMSNorm(hidden_dim)
@@ -77,6 +81,8 @@ class TernaryTransformerBlock(nn.Module):
             dropout=dropout,
             ternary_scale=ternary_scale,
             per_channel=per_channel,
+            group_size=group_size,
+            init_mode=init_mode,
         )
 
     def forward(
@@ -144,6 +150,8 @@ class TernaryTransformerModel(nn.Module):
         ternary_scale: float = 0.7,
         per_channel: bool = False,
         topk: float = 1.0,
+        group_size: int = 0,
+        init_mode: str = "kaiming",
     ):
         super().__init__()
 
@@ -162,6 +170,8 @@ class TernaryTransformerModel(nn.Module):
                 ternary_scale=ternary_scale,
                 per_channel=per_channel,
                 topk=topk,
+                group_size=group_size,
+                init_mode=init_mode,
             )
             for _ in range(num_layers)
         ])

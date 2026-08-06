@@ -165,6 +165,13 @@ class TrainingConfig:
     ternary_scale: float = 0.7  # Δ = scale x mean(|W|), lower -> more {-1,+1}, higher -> more 0
     per_channel: bool = False    # Per-channel vs per-tensor threshold
 
+    # STE robustness (rank-collapse fixes, finding #11)
+    init_mode: str = "kaiming"   # "kaiming" or "balanced" (33/33/33 ternary init)
+    ortho_reg: float = 0.0       # orthogonalization penalty weight on latent rows
+    rank_monitor_interval: int = 500  # unique-rows report cadence (0 = off)
+    rank_halt: bool = False      # halt training when any matrix collapses (unique_rows <= rows/4)
+    save_best: bool = False      # keep best-by-val checkpoint (checkpoint_best.pt)
+
     # Data
     data_dir: str = "data"
     block_size: int = 128
@@ -332,6 +339,11 @@ class TernaryTrainer:
         self.micro_steps = 0
         self._has_grads = False
 
+        # Best-checkpoint tracking
+        self.best_val_loss = float("inf")
+        self.best_step = -1
+        self._rank_halted = False
+
         # Initial memory snapshot
         self.log_mem("init")
 
@@ -363,6 +375,9 @@ class TernaryTrainer:
         t0 = time.perf_counter()
         _, loss, _ = self.model(x, y, activation_dtype=self.activation_dtype)
         t1 = time.perf_counter()
+
+        if self.config.ortho_reg > 0:
+            loss = loss + self.config.ortho_reg * self._ortho_penalty()
         raw_loss = loss.item()
         if not math.isfinite(raw_loss):
             self.model.zero_grad(set_to_none=True)
@@ -389,6 +404,71 @@ class TernaryTrainer:
             if id(p) not in seen:
                 seen.add(id(p))
                 yield p
+
+    def _ortho_penalty(self, margin: float = 0.3, k: int = 64) -> torch.Tensor:
+        """L2 orthogonality penalty on sampled latent-weight row pairs.
+
+        Mean over (|cosine| - margin)+ for random row pairs of each ternary
+        matrix. Counteracts the rank-1 collapse of finding #11.
+        """
+        total = None
+        count = 0
+        for name, p in self.model.named_parameters():
+            if "latent_weights" not in name or p.ndim != 2:
+                continue
+            out, inn = p.shape
+            kk = min(out, k)
+            idx = torch.randperm(out, device=p.device)[:kk]
+            rows = p[idx]
+            rows = rows / (rows.norm(dim=1, keepdim=True) + 1e-8)
+            g = rows @ rows.T
+            off = torch.triu(g, diagonal=1)
+            term = (off.abs().clamp_min(margin) - margin).mean()
+            total = term if total is None else total + term
+            count += 1
+        return total / max(count, 1) if total is not None else torch.zeros((), device=self.device)
+
+    @torch.no_grad()
+    def report_rank(self) -> bool:
+        """Count unique ternary rows per matrix; warn on collapse.
+
+        Collapse threshold: unique_rows <= rows/4 (finding #11: base checkpoint
+        had unique_rows=1). Returns False if halt requested and any matrix is
+        collapsed.
+        """
+        from .quantization import TernaryQuantizer, unpack_ternary_tensor
+
+        worst = []
+        halted = False
+        for name, mod in self.model.named_modules():
+            w = None
+            if hasattr(mod, "latent_weights") and mod.latent_weights is not None:
+                w = mod.latent_weights
+            elif hasattr(mod, "packed_weights") and mod.packed_weights is not None:
+                w = unpack_ternary_tensor(mod.packed_weights, (mod.out_features, mod.in_features))
+            if w is None:
+                continue
+            if hasattr(mod, "latent_weights"):
+                if getattr(mod, "per_channel", False):
+                    delta = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) \
+                        * getattr(mod, "ternary_scale", 0.7)
+                    wt = (w / delta).clamp(-1, 1).round()
+                else:
+                    wt = TernaryQuantizer.apply(w.data)
+            else:
+                wt = w
+            wt = wt.to("cpu")
+            rows = wt.shape[0]
+            n_unique = int(torch.unique(wt, dim=0).shape[0])
+            frac = n_unique / rows
+            worst.append((frac, name, n_unique, rows))
+            if frac < 0.25:
+                halted = True
+        worst.sort()
+        print("[Rank] " + " | ".join(f"{n}:{u}/{r}" for _, n, u, r in worst))
+        if halted:
+            print("[Rank] COLLAPSE detected" + (" — halting training" if self.config.rank_halt else ""))
+        return not halted
 
     def _hybrid_sync_gradients(self):
         """Copy gradients from GPU model to CPU params."""
@@ -521,6 +601,17 @@ class TernaryTrainer:
                 if step % self.config.eval_interval == 0:
                     val_loss = self.validate()
                     self.val_losses.append(val_loss)
+                    if self.config.save_best and math.isfinite(val_loss) and val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.best_step = step
+                        self.save_checkpoint(step, best=True)
+
+                # Rank monitor (unique ternary rows per matrix)
+                if (self.config.rank_monitor_interval > 0
+                        and step % self.config.rank_monitor_interval == 0
+                        and not self.report_rank()):
+                    self._rank_halted = True
+                    break
 
                 # Checkpoint
                 if step % self.config.save_interval == 0:
@@ -576,11 +667,12 @@ class TernaryTrainer:
                 dequantized[k] = v
         return dequantized
 
-    def save_checkpoint(self, step: int):
+    def save_checkpoint(self, step: int, best: bool = False):
         """Save model checkpoint and keep only the 3 most recent.
 
         STE mode: latent weights -> FP16, optimizer states -> FP16.
         Stochastic mode: packed ternary + accumulators saved directly.
+        best=True writes checkpoint_best.pt (kept until a better one).
         """
         is_stochastic = self.config.mode == "stochastic"
 
@@ -625,13 +717,17 @@ class TernaryTrainer:
                 return obj.cpu()
             return obj
 
-        path = Path(self.config.save_dir) / f"checkpoint_{step:06d}.pt"
+        path = Path(self.config.save_dir) / ("checkpoint_best.pt" if best else f"checkpoint_{step:06d}.pt")
         torch.save(_to_cpu(checkpoint), path)
         size_mb = path.stat().st_size / 1024 / 1024
-        print(f"Checkpoint saved to {path} ({size_mb:.0f} MB)")
+        print(f"Checkpoint saved to {path} ({size_mb:.0f} MB)" + (f" [best val {self.best_val_loss:.4f}]" if best else ""))
+
+        if best:
+            return
 
         # Cleanup: keep only 3 most recent checkpoints
         checkpoints = sorted(Path(self.config.save_dir).glob("checkpoint_*.pt"))
+        checkpoints = [c for c in checkpoints if "best" not in c.name]
         while len(checkpoints) > 3:
             oldest = checkpoints.pop(0)
             oldest.unlink()
@@ -715,6 +811,8 @@ class TernaryTrainer:
         self.train_log_steps = checkpoint.get("train_log_steps", [])
         self.val_losses = checkpoint.get("val_losses", [])
         self.learning_rates = checkpoint.get("learning_rates", [])
+        if self.config.save_best and self.val_losses:
+            self.best_val_loss = min(self.val_losses)
         print(f"Checkpoint loaded from {path} (step {checkpoint['step']})")
         print(f"Restored {len(self.train_losses)} train losses, {len(self.val_losses)} val losses")
         return checkpoint["step"]
@@ -760,13 +858,20 @@ class TernaryTrainer:
         while step < self.config.max_steps:
             step = self.train_epoch(step)
 
+            if self._rank_halted:
+                print(f"\nHalted by rank monitor at step {step}")
+                break
+
             if step < self.config.max_steps:
                 # Save checkpoint at intervals
                 if step % self.config.save_interval == 0:
                     self.save_checkpoint(step)
 
         # Final save
-        self.save_checkpoint(step)
+        if not self._rank_halted:
+            self.save_checkpoint(step)
+        elif self.config.save_best and self.best_step > 0:
+            print(f"Best checkpoint kept: step {self.best_step}, val {self.best_val_loss:.4f}")
 
         elapsed = time.time() - start_time
         print(f"\nTraining complete in {elapsed / 60:.1f} minutes")

@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
+from .layers import TernaryLinear
+
 __all__ = ["TernaryFFN", "StochasticFFN"]
 
 
@@ -36,16 +38,20 @@ class TernaryFFN(nn.Module):
         dropout: float = 0.0,
         ternary_scale: float = 0.7,
         per_channel: bool = False,
+        group_size: int = 0,
+        init_mode: str = "kaiming",
     ):
         super().__init__()
 
         self.gate_up_proj = TernaryLinear(
             hidden_dim, 2 * ffn_dim,
             ternary_scale=ternary_scale, per_channel=per_channel,
+            group_size=group_size, init_mode=init_mode,
         )
         self.down_proj = TernaryLinear(
             ffn_dim, hidden_dim,
             ternary_scale=ternary_scale, per_channel=per_channel,
+            group_size=group_size, init_mode=init_mode,
         )
         self.dropout = nn.Dropout(dropout)
 
