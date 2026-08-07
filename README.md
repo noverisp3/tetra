@@ -117,15 +117,19 @@ cd inference && bash build.sh avx2
 python run_inference.py tetra_model.bin "Once upon a time" --max-tokens 100
 ```
 
-### Binary Format (v4)
+### Binary Format (v4–v7)
+
+Base binary layout, shared by all versions (v5+ adds extended header fields, v6/v7 deltas documented under Discrete Learning):
 
 | Section | Encoding |
 |---------|----------|
-| Header (64B) | magic `TETR`, version, dims, param counts |
+| Header (64B) | magic `TETR`, version, dims, param counts (v5+: flags, kv_latent_dim, rope_per_head, group_size) |
 | Ternary weights | name (suffix `.latent_weights`), shape, `group_size(2B)` + `num_alphas(2B)` + `alphas(N×4B)`, 2-bit packed (4 weights/byte). `group_size=0` → per-channel or scalar (v3 compat). MLA auto-detected from tensor names containing `kv_down_proj`. |
 | FP32/INT8 weights | name, shape, dtype byte: `0`=FP32, `1`=INT8 + scale |
 | Embeddings | INT8 (token 8K×256→2.0 MB, pos 512×256→0.13 MB) |
 | Norms | FP32 (tiny, ~12 KB) |
+
+Version deltas: **v6** = +FP32 accumulator per ternary entry + SL metadata (below). **v7** = +outlier side-channel blobs (code 11 = ±2, below).
 
 Three alpha modes controlled by `group_size` and `num_alphas`:
 
