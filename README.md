@@ -10,9 +10,9 @@ Three training modes:
 
 - **STE** (Straight-Through Estimator) — FP32 latent shadow weights quantized on-the-fly via absmean, gradient flows through STE. (BitNet b1.58 approach)
 - **Stochastic Bit-Flip** — no latent weights. Weights stored as packed 2-bit ternary. Gradient sign accumulated in FP32 accumulator; weight flips when |accumulator| > threshold. Supports cosine threshold decay (`--threshold-decay-to`), per-channel scaling (`--per-channel`), and per-group block scaling (`--group-size N`).
-- **Hybrid SSM-Attention** — 80% Ternary SSM (Mamba-style) + 20% Ternary Attention layers. SSM scan via vectorized parallel prefix (O(T), no Python loop).
+- **Hybrid SSM-Attention** — 80% Ternary SSM (Mamba-style) + 20% Ternary Attention layers. SSM scan via vectorized parallel prefix (O(T), no Python loop). **Experimental — training runs exhibit loss explosions (unstable); not production-ready.**
 
-Plus **Multi-head Latent Attention (MLA)** — DeepSeek-V2-style KV compression for attention. Compresses K,V into a small latent vector (`--kv-latent-dim`, default 64) before caching, reducing KV cache by 4×. Uses decoupled RoPE with separate per-head Q/K rope projections (`--rope-per-head`, default 8). Compatible with Stochastic Bit-Flip mode (`--mla` flag).
+Plus **Multi-head Latent Attention (MLA)** — DeepSeek-V2-style KV compression for attention. Compresses K,V into a small latent vector (`--kv-latent-dim`, default 64) before caching, reducing KV cache by 4×. Uses decoupled RoPE with separate per-head Q/K rope projections (`--rope-per-head`, default 8). Compatible with Stochastic Bit-Flip mode (`--mla` flag). **Untested — implemented (Python + C++ loader) but not yet validated in a training run.**
 
 ## Architecture
 
@@ -21,8 +21,8 @@ Base BitNet b1.58-style transformer, optionally hybridized:
 | Component | STE / Stochastic | Hybrid | MLA |
 |-----------|-----------------|--------|-----|
 | **Weights** | {-1, 0, +1} via absmean (STE) or packed 2-bit (Stochastic). Optional per-channel or per-group scaling alpha. Per-group: `--group-size N` splits `in_features` into blocks of N, each with its own alpha. | Same per-layer | Same |
-| **Attention** | Causal multi-head, KV cache, ternary Q/K/V/O projections | 20% of layers | MLA: K,V compressed to latent (default 64-dim), decoupled RoPE (default 8-dim/head). 7 ternary projections: q, kv_down, k_up, v_up, q_rope, k_rope, o. KV cache reduced 4×. |
-| **SSM Block** | — | 80% of layers: RMSNorm → TernaryLinear(expand 2×) → depthwise Conv1d → SiLU → parallel-prefix SSM scan → gate → TernaryLinear(project back) | — |
+| **Attention** | Causal multi-head, KV cache, ternary Q/K/V/O projections | 20% of layers | MLA (untested): K,V compressed to latent (default 64-dim), decoupled RoPE (default 8-dim/head). 7 ternary projections: q, kv_down, k_up, v_up, q_rope, k_rope, o. KV cache reduced 4×. |
+| **SSM Block** | — | 80% of layers: RMSNorm → TernaryLinear(expand 2×) → depthwise Conv1d → SiLU → parallel-prefix SSM scan → gate → TernaryLinear(project back) — loss explosion observed in training | — |
 | **FFN** | SwiGLU: fused gate+up into one ternary matmul (2× FFN dim) | Same | Same |
 | **Sparsification** | Optional `--topk RATIO`: keep top-k% activations after norm, zero rest (STE backward) | Same | Same |
 | **INT8 Forward** | Optional `--int8`: quantize activations → int8 before matmul (QAT effect) | Same | Same |
@@ -52,7 +52,7 @@ python train.py --preset tiny --steps 15000 --dtype float16 --graph
 # Resume from latest checkpoint + plot full history
 python train.py --preset tiny --steps 30000 --dtype float16 --graph --resume
 
-# Train with Multi-head Latent Attention (MLA, DeepSeek-V2 style)
+# Train with Multi-head Latent Attention (MLA, DeepSeek-V2 style) — untested, experimental
 python train.py --preset tiny --steps 15000 --dtype float16 --graph --mla --kv-latent-dim 64 --rope-per-head 8
 
 # Export to C++ binary and run inference
@@ -94,7 +94,7 @@ Pure C++17 inference engine (`inference/tetra.h`, no dependencies):
 |---------|--------|
 | **File size** | 3.6 MB (ternary weights 2-bit packed, embeddings INT8 quantized) |
 | **Speed** | 300+ tok/s (AVX2, CPU), 80+ tok/s (scalar) |
-| **MLA** | Full MLA decode + prefill with KV latent compression, decoupled RoPE, and K/V reconstruction from cached latents |
+| **MLA** | Full MLA decode + prefill with KV latent compression, decoupled RoPE, and K/V reconstruction from cached latents (model-side untested end-to-end) |
 | **Prefill** | Parallel batch prefill — all prompt tokens in one forward pass (OpenMP) |
 | **Sampling** | Top-k + top-p + temperature + repetition penalty, matches PyTorch order |
 | **Build (Windows)** | `build.bat avx2` (auto-detects VS via vswhere, enables `/openmp`) |
