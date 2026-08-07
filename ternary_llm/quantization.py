@@ -650,6 +650,8 @@ def apply_bit_flips(
     toggle: bool = False,
     outlier_signs: Optional[torch.Tensor] = None,
     outlier_thr_mult: float = 3.0,
+    ungated: bool = False,
+    stats: Optional[dict] = None,
 ) -> Optional[torch.Tensor]:
     """Check accumulators and flip bits where threshold exceeded.
 
@@ -683,6 +685,9 @@ def apply_bit_flips(
     """
     flip_up = accumulator > threshold
     flip_down = accumulator < -threshold
+    if ungated:
+        flip_up = accumulator > 0
+        flip_down = accumulator < 0
     promote = accumulator.abs() > threshold * outlier_thr_mult
     if not (flip_up.any() or flip_down.any() or promote.any()):
         return None
@@ -714,6 +719,9 @@ def apply_bit_flips(
                         torch.where(w_raw > 0, 1.0, -1.0)))
         w_new = torch.where(demote, direction, w_new)
     packed_weights.copy_(pack_ternary_tensor(w_new).to(packed_weights.device))
+    if stats is not None:
+        stats["flips"] = stats.get("flips", 0) + int((w_new != w_raw).sum().item())
+        stats["n_calls"] = stats.get("n_calls", 0) + 1
     promote_sign = accumulator[promote].sign() if promote.any() else None
     accumulator[flip_up | flip_down] = 0.0
     if promote.any():

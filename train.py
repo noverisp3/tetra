@@ -152,6 +152,8 @@ def main():
                         help="[Stochastic] Promote weight to ±2 outlier when |acc| exceeds this × threshold (default: 3.0)")
     parser.add_argument("--flip-every-n-steps", type=int, default=5,
                         help="[Stochastic] Check threshold & flip bits every N optimizer steps (default: 5)")
+    parser.add_argument("--flip-ungated", action="store_true",
+                        help="[Stochastic] Flip every weight whose accumulator is non-zero (no surprise gate)")
     parser.add_argument("--graph", action="store_true",
                         help="Export training loss plot to checkpoints/loss_plot.png")
     parser.add_argument("--debug", action="store_true",
@@ -388,6 +390,15 @@ def main():
         )
 
     total_params = sum(p.numel() for p in model.parameters())
+    if is_stochastic and args.flip_ungated:
+        from ternary_llm.layers import StochasticTernaryLinear
+        n_gated = 0
+        for m in model.modules():
+            if isinstance(m, StochasticTernaryLinear):
+                m.ungated = True
+                n_gated += 1
+        print(f"Flip gating: UNGATED on {n_gated:,} linear layers "
+              f"(flip on every accumulator sign, no threshold)")
     if is_hybrid:
         ternary_params = sum(
             p.numel() for n, p in model.named_buffers()
@@ -456,6 +467,17 @@ def main():
             export_graph(trainer, config.save_dir)
         print("Checkpoint saved. Exiting.")
         sys.exit(130)
+
+    if is_stochastic:
+        from ternary_llm.layers import StochasticTernaryLinear
+        lin = [m for m in model.modules() if isinstance(m, StochasticTernaryLinear)]
+        total_flips = sum(m.flip_count for m in lin)
+        total_w = sum(m.accumulator.numel() for m in lin)
+        n_apply = max(1, max(1, trainer.scheduler.step_count) // max(1, config.flip_every_n_steps))
+        frac = total_flips / max(1, total_w * n_apply)
+        print(f"\nFlip stats: {total_flips:,} total flips over ~{n_apply} flip passes "
+              f"({total_w * n_apply:,} opportunities)")
+        print(f"Avg % weights flipped per pass: {frac * 100:.2f}%")
 
     if args.graph:
         export_graph(trainer, config.save_dir)

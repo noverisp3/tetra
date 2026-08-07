@@ -491,6 +491,55 @@ Reproduce the sustained case with:
 4. **The ternary substrate learns, but its on-device headroom is small**: cut-the-tail shows the ternary learned during Python training is worth ~1 nat over random, but continued C++ flips add only ~0.008 nats (only 0.18% of weights move). Toggle raises that to ~0.16 nats on-device (6.996 → 6.838) — but only in the transient ≤500-block window, after which sustained toggle destroys structure (#12).
 5. Still no standard-quality generation (CE ~7 → PPL ~1090) — gradient-free learning is proven effective but far from fluent text; scaling tokens/steps is untested.
 
+## Experiment: Surprise-Gated Bit Flips (Exp 1)
+
+Question: does the threshold "surprise gate" in `apply_bit_flips` save compute
+without hurting accuracy, compared to an un-gated flip on every accumulator
+sign?
+
+Setup: `train.py --mode stochastic --preset tiny`, 200 steps on `tinydata`
+(534M tokens). Slice CE: `tests/eval_ternary_ablation.py` on
+`examples/discrete/sliceEval100k.bin` (20K positions, `--scale 1.0`). Same
+config for all four runs; only the gate/threshold differs. Flip counts
+instrumented in `quantization.apply_bit_flips` (positions where
+`w_new != w_raw`).
+
+| Gate | Threshold | % weights flipped / pass | Slice CE |
+|---|---|---|---|
+| Full (ungated) | 0 | 62.78% | 63.99 |
+| Gated | 5 | 62.91% | 59.71 (47.9% became ±2 outliers) |
+| Gated | 20 (default) | 17.10% | 49.22 |
+| Gated | 100 | 3.09% | 18.18 |
+
+Readings:
+
+- The surprise gate cuts flips from **63% to 3%** (~20× fewer memory
+  writes per update pass) and *improves* held-out CE monotonically
+  (64 → 18): the gate wins on both axes.
+- Absolute numbers are far from the paper baselines (~6.9) because this
+  uses `train.py --mode stochastic` defaults (200 steps, LR 1e-3) — compare
+  **relative within the table only**.
+- Caveat / open question: tightening the gate moves the ternary core toward
+  its random initialization (sparsity 30.5% at thr=100 vs 33.5% at thr=20),
+  so CE improves because flips *stop destroying* structure, not because gated
+  learning *adds* value where it fires. The hypothesis "learn where surprised
+  beats a frozen core" (CE_active < CE_frozen) is not yet demonstrated;
+  the current sign-grad flip rule is net destructive (densification
+  50%→33% sparsity + randomization).
+
+Code changes: `quantization.apply_bit_flips(ungated=, stats=)`,
+`StochasticTernaryLinear.ungated` + flip counters, `train.py --flip-ungated`,
+`tests/eval_ternary_ablation.py --scale`.
+
+Reproduce:
+
+```bash
+python train.py --mode stochastic --preset tiny --steps 200 --data-cache tinydata --save-dir checkpoints_exp1_g20
+python train.py --mode stochastic --preset tiny --steps 200 --data-cache tinydata --flip-ungated --save-dir checkpoints_exp1_ungated
+python tests/eval_ternary_ablation.py --checkpoint checkpoints_exp1_g20/checkpoint_000200.pt --scale 1.0
+python tests/eval_ternary_ablation.py --checkpoint checkpoints_exp1_ungated/checkpoint_000200.pt --scale 1.0
+```
+
 ## Project Structure
 
 ```

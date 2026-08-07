@@ -209,6 +209,12 @@ class StochasticTernaryLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+        # Surprise-gating: if True, flip on every accumulator sign (no threshold)
+        self.ungated = False
+        # Flip statistics (cumulative)
+        self.flip_count = 0
+        self.last_flips = 0
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with stochastic ternary matmul.
 
@@ -251,17 +257,22 @@ class StochasticTernaryLinear(nn.Module):
     def apply_bit_flips(self) -> None:
         """Check accumulator and flip bits where threshold exceeded."""
         from .quantization import apply_bit_flips as _apply_bit_flips
+        stats = {"flips": 0, "n_calls": 0}
         blob = _apply_bit_flips(
             self.packed_weights, self.accumulator,
             self.threshold, self.scale,
             (self.out_features, self.in_features),
             outlier_signs=self.outlier_signs,
             outlier_thr_mult=self.outlier_thr_mult,
+            ungated=self.ungated,
+            stats=stats,
         )
         if blob is not None:
             self.outlier_signs[:blob.numel()].copy_(blob)
         # Invalidate cached unpacked weights (packed weights changed)
         self._w_raw_cache = None
+        self.flip_count += stats["flips"]
+        self.last_flips = stats["flips"]
 
     @torch.no_grad()
     def get_ternary_weights(self) -> torch.Tensor:

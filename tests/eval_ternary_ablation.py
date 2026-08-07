@@ -35,18 +35,18 @@ def load_eval_tokens(path: str, n: int) -> np.ndarray:
 
 
 def ternary_distribution(model) -> dict:
-    """Count {-1,0,+1} across all ternary weights (global, per matrix)."""
-    counts = {-1: 0, 0: 0, 1: 0}
+    """Count {-1,0,+1} (and any outliers) across all ternary weights."""
+    counts = {}
     per_matrix = []
     for m in model.modules():
         if isinstance(m, StochasticTernaryLinear):
             w = unpack_ternary_tensor(m.packed_weights, (m.out_features, m.in_features))
-            c = {-1: 0, 0: 0, 1: 0}
+            c = {}
             for v, n in zip(*(torch.unique(w, return_counts=True))):
                 c[int(v)] = int(n)
             per_matrix.append(c)
             for v, n in c.items():
-                counts[v] += n
+                counts[v] = counts.get(v, 0) + n
     return counts, per_matrix
 
 
@@ -108,6 +108,9 @@ def main():
                         help="Ternary weights to evaluate: learned (checkpoint), "
                              "random (fresh init), histmatch (per-matrix counts preserved, "
                              "positions shuffled)")
+    parser.add_argument("--scale", type=float, default=None,
+                        help="Logit scale (default: 1/sqrt(hidden_dim) for discrete checkpoints; "
+                             "use 1.0 for stochastic/backprop checkpoints)")
     args = parser.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -122,17 +125,23 @@ def main():
     )
     model.load_state_dict(sd, strict=False)
     model.eval()
-    scale = 1.0 / math.sqrt(cfg["hidden_dim"])
+    if args.scale is not None:
+        scale = args.scale
+    else:
+        scale = 1.0 / math.sqrt(cfg["hidden_dim"])
 
     tokens = load_eval_tokens(args.slice, args.positions)
-    print(f"Checkpoint step {ckpt.get('step')}: rule={cfg['rule']} "
+    rule = cfg.get("rule", cfg.get("mode", "?"))
+    print(f"Checkpoint step {ckpt.get('step')}: rule={rule} "
           f"| scale={scale:.5f} | slice {args.slice} | {len(tokens)} tokens")
 
     counts, _ = ternary_distribution(model)
     total = sum(counts.values())
+    c_n1 = counts.get(-1, 0); c_0 = counts.get(0, 0); c_p1 = counts.get(1, 0)
     print(f"Learned ternary distribution: "
-          f"-1={counts[-1]/total*100:.1f}% 0={counts[0]/total*100:.1f}% "
-          f"+1={counts[1]/total*100:.1f}% (sparsity={counts[0]/total*100:.1f}%)")
+          f"-1={c_n1/total*100:.1f}% 0={c_0/total*100:.1f}% "
+          f"+1={c_p1/total*100:.1f}% (sparsity={c_0/total*100:.1f}%)"
+          + (f" outliers(+-2)={counts.get(2, 0)/total*100:.1f}%" if counts.get(2) else ""))
 
     ce_learned = eval_ce(model, tokens, args.block_size, args.positions, scale)
 
