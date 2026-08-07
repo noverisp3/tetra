@@ -313,6 +313,39 @@ The exported model **continues learning in C++** on raw token streams, implement
 
 v6 = v5 + one **FP32 accumulator** (`rows×cols`) appended to every ternary entry + a trailing `META` section containing a JSON blob with the self-learning config (`sl_rule`, `sl_threshold`, `sl_acc_decay`, `sl_flip_every_n`, `sl_logit_scale`, `sl_lr_embedding`, `sl_wd_embedding`, `sl_block_size`, `_export_version`). Export via `export_model.py ... --self-learning`.
 
+### Binary format v7 (Ternary-Outlier)
+
+v7 adds a fourth ternary magnitude: **code `11` = ±2 outlier weights**, whose signs are stored in a per-entry side-channel blob. This lets SBF dynamics promote weights past the ±1 saturation wall instead of stalling:
+
+- **Layout** (per ternary entry, header version ≥ 7): packed 2-bit codes + FP32 accumulator (`rows×cols`, always written — uniform with v6) + trailing `u32 n_outliers` + `ceil(n_outliers/8)` blob bytes. The count+blob pair is written **for every entry** (empty blob = no outliers), so a reader can distinguish v6/v7 from the header alone.
+- **Blob encoding**: dense sign bits, MSB-first, 1 = positive, in dense-first row-major scan order; the running index of code-11 weights in the same scan order addresses the blob (no per-weight position storage).
+- **SBF promote/demote** (`apply_bit_flips`, identical in Python and C++): promote when `|acc| > outlier_mult × threshold` and `|w| ≤ 1` → ±2 (acc parked at ±threshold); demote an outlier pushed opposite or with `|acc| < threshold` → ±1; same-direction push on an outlier is a no-op (acc reset). Repack re-encodes ±2 (both signs) as code 11 and rebuilds the blob from floats each pass.
+- **Metadata**: `sl_outlier_mult` (default 3.0) exported/parsed by both engines. Export via `export_model.py ... --v7`; `tetra.h`/`selflearn.cpp` load, flip, and round-trip-save v7 (version read from header, blob rebuilt from floats).
+- **Verified**: C++ dequantized weights match Python exactly on all 36/36 modules (outlier counts + sign splits); selflearn save→reload round-trips consistently; `tests/ce_v6_vs_v7.py` measures block CE under both interpretations.
+
+**v6 vs v7 CE comparison** (`tests/ce_v6_vs_v7.py`, TinyStories window, 256 positions):
+
+| Model | v7 reading (blob) | v6 reading (code 11 → 0) |
+|-------|-------------------|--------------------------|
+| `exp_tog_s0_zacc.bin` (0 code-11, control) | 6.6682 | 6.6682 (identical — lossless control) |
+| `examples/v7/tetra_v7_smoke.bin` (outlier-bearing) | **8.8049** | 11.0732 |
+
+The side-channel recovers **2.27 nats** of CE on the same weights; a fresh `--v7` export of a 0-outlier checkpoint is bit-identical in CE to its v6 twin (+4 B/entry for the empty blob count).
+
+### Lossless zero-padding expansion (`scripts/pad_model.py`)
+
+Grows the FFN of an existing v6/v7 binary with zero weights (code `01` = 0) — the first step of block-wise growth / LBL continual learning:
+
+```bash
+python scripts/pad_model.py checkpoints_discrete_c3/exp_tog_s0_zacc.bin -o out_pad2048.bin --ffn 2048 --verify
+```
+
+- Pads `gate_up_proj` rows and `down_proj` cols; **fused gate_up is padded inside both halves** (`[gate_old, Z, up_old, Z]`) so the `fused[:FFN]` / `fused[FFN:2·FFN]` split keeps its semantics — appending at the end silently kills the up half (found via a CE regression of 6.8129 → 6.8288).
+- Accumulators padded with zeros; v7 outlier blobs untouched (padded weights are never code 11); per-row alphas padded with 1.0; header `ffn_dim` rewritten; fp32 section + metadata tail preserved verbatim.
+- **Verified lossless (bit-identical)**: `exp_tog_s0_zacc.bin` FFN 1024→2048 → CE 6.6682 both, C++ argmax generation 12/12 tokens identical; `tetra_v7_smoke.bin` → CE 8.8049 both (blob invariant).
+
+Next step (LBL): block-scoped training (`--blocks-range`) so only the zero-padded rows of one block get promoted to ±1/±2 outliers while all other blocks stay frozen — old knowledge preserved, new capacity learned.
+
 ### Validation results
 
 | Check | Result |
@@ -460,12 +493,12 @@ Reproduce the sustained case with:
 train.py                    # Main entry point
 train_discrete.py           # Gradient-free training: local rules (p/c/b), DiscreteTrainer
 train_baseline_backprop.py  # Backprop baseline (same architecture, AdamW, eval on same slice)
-tests/eval_ternary_ablation.py    # Cut-the-tail: learned vs random ternary with frozen embedding
 
 scripts/
   benchmark_speed.py        # Speed benchmark across presets
   prepare_data.py           # Stream data from HF → tokenized chunks
   train_tokenizer.py        # Train BPE tokenizer on TinyStories
+  pad_model.py              # Lossless FFN zero-padding expansion (v6/v7 binary)
 
 ternary_llm/
   quantization.py           # STE + Stochastic Bit-Flip autograd functions, pack/unpack
@@ -486,10 +519,10 @@ ternary_llm/
     setup.py                # PyTorch extension build
 
 inference/
-  tetra.h                   # C++ inference engine (RMSNorm, SiLU, softmax, sampling, forward, v6 loader)
+  tetra.h                   # C++ inference engine (RMSNorm, SiLU, softmax, sampling, forward, v6/v7 loader)
   tetra.cpp                 # CLI entry point, generation loop
   selflearn.cpp             # C++ self-learning runtime (rule c, accumulator bit-flips, --eval mode)
-  export_model.py           # Checkpoint → binary format (v4/v6, INT8 embedding, --self-learning)
+  export_model.py           # Checkpoint → binary format (v4/v6/v7, INT8 embedding, --self-learning, --v7)
   run_inference.py          # Python wrapper around C++ inference
   benchmark_ppl.py          # Perplexity measurement
   build.bat                 # MSVC build script (auto-detects VS via vswhere)
@@ -501,6 +534,15 @@ tests/
   test_prototype.py
   test_convergence.py
   test_discrete.py          # 9 tests: rules, accumulators, bit-flips, checkpoint round-trip
+  ce_v6_vs_v7.py            # Block-CE under v6 vs v7 interpretation of a binary (torch ref of C++ forward)
+  eval_ternary_ablation.py  # Cut-the-tail: learned vs random ternary with frozen embedding
+  bench_avx.py              # Benchmark AVX2 vs AVX-512 for ternary ops
+  bench_500m_cpu.py         # 500M-preset CPU benchmark
+
+examples/
+  tiny/                     # Trained tiny checkpoints, loss plots, training history
+  discrete/                 # Committed token slices (slice100k.bin, sliceEval100k.bin)
+  v7/                       # v7 ternary-outlier binaries (tetra_v7_smoke.bin, tetra_v7_dbg.bin)
 ```
 
 ## License
