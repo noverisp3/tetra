@@ -76,6 +76,13 @@ def main():
     parser.add_argument("--no-flips", action="store_true",
                         help="Freeze ternary weights (skip apply_bit_flips) — "
                              "ablation: backprop only trains embedding/lm_head")
+    parser.add_argument("--acc-energy", action="store_true",
+                        help="Exp 3: energy accumulator (leaky EMA of -grad) instead of ±1 sign votes")
+    parser.add_argument("--acc-decay", type=float, default=0.99,
+                        help="Exp 3: leaky accumulator decay per step (energy mode; default 0.99)")
+    parser.add_argument("--adaptive-thr", type=float, default=None,
+                        help="Exp 3: adaptive flip threshold k (tau = k*RMS(acc) per channel). "
+                             "None = fixed scalar threshold")
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--save-dir", type=str, default="checkpoints_bp")
@@ -151,6 +158,11 @@ def main():
         if name.endswith(".packed_weights"):
             n_ternary += buf.numel() * 4
     print(f"Model: 6L/256/8H/1024FFN, ternary bits: {n_ternary:,}")
+    if args.acc_energy or args.adaptive_thr is not None:
+        model.set_flip_config(acc_decay=args.acc_decay, energy=args.acc_energy,
+                              adaptive_thr=args.adaptive_thr)
+        print(f"Exp 3 flip mechanics: energy acc={args.acc_energy} "
+              f"(decay {args.acc_decay}) | adaptive thr k={args.adaptive_thr}")
 
     eval_tokens = load_eval_tokens(args.eval_slice, args.eval_positions)
     print(f"Eval slice: {args.eval_slice} ({len(eval_tokens)} tokens, "

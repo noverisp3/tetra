@@ -467,6 +467,8 @@ class StochasticBitFlipLinear(torch.autograd.Function):
         threshold: float,
         alphas: Optional[torch.Tensor] = None,
         group_size: int = 0,
+        acc_decay: float = 1.0,
+        energy: bool = False,
     ) -> torch.Tensor:
         """Forward with pre-unpacked w_raw (cached by module).
 
@@ -488,6 +490,8 @@ class StochasticBitFlipLinear(torch.autograd.Function):
         ctx.scale = scale
         ctx.accumulator = accumulator
         ctx.group_size = group_size
+        ctx.acc_decay = acc_decay
+        ctx.energy = energy
 
         if alphas is not None and group_size > 0:
             ctx.alphas = alphas
@@ -547,12 +551,18 @@ class StochasticBitFlipLinear(torch.autograd.Function):
             grad_alpha = None
 
         with torch.no_grad():
-            grad_w.sign_().neg_()
-            ctx.accumulator.add_(grad_w)
+            if ctx.energy:
+                # Energy accumulator: leaky EMA of the negative gradient.
+                # acc = acc_decay*acc - grad_w (magnitude-weighted, sign-correct).
+                # Requires adaptive threshold to stay scale-invariant (Exp 3).
+                ctx.accumulator.mul_(ctx.acc_decay).add_(-grad_w)
+            else:
+                grad_w.sign_().neg_()
+                ctx.accumulator.add_(grad_w)
 
         del grad_w, grad_output_flat
 
-        return grad_x, None, None, None, None, None, grad_alpha, None
+        return grad_x, None, None, None, None, None, grad_alpha, None, None, None
 
 
 class Int8StochasticBitFlipLinear(torch.autograd.Function):
@@ -574,6 +584,8 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
         accumulator: torch.Tensor,
         threshold: float,
         outlier_signs: Optional[torch.Tensor] = None,
+        acc_decay: float = 1.0,
+        energy: bool = False,
     ) -> torch.Tensor:
         """Forward with INT8 quantized activations.
 
@@ -597,6 +609,8 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
         ctx.w_raw = w_raw
         ctx.scale = scale
         ctx.accumulator = accumulator
+        ctx.acc_decay = acc_decay
+        ctx.energy = energy
 
         # Grad carrier: float matmul so grad flows through x
         out = F.linear(x.float(), w_raw.float()) * scale * scale_x
@@ -634,10 +648,15 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
 
         grad_w = torch.mm(grad_y_raw.T, x.reshape(-1, x.size(-1)))
         with torch.no_grad():
-            grad_w.sign_().neg_()
-            ctx.accumulator.add_(grad_w)
+            if ctx.energy:
+                ctx.accumulator.mul_(ctx.acc_decay).add_(-grad_w)
+            else:
+                grad_w.sign_().neg_()
+                ctx.accumulator.add_(grad_w)
 
-        return grad_x, None, None, None, None, None, None
+        del grad_w
+
+        return grad_x, None, None, None, None, None, None, None, None
 
 
 @torch.no_grad()
@@ -650,8 +669,9 @@ def apply_bit_flips(
     toggle: bool = False,
     outlier_signs: Optional[torch.Tensor] = None,
     outlier_thr_mult: float = 3.0,
-    ungated: bool = False,
-    stats: Optional[dict] = None,
+        ungated: bool = False,
+        stats: Optional[dict] = None,
+        adaptive_thr: Optional[float] = None,
 ) -> Optional[torch.Tensor]:
     """Check accumulators and flip bits where threshold exceeded.
 
@@ -666,6 +686,15 @@ def apply_bit_flips(
                   outlier whose |acc| drops below threshold → ±1 toward acc.
       - outliers pushed in their own direction stay put.
 
+    Exp 3 adaptive threshold: when ``adaptive_thr`` is not None, the flip
+    threshold is computed per output channel as
+    ``tau = adaptive_thr * RMS(accumulator, dim=in_features)`` instead of the
+    fixed scalar ``threshold``. This makes the flip criterion scale-invariant
+    (independent of gradient/logit scale), which is required when the
+    accumulator holds magnitude-weighted gradient energy (``energy=True`` in
+    the autograd Functions) rather than ±1 votes. tau is clamped to a small
+    floor so idle channels (RMS ~ 0) don't flip on noise.
+
     Args:
         packed_weights: packed ternary weights (modified in-place)
         accumulator: gradient accumulator tensor (same shape as unpacked weights)
@@ -678,13 +707,26 @@ def apply_bit_flips(
         outlier_signs: dense uint8 sign blob for code-11 weights (row-major
             scan order, MSB first, 1=positive). None = v6 behavior (no outliers).
         outlier_thr_mult: promotion threshold multiplier (default 3.0).
+        ungated: flip on every accumulator sign, ignoring the threshold.
+        stats: optional dict accumulating flip counters ("flips", "n_calls").
+        adaptive_thr: Exp 3 — if set, use k·RMS(acc) per output channel as the
+            flip threshold (None = fixed scalar ``threshold``).
 
     Returns:
         The rebuilt sign blob tensor (uint8) when ``outlier_signs`` is not
         None, else None. Callers must store it back (outliers moved).
     """
-    flip_up = accumulator > threshold
-    flip_down = accumulator < -threshold
+    if adaptive_thr is not None:
+        # Per-output-channel RMS of the accumulator = typical gradient energy.
+        # tau = k * RMS, clamped so near-idle channels require a small but
+        # non-zero energy to flip (avoids flip-on-noise for RMS ~ 0).
+        rms = accumulator.pow(2).mean(dim=1, keepdim=True).sqrt().clamp_min(1e-4)
+        thr = adaptive_thr * rms
+        flip_up = accumulator > thr
+        flip_down = accumulator < -thr
+    else:
+        flip_up = accumulator > threshold
+        flip_down = accumulator < -threshold
     if ungated:
         flip_up = accumulator > 0
         flip_down = accumulator < 0

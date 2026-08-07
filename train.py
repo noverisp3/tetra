@@ -154,6 +154,13 @@ def main():
                         help="[Stochastic] Check threshold & flip bits every N optimizer steps (default: 5)")
     parser.add_argument("--flip-ungated", action="store_true",
                         help="[Stochastic] Flip every weight whose accumulator is non-zero (no surprise gate)")
+    parser.add_argument("--acc-energy", action="store_true",
+                        help="[Stochastic] Exp 3: energy accumulator (leaky EMA of -grad) instead of ±1 sign votes")
+    parser.add_argument("--acc-decay", type=float, default=0.99,
+                        help="[Stochastic] Exp 3: leaky accumulator decay per step (energy mode; default 0.99)")
+    parser.add_argument("--adaptive-thr", type=float, default=None,
+                        help="[Stochastic] Exp 3: adaptive flip threshold k (tau = k*RMS(acc) per channel). "
+                             "None = fixed scalar threshold")
     parser.add_argument("--graph", action="store_true",
                         help="Export training loss plot to checkpoints/loss_plot.png")
     parser.add_argument("--debug", action="store_true",
@@ -399,6 +406,11 @@ def main():
                 n_gated += 1
         print(f"Flip gating: UNGATED on {n_gated:,} linear layers "
               f"(flip on every accumulator sign, no threshold)")
+    if is_stochastic and (args.acc_energy or args.adaptive_thr is not None):
+        model.set_flip_config(acc_decay=args.acc_decay, energy=args.acc_energy,
+                              adaptive_thr=args.adaptive_thr)
+        print(f"Exp 3 flip mechanics: energy acc={args.acc_energy} "
+              f"(decay {args.acc_decay}) | adaptive thr k={args.adaptive_thr}")
     if is_hybrid:
         ternary_params = sum(
             p.numel() for n, p in model.named_buffers()

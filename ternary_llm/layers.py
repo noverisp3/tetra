@@ -215,6 +215,23 @@ class StochasticTernaryLinear(nn.Module):
         self.flip_count = 0
         self.last_flips = 0
 
+        # Exp 3 flip mechanics: energy accumulator (leaky EMA of -grad) and
+        # adaptive threshold (k * per-channel RMS). Disabled by default.
+        self.acc_decay = 1.0
+        self.energy = False
+        self.adaptive_thr = None
+
+    def set_flip_config(self, *, acc_decay: float | None = None,
+                        energy: bool | None = None,
+                        adaptive_thr: float | None = None) -> None:
+        """Configure Exp 3 flip mechanics (energy acc + adaptive threshold)."""
+        if acc_decay is not None:
+            self.acc_decay = float(acc_decay)
+        if energy is not None:
+            self.energy = bool(energy)
+        if adaptive_thr is not None:
+            self.adaptive_thr = float(adaptive_thr)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with stochastic ternary matmul.
 
@@ -236,13 +253,14 @@ class StochasticTernaryLinear(nn.Module):
         if self.int8 and _ternary_ops is not None:
             output = Int8StochasticBitFlipLinear.apply(
                 x, self.packed_weights, self._w_raw_cache,
-                self.scale, self.accumulator, self.threshold, self.outlier_signs
+                self.scale, self.accumulator, self.threshold, self.outlier_signs,
+                self.acc_decay, self.energy,
             )
         else:
             output = StochasticBitFlipLinear.apply(
                 x, self.packed_weights, self._w_raw_cache,
                 self.scale, self.accumulator, self.threshold,
-                self.alphas, self.group_size
+                self.alphas, self.group_size, self.acc_decay, self.energy,
             )
 
         if self.bias is not None:
@@ -266,6 +284,7 @@ class StochasticTernaryLinear(nn.Module):
             outlier_thr_mult=self.outlier_thr_mult,
             ungated=self.ungated,
             stats=stats,
+            adaptive_thr=self.adaptive_thr,
         )
         if blob is not None:
             self.outlier_signs[:blob.numel()].copy_(blob)
