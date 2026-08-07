@@ -39,6 +39,7 @@ checkpoints_*/
 !tokenizer/tetra_tokenizer.json
 !tokenizer/vocab_info.json
 !examples/discrete/*.bin
+!examples/v7/*.bin
 
 # IDE
 .vscode/
