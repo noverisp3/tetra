@@ -77,6 +77,14 @@ def main():
     parser.add_argument("--eval-steps", type=int, default=20)
     parser.add_argument("--save-dir", type=str, default="checkpoints_discrete")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Phase-1 checkpoint to continue from (local-rule "
+                             "fine-tuning / continual learning). Accumulators "
+                             "are reset on load.")
+    parser.add_argument("--logit-scale", type=float, default=None,
+                        help="Logit scale for CE / embedding gradient (default: "
+                             "1/sqrt(hidden_dim); use 1.0 to continue a backprop "
+                             "checkpoint in its natural logit regime)")
     args = parser.parse_args()
 
     # Seed BEFORE loaders/model so data order + embedding/ternary init are
@@ -110,6 +118,7 @@ def main():
         eval_steps=args.eval_steps,
         seed=args.seed,
         save_dir=args.save_dir,
+        logit_scale=args.logit_scale,
     )
 
     if args.preset:
@@ -121,23 +130,40 @@ def main():
     if args.random_data is not None:
         print(f"Using {args.random_data:,} synthetic random tokens")
         tokens = random_token_array(args.random_data, config.vocab_size, seed=args.seed)
+        train_loader, val_loader = create_dataloaders(
+            tokens, block_size=config.block_size, batch_size=config.batch_size,
+            val_split=config.val_split, num_workers=0,
+        )
     else:
         data_cache = Path(args.data_cache) if args.data_cache else Path("tinydata")
+        manifest_path = data_cache / "manifest.json"
         meta_path = data_cache / "metadata.json"
-        bin_path = data_cache / "tinystories.bin"
-        if not (meta_path.exists() and bin_path.exists()):
-            print(f"ERROR: no metadata.json/tinystories.bin in {data_cache}")
+        if manifest_path.exists():
+            print(f"\nLoading multi-source data from {data_cache}...")
+            from ternary_llm.data import create_multi_source_dataloaders
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            config.vocab_size = manifest["vocab_size"]
+            print(f"Sources: {list(manifest['sources'].keys())} | "
+                  f"Total tokens: {manifest['total_tokens']:,}")
+            train_loader, val_loader = create_multi_source_dataloaders(
+                data_dir=data_cache, block_size=config.block_size,
+                batch_size=config.batch_size, val_split=config.val_split,
+                num_workers=0,
+            )
+        elif meta_path.exists() and (data_cache / "tinystories.bin").exists():
+            with open(meta_path) as f:
+                meta = json.load(f)
+            config.vocab_size = meta["vocab_size"]
+            tokens = np.memmap(str(data_cache / "tinystories.bin"), dtype=np.uint16, mode="r")
+            print(f"Tokens: {len(tokens):,} | Vocab: {config.vocab_size}")
+            train_loader, val_loader = create_dataloaders(
+                tokens, block_size=config.block_size, batch_size=config.batch_size,
+                val_split=config.val_split, num_workers=0,
+            )
+        else:
+            print(f"ERROR: no manifest.json or metadata.json+tinystories.bin in {data_cache}")
             sys.exit(1)
-        with open(meta_path) as f:
-            meta = json.load(f)
-        config.vocab_size = meta["vocab_size"]
-        tokens = np.memmap(str(bin_path), dtype=np.uint16, mode="r")
-        print(f"Tokens: {len(tokens):,} | Vocab: {config.vocab_size}")
-
-    train_loader, val_loader = create_dataloaders(
-        tokens, block_size=config.block_size, batch_size=config.batch_size,
-        val_split=config.val_split, num_workers=0,
-    )
 
     print(f"Rule: {config.rule} | Threshold: {config.threshold} "
           f"-> {config.threshold_decay_to} | flip every {config.flip_every_n_steps} "
@@ -152,6 +178,9 @@ def main():
     if config.rule == "p":
         n_aux = sum(p.numel() for p in trainer.aux_heads.parameters())
         print(f"Aux bottleneck heads: {n_aux:,} params")
+
+    if args.load_checkpoint:
+        trainer.load_checkpoint(args.load_checkpoint)
 
     try:
         trainer.train()

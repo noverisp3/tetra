@@ -540,6 +540,85 @@ python tests/eval_ternary_ablation.py --checkpoint checkpoints_exp1_g20/checkpoi
 python tests/eval_ternary_ablation.py --checkpoint checkpoints_exp1_ungated/checkpoint_000200.pt --scale 1.0
 ```
 
+## Experiment: Continual Learning & Catastrophic Forgetting (Exp 2)
+
+Question: when a Phase-1 model is switched to a NEW domain, do error-gated
+SBF local rules adapt with less **catastrophic forgetting** of the old domain
+than standard backprop fine-tuning?
+
+Setup:
+- **Phase 1** (old domain): `checkpoints_bp/checkpoint_000200.pt` — the
+  200-step backprop SBF baseline trained on TinyStories (`tinydata`). Slice CE
+  7.069 on `sliceEval100k.bin` (TinyStories held-out), domain CE 8.284 on
+  `data_teacher` (chat).
+- **Phase 2** (new domain): fine-tune on `data_teacher/` (2144 chat tokens,
+  teacher-generated conversations, manifest format), 100 steps, same
+  checkpoint start, accumulators reset on load (replaying Phase-1 acc state is
+  unsafe — finding #10/#12).
+  - **Method 1**: backprop fine-tune (`train_baseline_backprop.py --resume`).
+  - **Method 2**: SBF error-gated local rules, rule `c`
+    (`train_discrete.py --load-checkpoint --rule c --logit-scale 1.0`).
+- Metric: **SliceEval100k CE** (old-domain forgetting, higher = worse) and
+  domain CE (new-domain adaptation, lower = better).
+
+| Method | Phase-2 steps | Slice CE | Δ slice (forgetting) | Domain CE | Δ domain (adaptation) |
+|---|---|---|---|---|---|
+| Phase-1 baseline | 0 | 7.069 | 0 | 8.284 | 0 |
+| **M1 backprop** (flips on, LR 3e-4) | 100 | **23.99** | **+16.9** | 15.93 | +7.6 |
+| M1 backprop (flips on, LR 1e-4) | 100 | 24.32 | +17.2 | 15.82 | +7.5 |
+| **M2 local rules** (rule c, seed 0) | 100 | **8.34** | **+1.27** | 8.37 | +0.09 |
+| M2 local rules (rule c, seed 1) | 100 | 8.44 | +1.37 | 8.38 | +0.10 |
+| M2 local rules (rule c, toggle) | 300 | 9.20 | +2.13 | 8.26 | −0.03 |
+| Control: backprop, ternary frozen | 100 | 8.00 | +0.93 | **6.63** | **−1.66** |
+
+Readings:
+
+- **Catastrophic forgetting is a backprop-flips failure mode, not an SBF
+  one.** Standard backprop fine-tune on the new domain destroys TinyStories
+  knowledge (slice CE 7.07 → 24.0, +17 nats — worse than the random baseline
+  9.01). Mechanism: backprop's *ungated* ternary flips on new-domain gradients
+  mass-kick the old weights (the same matrix-inversion seen when replaying
+  accumulator state, finding #10/#12). Error-gated local rules forget ~13×
+  less (slice CE 8.34, +1.3 nats) because their sign-grad flips are sparse and
+  threshold-gated.
+- **But local rules barely *adapt* on this tiny domain**: domain CE stays
+  ~8.3 (Δ≈0) for rule `c` — the 2144-token teacher set is too small for the
+  local delta to accumulate meaningful signal in 100 steps. Toggle adds more
+  flips but just erodes the old domain further (slice 9.20, domain 8.26).
+- **The best-forgetting+adaptation tradeoff is the frozen-ternary control**:
+  backprop on the embedding only (ternary flips disabled) forgets +0.93 and
+  adapts domain CE 8.28 → 6.63 (−1.66). So on a small new domain the model's
+  FP32 embedding can absorb the distribution shift; the ternary core is what
+  backprop fine-tuning destroys.
+- Caveat: data_teacher is a 2144-token POC (14 conversations). The forgetting
+  asymmetry (M1 +17 vs M2 +1.3) is robust across LR and seeds, but the
+  adaptation result for M2 needs a larger new-domain set (see
+  `scripts/generate_teacher_data.py`, target ~2M tokens).
+
+Code changes: `DiscreteTrainer.load_checkpoint()` (Phase-1 resume, accumulators
+reset, FP16→FP32), `train_discrete.py --load-checkpoint/--logit-scale` +
+manifest.json (multi-source) data, `train_baseline_backprop.py
+--resume/--lr-domain/--domain-eval` + manifest data + accumulator reset.
+
+Reproduce:
+
+```bash
+# Method 1: backprop fine-tune on the new domain (with SBF flips)
+python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
+    --steps 100 --data-cache data_teacher --domain-eval data_teacher/teacher_poc_0000.bin \
+    --lr-domain 3e-4 --batch-size 8 --save-dir checkpoints_exp2_bp
+
+# Method 2: SBF error-gated local rules on the new domain
+python train_discrete.py --rule c --steps 100 --data-cache data_teacher \
+    --load-checkpoint checkpoints_bp/checkpoint_000200.pt --logit-scale 1.0 \
+    --batch-size 8 --save-dir checkpoints_exp2_local
+
+# Control: backprop, ternary flips frozen (embedding-only fine-tune)
+python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
+    --steps 100 --data-cache data_teacher --domain-eval data_teacher/teacher_poc_0000.bin \
+    --lr-domain 3e-4 --batch-size 8 --no-flips --save-dir checkpoints_exp2_bp_nf
+```
+
 ## Project Structure
 
 ```

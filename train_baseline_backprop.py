@@ -8,6 +8,8 @@ gradient-free rules can be compared apples-to-apples against a real optimizer.
 
 Usage:
     python train_baseline_backprop.py --steps 300 --save-dir checkpoints_bp
+    python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
+        --steps 100 --data-cache data_teacher   # backprop fine-tune (Exp 2, Method 1)
 """
 import argparse
 import json
@@ -19,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import numpy as np
 import torch
 
-from ternary_llm.data import create_dataloaders
+from ternary_llm.data import create_dataloaders, create_multi_source_dataloaders
 from ternary_llm.transformer import StochasticTransformerModel
 
 
@@ -77,50 +79,114 @@ def main():
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--save-dir", type=str, default="checkpoints_bp")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Phase-1 checkpoint to continue from (backprop "
+                             "fine-tuning / continual learning, Exp 2 Method 1)")
+    parser.add_argument("--lr-domain", type=float, default=None,
+                        help="LR for fine-tuning on a new domain (default: --lr)")
+    parser.add_argument("--domain-eval", type=str, default=None,
+                        help="Raw uint16 .bin slice of the NEW domain; reports "
+                             "its CE alongside the TinyStories slice (adaptation metric)")
     args = parser.parse_args()
 
     data_cache = Path(args.data_cache)
     meta_path = data_cache / "metadata.json"
     bin_path = data_cache / "tinystories.bin"
-    with open(meta_path) as f:
-        meta = json.load(f)
-    vocab_size = meta["vocab_size"]
-    tokens = np.memmap(str(bin_path), dtype=np.uint16, mode="r")
-    print(f"Tokens: {len(tokens):,} | Vocab: {vocab_size}")
+    manifest_path = data_cache / "manifest.json"
+    tokens = None
+    if manifest_path.exists():
+        from ternary_llm.data import create_multi_source_dataloaders
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        vocab_size = manifest["vocab_size"]
+        print(f"Sources: {list(manifest['sources'].keys())} | "
+              f"Total tokens: {manifest['total_tokens']:,}")
+        train_loader, val_loader = create_multi_source_dataloaders(
+            data_cache, block_size=args.block_size, batch_size=args.batch_size,
+            val_split=args.val_split, num_workers=0,
+        )
+    else:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        vocab_size = meta["vocab_size"]
+        tokens = np.memmap(str(bin_path), dtype=np.uint16, mode="r")
+        print(f"Tokens: {len(tokens):,} | Vocab: {vocab_size}")
+        train_loader, val_loader = create_dataloaders(
+            tokens, block_size=args.block_size, batch_size=args.batch_size,
+            val_split=args.val_split, num_workers=0,
+        )
 
     model = StochasticTransformerModel(
         vocab_size=vocab_size, hidden_dim=256, num_layers=6, num_heads=8,
         ffn_dim=1024, max_seq_len=2048, threshold=args.threshold,
     )
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        ckpt_cfg = ckpt["config"]
+        # Override architecture from the Phase-1 checkpoint if it differs.
+        model = StochasticTransformerModel(
+            vocab_size=ckpt_cfg.get("vocab_size", vocab_size),
+            hidden_dim=ckpt_cfg.get("hidden_dim", 256),
+            num_layers=ckpt_cfg.get("num_layers", 6),
+            num_heads=ckpt_cfg.get("num_heads", 8),
+            ffn_dim=ckpt_cfg.get("ffn_dim", 1024),
+            max_seq_len=ckpt_cfg.get("max_seq_len", 2048),
+            threshold=args.threshold,
+        )
+        sd = {}
+        for k, v in ckpt["model_state_dict"].items():
+            sd[k] = v.float() if isinstance(v, torch.Tensor) and v.dtype == torch.float16 else v
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        # Zero accumulators: replaying the Phase-1 accumulator state on a new
+        # domain is unsafe (findings #10/#12 — the old-domain mass kick
+        # inverts the matrix). Reset so the first flips reflect new-domain grads.
+        for name, buf in model.named_buffers():
+            if name.endswith(".accumulator"):
+                buf.zero_()
+        print(f"Resumed from {args.resume} (step {ckpt.get('step')}); "
+              f"missing {len(missing)} / unexpected {len(unexpected)} keys"
+              " - accumulators reset")
     n_ternary = 0
     for name, buf in model.named_buffers():
         if name.endswith(".packed_weights"):
             n_ternary += buf.numel() * 4
     print(f"Model: 6L/256/8H/1024FFN, ternary bits: {n_ternary:,}")
 
-    train_loader, val_loader = create_dataloaders(
-        tokens, block_size=args.block_size, batch_size=args.batch_size,
-        val_split=args.val_split, num_workers=0,
-    )
-
     eval_tokens = load_eval_tokens(args.eval_slice, args.eval_positions)
     print(f"Eval slice: {args.eval_slice} ({len(eval_tokens)} tokens, "
           f"{args.eval_positions} positions)")
+    if args.domain_eval:
+        domain_tokens = load_eval_tokens(args.domain_eval, args.eval_positions)
+        print(f"Domain eval slice: {args.domain_eval} ({len(domain_tokens)} tokens)")
+    else:
+        domain_tokens = None
     print(f"Mode: ternary flips {'DISABLED (frozen)' if args.no_flips else 'ENABLED'}")
+    if args.resume:
+        print(f"Fine-tune LR: {args.lr_domain if args.lr_domain else args.lr} "
+              f"(was {args.lr})")
 
-    # Held-out (last 5%) reference at init.
-    val_tokens = tokens[int(len(tokens) * (1 - args.val_split)):]
-    ce_init_val = eval_ce(model, np.asarray(val_tokens), args.block_size,
-                          args.eval_positions)
+    # Held-out (last 5%) reference at init (single-source caches only).
     ce_init_slice = eval_ce(model, eval_tokens, args.block_size,
                             args.eval_positions)
-    print(f"[step 0] heldout(last5%) CE {ce_init_val:.4f} | slice CE {ce_init_slice:.4f}")
+    if tokens is not None:
+        val_tokens = tokens[int(len(tokens) * (1 - args.val_split)):]
+        ce_init_val = eval_ce(model, np.asarray(val_tokens), args.block_size,
+                              args.eval_positions)
+        print(f"[step 0] heldout(last5%) CE {ce_init_val:.4f} | "
+              f"slice CE {ce_init_slice:.4f}")
+    else:
+        print(f"[step 0] slice CE {ce_init_slice:.4f}")
+    ce_init_domain = (eval_ce(model, domain_tokens, args.block_size, args.eval_positions)
+                      if domain_tokens is not None else None)
+    if ce_init_domain is not None:
+        print(f"[step 0] domain CE {ce_init_domain:.4f}")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr_domain if args.lr_domain else args.lr,
                             weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lr_lambda=lambda s: _schedule(s, args.steps, args.warmup,
-                                           args.lr, args.min_lr))
+                                           args.lr_domain if args.lr_domain else args.lr,
+                                           args.min_lr))
     torch.manual_seed(0)
 
     save_dir = Path(args.save_dir)
@@ -153,12 +219,20 @@ def main():
                   f"avg10 {np.mean(losses[-10:]):.4f}")
 
         if step % args.eval_every == 0 or step == args.steps:
-            ce_val = eval_ce(model, np.asarray(val_tokens), args.block_size,
-                             args.eval_positions)
             ce_slice = eval_ce(model, eval_tokens, args.block_size,
                                args.eval_positions)
-            print(f"  eval[step {step}] heldout(last5%) CE {ce_val:.4f} | "
-                  f"slice CE {ce_slice:.4f}")
+            if tokens is not None:
+                ce_val = eval_ce(model, np.asarray(val_tokens), args.block_size,
+                                 args.eval_positions)
+                line = (f"  eval[step {step}] heldout(last5%) CE {ce_val:.4f} | "
+                        f"slice CE {ce_slice:.4f}")
+            else:
+                line = f"  eval[step {step}] slice CE {ce_slice:.4f}"
+            if domain_tokens is not None:
+                ce_dom = eval_ce(model, domain_tokens, args.block_size,
+                                 args.eval_positions)
+                line += f" | domain CE {ce_dom:.4f}"
+            print(line)
 
         if step % 100 == 0 or step == args.steps:
             ckpt_path = save_dir / f"checkpoint_{step:06d}.pt"
@@ -176,6 +250,11 @@ def main():
     ce_final = eval_ce(model, eval_tokens, args.block_size, args.eval_positions)
     print(f"\nFINAL slice CE: {ce_final:.4f} "
           f"(init {ce_init_slice:.4f}, baseline random {np.log(vocab_size):.4f})")
+    if domain_tokens is not None:
+        ce_dom_final = eval_ce(model, domain_tokens, args.block_size,
+                               args.eval_positions)
+        print(f"FINAL domain CE: {ce_dom_final:.4f} "
+              f"(init {ce_init_domain:.4f})")
 
 
 def _schedule(step: int, total: int, warmup: int, lr: float, min_lr: float) -> float:

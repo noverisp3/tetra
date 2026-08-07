@@ -221,6 +221,11 @@ class DiscreteConfig:
     eval_interval: int = 200
     eval_steps: int = 20
 
+    # Logit scale for CE / embedding gradient (None = 1/sqrt(hidden_dim),
+    # the discrete-trainer calibration; set 1.0 to continue a backprop
+    # checkpoint whose logits are already in the natural regime)
+    logit_scale: float | None = None
+
     # Misc
     seed: int = 0
     save_dir: str = "checkpoints_discrete"
@@ -298,7 +303,10 @@ class DiscreteTrainer:
         # Calibration: the tied lm_head shares the nn.Embedding weight which is
         # initialised with std ~1, giving raw logits that explode the CE. We
         # scale logits down to O(1) inside the trainer (weights untouched).
-        self._logit_scale = 1.0 / math.sqrt(config.hidden_dim)
+        if config.logit_scale is not None:
+            self._logit_scale = float(config.logit_scale)
+        else:
+            self._logit_scale = 1.0 / math.sqrt(config.hidden_dim)
 
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -699,3 +707,37 @@ class DiscreteTrainer:
         with open(path / "training_history.json", "w") as f:
             json.dump(history, f)
         print(f"Checkpoint saved to {path / f'checkpoint_{step:06d}.pt'}")
+
+    def load_checkpoint(self, path: str, reset_accumulators: bool = True) -> int:
+        """Load a Phase-1 checkpoint and continue training from it.
+
+        Handles both the DiscreteTrainer checkpoint format and the
+        backprop-baseline format (``train_baseline_backprop.py`` /
+        ``train.py --mode stochastic``): model state dict may carry FP16
+        accumulators (converted to FP32 here) and the tied lm_head weight.
+
+        Accumulators are ZEROED by default when resuming: the old-domain
+        accumulator state is transient and replaying it biases the first
+        flips on the new domain (findings #10/#12 — replaying acc state is
+        unsafe). Pass ``reset_accumulators=False`` to keep them.
+
+        Returns the checkpoint step.
+        """
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        raw_sd = ckpt["model_state_dict"]
+        state_dict = {}
+        for k, v in raw_sd.items():
+            if isinstance(v, torch.Tensor) and v.dtype == torch.float16:
+                state_dict[k] = v.float()
+            else:
+                state_dict[k] = v
+        self.model.load_state_dict(state_dict, strict=False)
+        if reset_accumulators:
+            for m in self._linear_map.values():
+                m.accumulator.zero_()
+        if ckpt.get("aux_heads") is not None and self._aux_enabled:
+            self.aux_heads.load_state_dict(ckpt["aux_heads"])
+        step = int(ckpt.get("step", 0))
+        print(f"Loaded Phase-1 checkpoint from {path} (step {step})"
+              + (" - accumulators reset" if reset_accumulators else ""))
+        return step
