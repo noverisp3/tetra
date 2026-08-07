@@ -17,6 +17,7 @@ data/*.json
 data/*.rar
 data_local/
 tinydata/
+data_teacher/
 
 # Checkpoints (large, regenerate)
 checkpoints/

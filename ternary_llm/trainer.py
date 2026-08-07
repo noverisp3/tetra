@@ -858,7 +858,12 @@ class TernaryTrainer:
             print(f"Resumed from step {resume_step}, LR = {self.scheduler.optimizer.param_groups[0]['lr']:.6f}")
 
         while step < self.config.max_steps:
-            step = self.train_epoch(step)
+            new_step = self.train_epoch(step)
+            if new_step == step:
+                print("WARNING: No training progress (loader empty or all batches dropped). "
+                      "Check batch size vs dataset size. Stopping.")
+                break
+            step = new_step
 
             if self._rank_halted:
                 print(f"\nHalted by rank monitor at step {step}")
