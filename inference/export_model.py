@@ -803,7 +803,7 @@ Examples:
     parser.add_argument("-o", "--output", default="tetra_model.bin",
                         help="Output binary path (default: tetra_model.bin)")
     parser.add_argument("--quantize-int8", action="store_true",
-                        help="Quantize all FP32 weights to INT8 (saves ~50% non-ternary size)")
+                        help="Quantize all FP32 weights to INT8 (saves ~50%% non-ternary size)")
     parser.add_argument("--verify", action="store_true",
                         help="Auto-verify export against PyTorch model")
     parser.add_argument("--no-metadata", action="store_true",

@@ -11,7 +11,7 @@ random projection. If CE(learned) << CE(random): the ternary weights carry
 real learned structure that the embedding depends on.
 
 Usage:
-    python eval_ternary_ablation.py [--checkpoint ...] [--slice ...] [--positions N]
+    python tests/eval_ternary_ablation.py [--checkpoint ...] [--slice ...] [--positions N]
 """
 import argparse
 import copy
@@ -19,7 +19,7 @@ import math
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import torch
