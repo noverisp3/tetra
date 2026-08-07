@@ -722,15 +722,20 @@ def apply_bit_flips(
         # non-zero energy to flip (avoids flip-on-noise for RMS ~ 0).
         rms = accumulator.pow(2).mean(dim=1, keepdim=True).sqrt().clamp_min(1e-4)
         thr = adaptive_thr * rms
+        promote_thr = thr * outlier_thr_mult
+        demote_thr = thr
         flip_up = accumulator > thr
         flip_down = accumulator < -thr
     else:
+        thr = threshold
+        promote_thr = threshold * outlier_thr_mult
+        demote_thr = threshold
         flip_up = accumulator > threshold
         flip_down = accumulator < -threshold
     if ungated:
         flip_up = accumulator > 0
         flip_down = accumulator < 0
-    promote = accumulator.abs() > threshold * outlier_thr_mult
+    promote = accumulator.abs() > promote_thr
     if not (flip_up.any() or flip_down.any() or promote.any()):
         return None
     w_raw = unpack_ternary_tensor(packed_weights, shape_w, outlier_signs)
@@ -753,7 +758,7 @@ def apply_bit_flips(
     if same_dir.any():
         w_new = torch.where(out_mask & same_dir, w_raw, w_new)
     # Outliers whose accumulator relaxed below threshold demote to ±1
-    demote = out_mask & (accumulator.abs() < threshold)
+    demote = out_mask & (accumulator.abs() < demote_thr)
     if demote.any():
         direction = torch.where(
             accumulator > 0, 1.0,
@@ -767,7 +772,15 @@ def apply_bit_flips(
     promote_sign = accumulator[promote].sign() if promote.any() else None
     accumulator[flip_up | flip_down] = 0.0
     if promote.any():
-        accumulator[promote] = promote_sign * threshold
+        if isinstance(demote_thr, torch.Tensor):
+            # Per-channel parking: park each promoted weight at its channel's
+            # base threshold (stays promoted until leaky decay pulls it below
+            # the same threshold, i.e. demote).
+            promote_idx = promote.nonzero()
+            park = demote_thr[promote_idx[:, 0], 0]
+            accumulator[promote_idx[:, 0], promote_idx[:, 1]] = promote_sign * park
+        else:
+            accumulator[promote] = promote_sign * demote_thr
     if demote.any():
         accumulator[demote] = 0.0
     if outlier_signs is not None:

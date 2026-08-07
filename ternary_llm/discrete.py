@@ -49,76 +49,90 @@ from .data import ChunkedDataset, create_dataloaders
 # Local delta rules
 # ──────────────────────────────────────────────────────────────
 
-def predictive_coding_delta(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor | None:
+def predictive_coding_delta(x: torch.Tensor, y: torch.Tensor,
+                            energy: bool = False) -> torch.Tensor | None:
     """Rule C: temporal predictive coding.
 
     ``e = y(t) - y(t-1)`` (each position predicts its successor), then
     ``delta = -sign(x^T e)`` — the descent direction of ``0.5||e||^2``,
     matching the accumulator convention used by ``StochasticBitFlipLinear``.
 
+    With ``energy=True`` (Exp 3/4 flip mechanics) the full magnitude is kept:
+    ``delta = -x^T e``, so the accumulator holds gradient energy (heavy-tailed)
+    that the adaptive threshold ``tau = k*RMS(acc)`` can select from, instead
+    of uniform ±1 votes.
+
     Args:
         x: layer input (batch, seq, in_features)
         y: layer output (batch, seq, out_features)
+        energy: keep magnitude (-grad) instead of sign votes (-sign(grad))
 
     Returns:
-        (out_features, in_features) delta in {-1, 0, +1}, or None if seq < 2.
+        (out_features, in_features) delta in {-1, 0, +1} (or real-valued when
+        ``energy``), or None if seq < 2.
     """
     if y.size(-2) < 2:
         return None
     xf = x[:, :-1, :].reshape(-1, x.size(-1))
     e = (y[:, 1:, :] - y[:, :-1, :]).reshape(-1, y.size(-1))
     grad = e.t() @ xf  # (out, in)
-    return -torch.sign(grad)
+    return -grad if energy else -torch.sign(grad)
 
 
 def forward_forward_delta(
     x_pos: torch.Tensor, y_pos: torch.Tensor,
     x_neg: torch.Tensor, y_neg: torch.Tensor,
+    energy: bool = False,
 ) -> torch.Tensor:
     """Rule B: Forward-Forward goodness update.
 
     ``delta = sign(x_pos^T y_pos - x_neg^T y_neg)`` — increase goodness
     (sum of squared activations) on the positive pass, decrease on the
-    negative pass.
+    negative pass. With ``energy=True`` the magnitude is kept.
 
     Args:
         x_pos/y_pos: input/output of the positive pass
         x_neg/y_neg: input/output of the corrupted negative pass
+        energy: keep magnitude instead of sign votes
 
     Returns:
-        (out_features, in_features) delta in {-1, 0, +1}.
+        (out_features, in_features) delta in {-1, 0, +1} (or real-valued when
+        ``energy``).
     """
     xp = x_pos.reshape(-1, x_pos.size(-1))
     yp = y_pos.reshape(-1, y_pos.size(-1))
     xn = x_neg.reshape(-1, x_neg.size(-1))
     yn = y_neg.reshape(-1, y_neg.size(-1))
     grad = yp.t() @ xp - yn.t() @ xn  # (out, in)
-    return torch.sign(grad)
+    return grad if energy else torch.sign(grad)
 
 
-def hebbian_delta(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def hebbian_delta(x: torch.Tensor, y: torch.Tensor,
+                  energy: bool = False) -> torch.Tensor:
     """Rule A: Hebbian correlation (EXPERIMENTAL).
 
     ``delta = sign(x^T y)``. No error signal, so consistent correlated input
-    pushes weights toward saturation. Use with a high threshold.
+    pushes weights toward saturation. Use with a high threshold. With
+    ``energy=True`` the magnitude is kept.
     """
     xf = x.reshape(-1, x.size(-1))
     yf = y.reshape(-1, y.size(-1))
     grad = yf.t() @ xf  # (out, in)
-    return torch.sign(grad)
+    return grad if energy else torch.sign(grad)
 
 
-def entropy_delta(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def entropy_delta(x: torch.Tensor, y: torch.Tensor,
+                  energy: bool = False) -> torch.Tensor:
     """Rule D: local entropy minimization (EXPERIMENTAL).
 
     Uses a centered residual ``e = y - mean(y)`` as the error — pushing each
     channel away from the channel mean concentrates energy (lower normalized
-    entropy). ``delta = -sign(x^T e)``.
+    entropy). ``delta = -sign(x^T e)``. With ``energy=True`` magnitude kept.
     """
     xf = x.reshape(-1, x.size(-1))
     e = (y - y.mean(dim=-1, keepdim=True)).reshape(-1, y.size(-1))
     grad = e.t() @ xf  # (out, in)
-    return -torch.sign(grad)
+    return -grad if energy else -torch.sign(grad)
 
 
 # Temporal fallback for rule 'p' modules that have no target signal.
@@ -192,6 +206,16 @@ class DiscreteConfig:
     threshold_decay_to: float | None = None
     flip_every_n_steps: int = 5
     acc_decay: float = 0.99  # leaky accumulator: acc *= acc_decay each step
+    # Exp 3 adaptive threshold: tau = adaptive_thr * RMS(acc) per output channel
+    # (scale-invariant flip budget; None = fixed scalar threshold). The discrete
+    # rules already accumulate magnitude-weighted energy (local deltas + leaky
+    # decay), so this is the missing half of the Exp 3 mechanism.
+    adaptive_thr: float | None = None
+    # Exp 4: keep gradient magnitude in the local deltas (-grad instead of
+    # -sign(grad)) so the accumulator holds real energy. Required for the
+    # adaptive threshold to select a heavy tail — sign-vote accumulators are
+    # near-uniform (|acc|/RMS < 1.2) so adaptive tau freezes them.
+    rule_energy: bool = False
 
     # Anti-collapse controls
     toggle: bool = False       # kick saturated weights to opposite extreme
@@ -424,11 +448,14 @@ class DiscreteTrainer:
             module.accumulator.add_(delta.to(module.accumulator.device))
 
     def _feed_local_deltas(self):
+        energy = self.config.rule_energy
         if self.config.rule == "b":
             for name, m in self._linear_map.items():
                 if name not in self._captured_pos or name not in self._captured_neg:
                     continue
-                d = forward_forward_delta(*self._captured_pos[name], *self._captured_neg[name])
+                d = forward_forward_delta(*self._captured_pos[name],
+                                          *self._captured_neg[name],
+                                          energy=energy)
                 self._accumulate(m, d)
             return
         for name, m in self._linear_map.items():
@@ -437,7 +464,7 @@ class DiscreteTrainer:
             if self.config.rule == "p" and name in self._target_mods:
                 continue  # handled by target deltas
             fn = self._single_pass_rules.get(self.config.rule, predictive_coding_delta)
-            d = fn(*self._captured_pos[name])
+            d = fn(*self._captured_pos[name], energy=energy)
             if d is not None:
                 self._accumulate(m, d)
 
@@ -493,7 +520,8 @@ class DiscreteTrainer:
         xf = x_cap.reshape(-1, x_cap.size(-1))
         gf = g_h.reshape(-1, g_h.size(-1))
         grad = gf.t() @ xf  # (out, in)
-        self._accumulate(module, -torch.sign(grad))
+        d = -grad if self.config.rule_energy else -torch.sign(grad)
+        self._accumulate(module, d)
 
     def _aux_head_error(self, k: int, h_k: torch.Tensor, targets: torch.Tensor,
                         ) -> torch.Tensor:
@@ -589,7 +617,8 @@ class DiscreteTrainer:
                 m.packed_weights, m.accumulator, m.threshold, m.scale,
                 (m.out_features, m.in_features), toggle=cfg.toggle,
                 outlier_signs=m.outlier_signs,
-                outlier_thr_mult=m.outlier_thr_mult)
+                outlier_thr_mult=m.outlier_thr_mult,
+                adaptive_thr=cfg.adaptive_thr)
             if blob is not None:
                 m.outlier_signs[:blob.numel()].copy_(blob)
             m._w_raw_cache = None

@@ -636,46 +636,48 @@ Fix (this experiment): two coupled changes to `quantization.py`:
    leaky EMA of the *negative gradient* instead of ±1 sign votes:
    `acc = acc_decay*acc - grad_w`. Magnitude now carries the signal (a weight
    only flips when the accumulated gradient *energy* is large), and the decay
-   makes old-domain energy fade naturally over the new domain (no manual
-   accumulator reset needed).
+   makes old-domain energy fade naturally over the new domain.
 2. **Adaptive threshold** (`--adaptive-thr k`): the flip threshold is computed
    per output channel as `tau = k * RMS(acc)` instead of a fixed integer (20).
-   This is scale-invariant — the flip decision no longer depends on the
-   absolute gradient/logit scale, and `k` becomes a single interpretable knob
-   on the flip *budget* (measured: k=2 → ~2.2% of weights/pass, k=3 → ~0.1%,
-   k=4 → ~0.0%).
+   Scale-invariant — `k` is an interpretable knob on the flip *budget*
+   (measured: k=2 → ~2% of weights/pass, k=3 → ~0.1%, k=4 → ~0.0%).
 
 Setup: same as Exp 2 — continue `checkpoints_bp/checkpoint_000200.pt`
 (Phase-1 TinyStories, slice CE 7.069, domain CE 8.284) on `data_teacher`
 (2144 chat tokens), 100 steps, `--lr-domain 1e-4 --batch-size 8`, accumulator
-reset on load. Same slice/domain CE metrics.
+reset on load. Same slice/domain CE metrics. **The frozen-ternary control was
+re-run at the SAME LR (1e-4)** so the comparison is apples-to-apples (the
+Exp-2 frozen control used 3e-4).
 
-| Run | Steps | Slice CE (Δ) | Domain CE (Δ) |
-|---|---|---|---|
-| Phase-1 baseline | 0 | 7.069 (0) | 8.284 (0) |
-| Exp2 M1 backprop (flips) | 100 | 23.99 (+16.9) | 15.93 (+7.6) |
-| Exp2 M2 local rules | 100 | 8.34 (+1.27) | 8.37 (+0.09) |
-| Exp2 control (frozen) | 100 | 8.00 (+0.93) | 6.63 (−1.66) |
-| **Exp3 k=2** | 100 | **10.58 (+3.51)** | **9.21 (+0.93)** |
-| **Exp3 k=3** | 100 | **7.34 (+0.27)** | **7.34 (−0.95)** |
-| **Exp3 k=4** | 100 | **7.36 (+0.30)** | **7.40 (−0.89)** |
+| Run | Steps | Slice CE (Δ) | Domain CE (Δ) | Ternary bits flipped |
+|---|---|---|---|---|
+| Phase-1 baseline | 0 | 7.069 (0) | 8.284 (0) | — |
+| Exp2 M1 backprop (flips) | 100 | 23.99 (+16.9) | 15.93 (+7.6) | — |
+| Exp2 M2 local rules | 100 | 8.34 (+1.27) | 8.37 (+0.09) | — |
+| **Exp3 frozen control (1e-4)** | 100 | **7.36 (+0.29)** | **7.40 (−0.90)** | 0 |
+| Exp3 k=2 | 100 | 10.58 (+3.51) | 9.21 (+0.93) | 1.24% |
+| Exp3 k=3 | 100 | 7.34 (+0.27) | 7.34 (−0.95) | 0.053% |
+| Exp3 k=4 | 100 | 7.36 (+0.30) | 7.40 (−0.89) | 0.0025% |
 
-Readings:
+Readings (honest):
 
-- **The ternary core learns the new domain without forgetting.** At k=3, slice
-  CE drifts only +0.27 nats (vs +16.9 for M1 backprop, +1.27 for M2 local
-  rules) while domain CE drops −0.95 (vs +0.09 flat for M2) — the first
-  configuration where the ternary core both adapts *and* preserves. k=2 is too
-  aggressive (flip budget too high → +3.5 nats slice); k=3/k=4 are gentle
-  enough that flips are rare, sparse, and high-energy.
-- **The mechanism works because it couples magnitude with the gate.** The old
-  rule flipped on `|sign|`; the new rule flips on *accumulated energy* relative
-  to a per-channel baseline. Noise (small |grad|) never accumulates enough
-  energy to flip; genuine new-domain signal (large, consistent gradient) does.
-- **`k` is the interpretable "ternary learning rate".** Lower k = more flips =
-  faster adaptation but more forgetting; higher k = sparser, safer flips. This
-  replaces the magic integer threshold (20) with a knob that directly controls
-  the flip budget per pass.
+- **The "adaptation" is the FP32 embedding, not the ternary core.** At k=3/k=4
+  the ternary core is effectively frozen (0.05%/0.003% of bits flipped over 100
+  steps) and the results are statistically identical to the frozen-ternary
+  control at the same LR (slice +0.27 vs +0.29; domain −0.95 vs −0.90). The
+  adaptive threshold does not make the ternary core learn — at these k values
+  it makes the ternary core *stop moving entirely*, and the FP32 embedding
+  absorbs the distribution shift (same mechanism as the Exp-2 frozen control).
+- **k is a safety dial, not a learning rate.** Lower k (k=2) allows more flips
+  and they *hurt* (+3.5 nats slice, domain *worse* +0.93). Higher k freezes.
+  There is no k where flipping the ternary core beats the frozen control. This
+  is consistent with Exp 1: flips are net destructive; every improvement in the
+  chain came from *stopping* flips, never from learning via flips.
+- **Why the mechanism still matters for continual learning**: it gives a
+  principled, scale-invariant way to be *nearly* frozen on the old domain while
+  the (FP32) embedding adapts — replacing the manual accumulator reset and the
+  magic threshold-20 with one interpretable knob. But it does NOT demonstrate
+  that ternary weights can learn via local sign-flip dynamics.
 
 Code changes: `StochasticBitFlipLinear`/`Int8StochasticBitFlipLinear` accept
 `acc_decay`/`energy` (accumulate `-grad_w` with leaky decay when energy mode),
@@ -687,10 +689,86 @@ plumb config through, `train.py`/`train_baseline_backprop.py` add
 Reproduce:
 
 ```bash
+# Mechanism run
 python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
     --steps 100 --data-cache data_teacher --domain-eval data_teacher/teacher_poc_0000.bin \
     --lr-domain 1e-4 --batch-size 8 --acc-energy --acc-decay 0.99 --adaptive-thr 3.0 \
     --save-dir checkpoints_exp3_k3
+# Same-LR frozen control (attribution)
+python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
+    --steps 100 --data-cache data_teacher --domain-eval data_teacher/teacher_poc_0000.bin \
+    --lr-domain 1e-4 --batch-size 8 --no-flips --save-dir checkpoints_exp3_ctrl1e4
+```
+
+## Experiment: Applying the Mechanism to the Discrete Trainer (Exp 4)
+
+Question (Direction 1, choice a): porting the energy-accumulator + adaptive-τ
+mechanism to the on-device local-rule trainer (`train_discrete.py`) — can
+**backprop-free** continual learning adapt to a new domain while resisting
+forgetting?
+
+Two missing halves had to be added to the discrete pipeline:
+
+1. **`--rule-energy`**: the local rules (`predictive_coding_delta`,
+   `forward_forward_delta`, etc.) returned `±sign(grad)` — discarding magnitude,
+   so the accumulator held uniform ±1 votes with `|acc|/RMS < 1.2` (no heavy
+   tail for the adaptive threshold to select). With `--rule-energy` they return
+   `±grad` (magnitude-weighted), giving `max |acc|/RMS ≈ 4.5` like backprop.
+2. **`--adaptive-thr k`** (plus existing `acc_decay`): `tau = k*RMS(acc)` per
+   output channel, as in Exp 3. Wired into `apply_bit_flips` in the discrete
+   trainer's flip pass.
+
+Setup: continue the same Phase-1 checkpoint on `data_teacher`, 100 steps,
+`--batch-size 8 --logit-scale 1.0`. **Control: flips disabled entirely
+(`--flip-every-n 100000`) — embedding-only adaptation.**
+
+| Run | Slice CE (Δ) | Domain CE (Δ) | Ternary bits flipped |
+|---|---|---|---|
+| Phase-1 baseline | 7.069 (0) | 8.284 (0) | — |
+| Exp2 M2 local rules (no mechanism) | 8.34 (+1.27) | 8.37 (+0.09) | — |
+| **Exp4 control (flips off, embedding only)** | **7.85 (+0.78)** | **6.29 (−2.01)** | 0 |
+| Exp4 rule-c energy k=3 | 7.85 (+0.78) | 6.29 (−2.01) | 0.0001% |
+| Exp4 rule-c energy k=2 | 7.87 (+0.80) | 6.31 (−1.99) | 0.03% |
+| Exp4 rule-c (no energy) k=3 | 7.85 (+0.78) | 6.29 (−2.01) | 0 |
+
+Readings (honest):
+
+- **The domain adaptation (−2.01 nats) is 100% the FP32 embedding.** The
+  flips-off control achieves exactly the same slice/domain CE as every
+  `--rule-energy --adaptive-thr` run, because at k≥2 the ternary core is
+  effectively frozen (≤0.03% of bits flipped). The discrete pipeline's
+  *embedding* adapts to the new domain as well as (slightly better than) the
+  backprop frozen control (−2.01 vs −0.90), with no backprop through the
+  ternary core at all.
+- **The local-rule ternary core still cannot learn the new domain.** With the
+  embedding frozen (`--no-train-embedding`) and k=1.5 (1.5% of bits flipped),
+  slice CE holds (+0.45, good) but domain CE gets *worse* (+1.01) — the local
+  deltas carry no usable new-domain signal at this data scale (2144 tokens).
+  This is a data-scale / rule-signal limitation, not a flip-mechanics one.
+- **Conclusion across Exp 1-4**: the bit-flip mechanism, in every variant
+  tested (sign-gate, energy acc, adaptive τ, backprop or local rules), is a
+  *preservation* tool, not a *learning* tool. The gains in this chain all come
+  from stopping destructive flips + letting the FP32 embedding adapt. On-device
+  continual learning *preserves* well and adapts via the embedding — but the
+  ternary core has not yet been shown to learn via local dynamics.
+
+Code changes: `predictive_coding_delta`/`forward_forward_delta`/`hebbian_delta`/
+`entropy_delta` take `energy=` (return ±grad instead of ±sign(grad)),
+`DiscreteConfig.rule_energy` + `_feed_local_deltas`/`_accumulate_target`
+thread it through, `train_discrete.py --rule-energy/--adaptive-thr`.
+
+Reproduce:
+
+```bash
+# Mechanism run (matches flips-off control -> attribution = embedding)
+python train_discrete.py --rule c --steps 100 --data-cache data_teacher \
+    --load-checkpoint checkpoints_bp/checkpoint_000200.pt --logit-scale 1.0 \
+    --batch-size 8 --acc-decay 0.99 --adaptive-thr 3.0 --rule-energy \
+    --save-dir checkpoints_exp4_de_k3
+# Flips-off control
+python train_discrete.py --rule c --steps 100 --data-cache data_teacher \
+    --load-checkpoint checkpoints_bp/checkpoint_000200.pt --logit-scale 1.0 \
+    --batch-size 8 --flip-every-n 100000 --save-dir checkpoints_exp4_ctrl
 ```
 
 ## Project Structure

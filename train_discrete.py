@@ -55,6 +55,14 @@ def main():
     parser.add_argument("--flip-every-n", type=int, default=5)
     parser.add_argument("--acc-decay", type=float, default=0.99,
                         help="Leaky accumulator decay per step (0.99 recommended)")
+    parser.add_argument("--adaptive-thr", type=float, default=None,
+                        help="Exp 3: adaptive flip threshold k (tau = k*RMS(acc) "
+                             "per channel). None = fixed scalar threshold")
+    parser.add_argument("--rule-energy", action="store_true",
+                        help="Exp 4: keep gradient magnitude in local deltas "
+                             "(-grad instead of -sign(grad)) so the accumulator "
+                             "holds real energy (needed for adaptive threshold "
+                             "to select a heavy tail)")
     parser.add_argument("--init", type=str, default="default",
                         choices=["default", "balanced"],
                         help="Ternary init: default (75%/-1) or balanced (33/33/33)")
@@ -104,6 +112,8 @@ def main():
         threshold_decay_to=args.threshold_decay_to,
         flip_every_n_steps=args.flip_every_n,
         acc_decay=args.acc_decay,
+        adaptive_thr=args.adaptive_thr,
+        rule_energy=args.rule_energy,
         toggle=args.toggle,
         zero_center=args.zero_center,
         init_mode=args.init,
@@ -167,7 +177,8 @@ def main():
 
     print(f"Rule: {config.rule} | Threshold: {config.threshold} "
           f"-> {config.threshold_decay_to} | flip every {config.flip_every_n_steps} "
-          f"| acc decay {config.acc_decay} | init {config.init_mode} "
+          f"| acc decay {config.acc_decay} | adaptive thr {config.adaptive_thr} "
+          f"| rule energy {config.rule_energy} | init {config.init_mode} "
           f"| toggle {config.toggle} | zero-center {config.zero_center}")
     print(f"Model: hidden={config.hidden_dim} layers={config.num_layers} "
           f"heads={config.num_heads} ffn={config.ffn_dim}")
