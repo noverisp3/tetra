@@ -157,6 +157,7 @@ class StochasticTernaryLinear(nn.Module):
         int8: bool = False,
         per_channel: bool = False,
         group_size: int = 0,
+        outlier_thr_mult: float = 3.0,
     ):
         super().__init__()
         self.in_features = in_features
@@ -193,6 +194,16 @@ class StochasticTernaryLinear(nn.Module):
         # Cached unpacked weights (recomputed after apply_bit_flips)
         self._w_raw_cache = None
 
+        # v7 outlier side-channel: dense sign bits for code-11 (±2) weights,
+        # row-major scan order, MSB first, 1 = positive. Fixed max size
+        # (ceil(out*in/8) bytes); only the prefix for the current outlier
+        # count is meaningful. All-zero = no outliers.
+        self.outlier_thr_mult = outlier_thr_mult
+        self.register_buffer(
+            "outlier_signs",
+            torch.zeros((out_features * in_features + 7) // 8, dtype=torch.uint8),
+        )
+
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
@@ -212,13 +223,14 @@ class StochasticTernaryLinear(nn.Module):
         """
         if self._w_raw_cache is None:
             self._w_raw_cache = unpack_ternary_tensor(
-                self.packed_weights, (self.out_features, self.in_features)
+                self.packed_weights, (self.out_features, self.in_features),
+                self.outlier_signs if self.outlier_signs.numel() > 0 else None,
             ).to(x.dtype)
 
         if self.int8 and _ternary_ops is not None:
             output = Int8StochasticBitFlipLinear.apply(
                 x, self.packed_weights, self._w_raw_cache,
-                self.scale, self.accumulator, self.threshold
+                self.scale, self.accumulator, self.threshold, self.outlier_signs
             )
         else:
             output = StochasticBitFlipLinear.apply(
@@ -239,11 +251,15 @@ class StochasticTernaryLinear(nn.Module):
     def apply_bit_flips(self) -> None:
         """Check accumulator and flip bits where threshold exceeded."""
         from .quantization import apply_bit_flips as _apply_bit_flips
-        _apply_bit_flips(
+        blob = _apply_bit_flips(
             self.packed_weights, self.accumulator,
             self.threshold, self.scale,
-            (self.out_features, self.in_features)
+            (self.out_features, self.in_features),
+            outlier_signs=self.outlier_signs,
+            outlier_thr_mult=self.outlier_thr_mult,
         )
+        if blob is not None:
+            self.outlier_signs[:blob.numel()].copy_(blob)
         # Invalidate cached unpacked weights (packed weights changed)
         self._w_raw_cache = None
 
@@ -251,7 +267,10 @@ class StochasticTernaryLinear(nn.Module):
     def get_ternary_weights(self) -> torch.Tensor:
         if self._w_raw_cache is not None:
             return self._w_raw_cache
-        return unpack_ternary_tensor(self.packed_weights, (self.out_features, self.in_features))
+        return unpack_ternary_tensor(
+            self.packed_weights, (self.out_features, self.in_features),
+            self.outlier_signs if self.outlier_signs.numel() > 0 else None,
+        )
 
     def get_num_bits(self) -> int:
         return self.out_features * self.in_features * 2  # 2 bits per weight

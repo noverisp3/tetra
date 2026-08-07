@@ -325,6 +325,7 @@ class StochasticTransformerBlock(nn.Module):
         topk: float = 1.0,
         per_channel: bool = False,
         group_size: int = 0,
+        outlier_thr_mult: float = 3.0,
     ):
         super().__init__()
         from .attention import StochasticMultiHeadAttention
@@ -335,12 +336,14 @@ class StochasticTransformerBlock(nn.Module):
         self.attn = StochasticMultiHeadAttention(
             hidden_dim, num_heads, dropout, scale, threshold,
             int8=int8, per_channel=per_channel, group_size=group_size,
+            outlier_thr_mult=outlier_thr_mult,
         )
         self.ffn_norm = RMSNorm(hidden_dim)
         self.ffn_topk = TopKActivation(topk)
         self.ffn = StochasticFFN(
             hidden_dim, ffn_dim, dropout, scale, threshold,
             int8=int8, per_channel=per_channel, group_size=group_size,
+            outlier_thr_mult=outlier_thr_mult,
         )
 
     def forward(
@@ -423,6 +426,7 @@ class StochasticTransformerModel(nn.Module):
         topk: float = 1.0,
         per_channel: bool = False,
         group_size: int = 0,
+        outlier_thr_mult: float = 3.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -433,6 +437,7 @@ class StochasticTransformerModel(nn.Module):
             StochasticTransformerBlock(
                 hidden_dim, num_heads, ffn_dim, dropout, scale, threshold,
                 int8=int8, topk=topk, per_channel=per_channel, group_size=group_size,
+                outlier_thr_mult=outlier_thr_mult,
             )
             for _ in range(num_layers)
         ])
@@ -572,6 +577,7 @@ class StochasticMLABlock(nn.Module):
         group_size: int = 0,
         kv_latent_dim: Optional[int] = None,
         rope_per_head: Optional[int] = None,
+        outlier_thr_mult: float = 3.0,
     ):
         super().__init__()
         from .ffn import StochasticFFN
@@ -582,12 +588,14 @@ class StochasticMLABlock(nn.Module):
             hidden_dim, num_heads, dropout, scale, threshold,
             int8=int8, per_channel=per_channel, group_size=group_size,
             kv_latent_dim=kv_latent_dim, rope_per_head=rope_per_head,
+            outlier_thr_mult=outlier_thr_mult,
         )
         self.ffn_norm = RMSNorm(hidden_dim)
         self.ffn_topk = TopKActivation(topk)
         self.ffn = StochasticFFN(
             hidden_dim, ffn_dim, dropout, scale, threshold,
             int8=int8, per_channel=per_channel, group_size=group_size,
+            outlier_thr_mult=outlier_thr_mult,
         )
 
     def forward(
@@ -673,6 +681,7 @@ class StochasticMLAModel(nn.Module):
         group_size: int = 0,
         kv_latent_dim: Optional[int] = None,
         rope_per_head: Optional[int] = None,
+        outlier_thr_mult: float = 3.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -683,6 +692,7 @@ class StochasticMLAModel(nn.Module):
                 hidden_dim, num_heads, ffn_dim, dropout, scale, threshold,
                 int8=int8, topk=topk, per_channel=per_channel, group_size=group_size,
                 kv_latent_dim=kv_latent_dim, rope_per_head=rope_per_head,
+                outlier_thr_mult=outlier_thr_mult,
             )
             for _ in range(num_layers)
         ])

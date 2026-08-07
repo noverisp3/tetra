@@ -5,10 +5,13 @@
 // Requires: AVX2 (Intel Haswell+, Intel Iris Xe)
 
 #include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <vector>
-#include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <pybind11/pybind11.h>
+
+namespace py = pybind11;
 #include <immintrin.h>
 
 // Pack: float {-1, 0, +1} -> packed uint8 (4 weights/byte)
@@ -28,10 +31,15 @@ at::Tensor pack_ternary(at::Tensor w) {
     auto* out = packed.data_ptr<uint8_t>();
 
     for (int64_t i = 0; i < padded; i += 4) {
-        int v0 = (i+0 < n) ? ((data[i+0] >= 0.5f) ? 2 : (data[i+0] <= -0.5f) ? 0 : 1) : 1;
-        int v1 = (i+1 < n) ? ((data[i+1] >= 0.5f) ? 2 : (data[i+1] <= -0.5f) ? 0 : 1) : 1;
-        int v2 = (i+2 < n) ? ((data[i+2] >= 0.5f) ? 2 : (data[i+2] <= -0.5f) ? 0 : 1) : 1;
-        int v3 = (i+3 < n) ? ((data[i+3] >= 0.5f) ? 2 : (data[i+3] <= -0.5f) ? 0 : 1) : 1;
+        // Codes: 00=-1, 01=0, 10=+1, 11=outlier (±2, sign in side-channel)
+        int v0 = (i+0 < n) ? ((data[i+0] >= 1.5f) ? 3 : (data[i+0] >= 0.5f) ? 2 :
+                              (data[i+0] <= -1.5f) ? 3 : (data[i+0] <= -0.5f) ? 0 : 1) : 1;
+        int v1 = (i+1 < n) ? ((data[i+1] >= 1.5f) ? 3 : (data[i+1] >= 0.5f) ? 2 :
+                              (data[i+1] <= -1.5f) ? 3 : (data[i+1] <= -0.5f) ? 0 : 1) : 1;
+        int v2 = (i+2 < n) ? ((data[i+2] >= 1.5f) ? 3 : (data[i+2] >= 0.5f) ? 2 :
+                              (data[i+2] <= -1.5f) ? 3 : (data[i+2] <= -0.5f) ? 0 : 1) : 1;
+        int v3 = (i+3 < n) ? ((data[i+3] >= 1.5f) ? 3 : (data[i+3] >= 0.5f) ? 2 :
+                              (data[i+3] <= -1.5f) ? 3 : (data[i+3] <= -0.5f) ? 0 : 1) : 1;
         out[i/4] = (uint8_t)(v0 * 64 + v1 * 16 + v2 * 4 + v3);
     }
 
@@ -54,7 +62,7 @@ at::Tensor unpack_ternary(at::Tensor packed, std::vector<int64_t> shape) {
     auto result = torch::empty(total, torch::kFloat32);
     auto* out = result.data_ptr<float>();
 
-    static const float lut[4] = {-1.0f, 0.0f, 1.0f, 0.0f};
+    static const float lut[4] = {-1.0f, 0.0f, 1.0f, 2.0f};  // code 11 = outlier ±2
 
     for (int64_t i = 0; i < total; i++) {
         int byte_idx = i / 4;
@@ -89,7 +97,7 @@ at::Tensor ternary_matmul(at::Tensor x, at::Tensor packed_weights,
     const auto* x_data = x.data_ptr<float>();
 
     int64_t tokens = batch * seq;
-    static const float lut[4] = {-1.0f, 0.0f, 1.0f, 0.0f};
+    static const float lut[4] = {-1.0f, 0.0f, 1.0f, 2.0f};  // code 11 = outlier ±2
 
     // Tile over output features for better cache reuse of x
     const int64_t TILE_OF = 8;  // process 8 output features at a time
@@ -147,9 +155,10 @@ at::Tensor ternary_matmul(at::Tensor x, at::Tensor packed_weights,
                 for (int64_t if2 = if_; if2 < in_features; if2++) {
                     int byte_idx = ((of0 + of) * in_features + if2) / 4;
                     int shift = 6 - 2 * (((of0 + of) * in_features + if2) % 4);
-                    int val = (w[byte_idx] >> shift) & 3;
-                    if (val == 0) sum -= row_x[if2];
-                    else if (val == 2) sum += row_x[if2];
+                int val = (w[byte_idx] >> shift) & 3;
+                if (val == 0) sum -= row_x[if2];
+                else if (val == 2) sum += row_x[if2];
+                else if (val == 3) sum += 2.0f * row_x[if2];
                 }
 
                 row_out[of0 + of] = sum * scale;
@@ -274,9 +283,12 @@ int64_t apply_bit_flips(at::Tensor packed_weights, at::Tensor accumulator,
 // INT8 ternary matmul: int8 activations x packed ternary weights -> float32 output
 // Pure integer in forward: conditional add/sub, int32 accumulation, final float scale
 // Returns float32 for seamless integration with float norms/attention
+// Code 11 (outlier ±2) resolves its sign from the dense side-channel bits
+// (row-major scan order, MSB first, 1 = positive).
 
 at::Tensor ternary_matmul_int8(at::Tensor x_int8, at::Tensor packed_weights,
-                                int64_t out_features, int64_t in_features) {
+                               int64_t out_features, int64_t in_features,
+                               at::Tensor outlier_signs) {
     TORCH_CHECK(x_int8.dtype() == torch::kInt8, "x_int8 must be int8");
     TORCH_CHECK(packed_weights.dtype() == torch::kUInt8,
                 "packed_weights must be uint8");
@@ -291,6 +303,23 @@ at::Tensor ternary_matmul_int8(at::Tensor x_int8, at::Tensor packed_weights,
 
     const auto* x_data = x_int8.data_ptr<int8_t>();
     const auto* w = packed_weights.data_ptr<uint8_t>();
+    const bool has_signs = outlier_signs.defined() && outlier_signs.numel() > 0;
+    const auto* signs = has_signs ? outlier_signs.data_ptr<uint8_t>() : nullptr;
+
+    // Pass 1: per-row outlier counts -> prefix offsets into the sign blob
+    std::vector<int64_t> row_off(out_features + 1, 0);
+    if (has_signs) {
+        for (int64_t of = 0; of < out_features; of++) {
+            const uint8_t* w_row = w + of * in_features / 4;
+            int64_t cnt = 0;
+            for (int64_t if_ = 0; if_ < in_features; if_++) {
+                int shift = 6 - 2 * (if_ % 4);
+                if (((w_row[if_ / 4] >> shift) & 3) == 3) cnt++;
+            }
+            row_off[of + 1] = cnt;
+        }
+        for (int64_t of = 1; of <= out_features; of++) row_off[of] += row_off[of - 1];
+    }
 
     auto result = torch::empty({batch, seq, out_features}, torch::kFloat32);
     auto* out = result.data_ptr<float>();
@@ -301,24 +330,45 @@ at::Tensor ternary_matmul_int8(at::Tensor x_int8, at::Tensor packed_weights,
 
         for (int64_t of = 0; of < out_features; of++) {
             const uint8_t* w_row = w + of * in_features / 4;
+            int64_t cursor = row_off[of];
             int32_t acc = 0;
 
             int64_t if_ = 0;
             for (; if_ + 3 < in_features; if_ += 4) {
                 uint8_t byte = w_row[if_ / 4];
-                // 00=-1, 01=0, 10=1, 11=0
-                int v0 = (int)((byte >> 6) & 3) - 1;
-                int v1 = (int)((byte >> 4) & 3) - 1;
-                int v2 = (int)((byte >> 2) & 3) - 1;
-                int v3 = (int)(byte & 3) - 1;
-                if (v0 == 1)      acc += (int32_t)x_row[if_];
-                else if (v0 == -1) acc -= (int32_t)x_row[if_];
-                if (v1 == 1)      acc += (int32_t)x_row[if_+1];
-                else if (v1 == -1) acc -= (int32_t)x_row[if_+1];
-                if (v2 == 1)      acc += (int32_t)x_row[if_+2];
-                else if (v2 == -1) acc -= (int32_t)x_row[if_+2];
-                if (v3 == 1)      acc += (int32_t)x_row[if_+3];
-                else if (v3 == -1) acc -= (int32_t)x_row[if_+3];
+                // 00=-1, 01=0, 10=1, 11=±2 (sign from side-channel)
+                int c0 = (byte >> 6) & 3;
+                int c1 = (byte >> 4) & 3;
+                int c2 = (byte >> 2) & 3;
+                int c3 = byte & 3;
+                if (c0 == 2)      acc += (int32_t)x_row[if_];
+                else if (c0 == 0) acc -= (int32_t)x_row[if_];
+                else if (c0 == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_];
+                }
+                if (c1 == 2)      acc += (int32_t)x_row[if_+1];
+                else if (c1 == 0) acc -= (int32_t)x_row[if_+1];
+                else if (c1 == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_+1];
+                }
+                if (c2 == 2)      acc += (int32_t)x_row[if_+2];
+                else if (c2 == 0) acc -= (int32_t)x_row[if_+2];
+                else if (c2 == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_+2];
+                }
+                if (c3 == 2)      acc += (int32_t)x_row[if_+3];
+                else if (c3 == 0) acc -= (int32_t)x_row[if_+3];
+                else if (c3 == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_+3];
+                }
             }
 
             // Scalar remainder
@@ -328,6 +378,11 @@ at::Tensor ternary_matmul_int8(at::Tensor x_int8, at::Tensor packed_weights,
                 int code = (w[byte_idx] >> shift) & 3;
                 if (code == 2)       acc += (int32_t)x_row[if_];
                 else if (code == 0)  acc -= (int32_t)x_row[if_];
+                else if (code == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_];
+                }
             }
 
             out_row[of] = (float)acc;
@@ -350,5 +405,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("apply_bit_flips", &apply_bit_flips,
           "Check accumulators and flip bits where threshold exceeded");
     m.def("ternary_matmul_int8", &ternary_matmul_int8,
-          "INT8 ternary matmul: int8 activations x packed ternary -> int32 accum -> float");
+          "INT8 ternary matmul: int8 activations x packed ternary -> int32 accum -> float",
+          py::arg("x_int8"), py::arg("packed_weights"),
+          py::arg("out_features"), py::arg("in_features"),
+          py::arg("outlier_signs") = at::Tensor());
 }

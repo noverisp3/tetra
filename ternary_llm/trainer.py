@@ -783,7 +783,9 @@ class TernaryTrainer:
         else:
             state_dict = raw_state
 
-        self.model.load_state_dict(state_dict)
+        # strict=False: v7 checkpoints carry outlier_signs buffers that older
+        # checkpoints lack (defaults to empty = no outliers)
+        self.model.load_state_dict(state_dict, strict=False)
 
         # Dequantize optimizer states from FP16 to FP32 if needed
         opt_state = checkpoint["optimizer_state_dict"]

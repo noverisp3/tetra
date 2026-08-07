@@ -410,10 +410,10 @@ python inference/parity_check.py checkpoints_discrete_c3/exp_tog_s0/checkpoint_0
 #   deep layers, |g| ~ 1e-3–1). Do NOT use the base checkpoint here — it is rank-1 degenerate (#11).
 
 # 5. Cut-the-tail ablation (finding #5/#7): learned vs random ternary, frozen trained embedding
-python eval_ternary_ablation.py --checkpoint checkpoints_discrete_c3/exp_base_s0/checkpoint_000250.pt \
+python tests/eval_ternary_ablation.py --checkpoint checkpoints_discrete_c3/exp_base_s0/checkpoint_000250.pt \
        --slice examples/discrete/sliceEval100k.bin --ternary-mode learned    # 7.157
-python eval_ternary_ablation.py --checkpoint ... --ternary-mode random             # ~8.12 (avg 3 seeds)
-python eval_ternary_ablation.py --checkpoint ... --ternary-mode histmatch          # ~7.86 (2 seeds)
+python tests/eval_ternary_ablation.py --checkpoint ... --ternary-mode random             # ~8.12 (avg 3 seeds)
+python tests/eval_ternary_ablation.py --checkpoint ... --ternary-mode histmatch          # ~7.86 (2 seeds)
 
 # 6. Rank scan (finding #11) — unique rows per ternary matrix, printed per layer
 python -c "
@@ -460,7 +460,7 @@ Reproduce the sustained case with:
 train.py                    # Main entry point
 train_discrete.py           # Gradient-free training: local rules (p/c/b), DiscreteTrainer
 train_baseline_backprop.py  # Backprop baseline (same architecture, AdamW, eval on same slice)
-eval_ternary_ablation.py    # Cut-the-tail: learned vs random ternary with frozen embedding
+tests/eval_ternary_ablation.py    # Cut-the-tail: learned vs random ternary with frozen embedding
 
 scripts/
   benchmark_speed.py        # Speed benchmark across presets

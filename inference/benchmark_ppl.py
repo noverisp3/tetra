@@ -205,7 +205,7 @@ def main():
             ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
         )
         print(f"Mode: STE")
-    model.load_state_dict(sd)
+    model.load_state_dict(sd, strict=False)
     model.eval()
 
     total_params = sum(p.numel() for p in model.parameters())

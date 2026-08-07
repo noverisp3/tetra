@@ -15,7 +15,9 @@ from typing import Optional
 __all__ = [
     "FusedTernaryLinear", "StochasticBitFlipLinear", "Int8StochasticBitFlipLinear",
     "TernaryQuantizer", "init_ternary_weight", "unpack_ternary_tensor",
-    "apply_bit_flips", "ternary_matmul_forward", "ternary_forward_direct",
+    "pack_ternary_tensor", "pack_ternary", "unpack_ternary",
+    "pack_sign_blob", "pack_sign_blob_tensor", "apply_bit_flips",
+    "ternary_matmul_forward", "ternary_forward_direct",
 ]
 
 import torch
@@ -52,6 +54,18 @@ def _load_cpp_extension() -> bool:
     global _ternary_ops
     if _ternary_ops is not None:
         return True
+
+    # torch 2.4's ninja build path calls distutils._msvccompiler._get_vc_env;
+    # modern setuptools (>= 60) no longer installs that shim into stdlib
+    # distutils. Alias the vendored copy so the extension can still build.
+    if sys.platform == "win32":
+        try:
+            import distutils
+            if not hasattr(distutils, "_msvccompiler"):
+                from setuptools._distutils import _msvccompiler
+                distutils._msvccompiler = _msvccompiler
+        except Exception:
+            pass
 
     csrc = os.path.join(os.path.dirname(__file__), "csrc")
 
@@ -132,7 +146,8 @@ class TernaryQuantizer(torch.autograd.Function):
     def forward(ctx, input: torch.Tensor, scale: float = 0.7) -> torch.Tensor:
         ctx.scale = scale
         delta = input.abs().mean().clamp(min=1e-6) * scale
-        w_ternary = (input / delta).clamp(-1, 1).round()
+        # |W| > 1.5Δ promotes to an outlier (±2, code 11 in the 2-bit format)
+        w_ternary = (input / delta).round().clamp(-2, 2)
         ctx.save_for_backward(input)
         return w_ternary
 
@@ -163,7 +178,9 @@ class FusedTernaryLinear(torch.autograd.Function):
             delta = latent_weights.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * scale
         else:
             delta = latent_weights.abs().mean().clamp(min=1e-6) * scale
-        w_ternary = (latent_weights / delta).clamp(-1, 1).round().to(x.dtype)
+        # |W| > 1.5Δ promotes to an outlier (±2, code 11 in the 2-bit format);
+        # the learned per-group alpha scales it to ±2α at inference time.
+        w_ternary = (latent_weights / delta).round().clamp(-2, 2).to(x.dtype)
         ctx.save_for_backward(x, w_ternary.detach(), alphas.detach() if alphas is not None else alphas)
         ctx.group_size = group_size
         if alphas is not None and group_size > 0:
@@ -222,33 +239,72 @@ def ternary_quantize(weights: torch.Tensor) -> torch.Tensor:
 
 
 def pack_ternary(weights: torch.Tensor) -> bytes:
-    """Pack ternary weights {-1, 0, +1} to 2-bit format (4 weights/byte).
+    """Pack ternary weights to 2-bit format (4 weights/byte).
 
-    Encoding: 00=-1, 01=0, 10=+1, MSB first.
-    Input: flat float tensor with values in {-1, 0, +1}.
+    Encoding: 00=-1, 01=0, 10=+1, 11=outlier (±2, sign in side-channel),
+    MSB first. Input: flat float tensor with values in {-2, -1, 0, +1, +2}.
     Output: packed bytes.
     """
-    w = weights.detach().cpu().flatten().to(torch.int8)
-    # Map {-1,0,+1} -> {0,1,2}
-    w = (w + 1).to(torch.uint8)  # -1->0, 0->1, +1->2
+    w = weights.detach().cpu().flatten().to(torch.int64)
+    # {-2,-1,0,1,2} -> codes {3,0,1,2,3}
+    w = torch.where(w.abs() > 1, torch.full_like(w, 3), (w + 1).clamp(0, 2))
     n = len(w)
     # Pad to multiple of 4
     padded = (n + 3) // 4 * 4
     if padded != n:
         w = torch.nn.functional.pad(w, (0, padded - n), value=1)  # pad with 0 (encoded as 1)
-    w = w.view(-1, 4)
+    w = w.view(-1, 4).to(torch.uint8)
     # Pack: MSB first, 2 bits per weight
-    packed = (w[:, 0].to(torch.uint8) << 6 |
-              w[:, 1].to(torch.uint8) << 4 |
-              w[:, 2].to(torch.uint8) << 2 |
-              w[:, 3].to(torch.uint8))
+    packed = (w[:, 0] << 6 |
+              w[:, 1] << 4 |
+              w[:, 2] << 2 |
+              w[:, 3])
     return bytes(packed.tolist())
 
 
-def unpack_ternary(packed: bytes, shape: tuple, device: str = "cpu") -> torch.Tensor:
-    """Unpack 2-bit packed ternary weights back to {-1, 0, +1} float tensor.
+def pack_sign_blob(weights: torch.Tensor) -> bytes:
+    """Pack outlier signs into a dense bit blob.
 
-    Encoding: 00=-1, 01=0, 10=+1, MSB first.
+    One bit per outlier weight (code 11), row-major scan order,
+    MSB first within each byte: 1 = positive outlier, 0 = negative.
+    Returns b"" when there are no outliers.
+    """
+    w = weights.detach().cpu().flatten()
+    mask = w.abs() > 1.5
+    n = int(mask.sum().item())
+    if n == 0:
+        return b""
+    bits = (w[mask] > 0).to(torch.uint8)
+    padded = (n + 7) // 8 * 8
+    if padded != n:
+        bits = torch.nn.functional.pad(bits, (0, padded - n))
+    bits = bits.view(-1, 8)
+    packed = (bits[:, 0] << 7 | bits[:, 1] << 6 | bits[:, 2] << 5 |
+              bits[:, 3] << 4 | bits[:, 4] << 3 | bits[:, 5] << 2 |
+              bits[:, 6] << 1 | bits[:, 7])
+    return bytes(packed.tolist())
+
+
+def _apply_sign_blob(flat: torch.Tensor, sign_blob: bytes) -> torch.Tensor:
+    """Apply sign bits to outlier positions of a flat weight tensor."""
+    import numpy as np
+    mask = flat.abs() > 1.5
+    n = int(mask.sum().item())
+    if n == 0 or not sign_blob:
+        return flat
+    bits = np.unpackbits(np.frombuffer(sign_blob, dtype=np.uint8))
+    bits = bits[:n].astype(np.float32) * 2.0 - 1.0  # 0 -> -1, 1 -> +1
+    flat = flat.clone()
+    flat[mask] *= torch.from_numpy(bits)
+    return flat
+
+
+def unpack_ternary(packed: bytes, shape: tuple, sign_blob: Optional[bytes] = None,
+                   device: str = "cpu") -> torch.Tensor:
+    """Unpack 2-bit packed ternary weights back to float tensor.
+
+    Encoding: 00=-1, 01=0, 10=+1, 11=outlier ±2 (sign from ``sign_blob``),
+    MSB first.
     """
     import numpy as np
     data = np.frombuffer(packed, dtype=np.uint8)
@@ -259,17 +315,26 @@ def unpack_ternary(packed: bytes, shape: tuple, device: str = "cpu") -> torch.Te
     w3 = ((data >> 0) & 3).astype(np.int8) - 1
     flat = np.stack([w0, w1, w2, w3], axis=-1).flatten()
     flat = flat[:np.prod(shape)]
-    return torch.from_numpy(flat.astype(np.float32)).reshape(shape).to(device)
+    flat = np.ascontiguousarray(flat)
+    t = torch.from_numpy(flat.astype(np.float32))
+    if sign_blob:
+        t = _apply_sign_blob(t, sign_blob)
+    return t.reshape(shape).to(device)
 
 
 # Fast Tensor Pack/Unpack for Stochastic Bit-Flip
 
 def pack_ternary_tensor(w: torch.Tensor) -> torch.Tensor:
-    """Pack ternary float tensor {-1, 0, +1} -> uint8 tensor (4 weights/byte)."""
+    """Pack ternary float tensor {-2,-1,0,+1,+2} -> uint8 tensor (4 weights/byte).
+
+    ±2 maps to code 11 (outlier); the sign lives in the side-channel blob.
+    """
     if _has_cpp and w.is_cpu and w.dtype in (torch.float32, torch.float16):
         return _ternary_ops.pack_ternary(w.contiguous())
-    w_u8 = (w + 1).to(torch.uint8)  # -1->0, 0->1, +1->2
-    flat = w_u8.flatten()
+    # {-2,-1,0,1,2} -> codes {3,0,1,2,3}
+    w_i = w.flatten().to(torch.int64)
+    w_codes = torch.where(w_i.abs() > 1, torch.full_like(w_i, 3), (w_i + 1).clamp(0, 2))
+    flat = w_codes.to(torch.uint8)
     n = flat.size(0)
     padded = (n + 3) // 4 * 4
     if padded != n:
@@ -279,9 +344,53 @@ def pack_ternary_tensor(w: torch.Tensor) -> torch.Tensor:
     return packed.contiguous().to(torch.uint8)
 
 
-def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple) -> torch.Tensor:
-    """Unpack uint8 tensor -> float tensor {-1, 0, +1}.
+def pack_sign_blob_tensor(w: torch.Tensor) -> torch.Tensor:
+    """Pack outlier signs of ``w`` into a dense uint8 bit tensor.
 
+    Row-major scan order, MSB first, 1 bit per outlier (1 = positive).
+    Returns an empty tensor when there are no outliers.
+    """
+    w = w.detach().cpu().flatten()
+    mask = w.abs() > 1.5
+    n = int(mask.sum().item())
+    if n == 0:
+        return torch.zeros(0, dtype=torch.uint8)
+    bits = (w[mask] > 0).to(torch.uint8)
+    padded = (n + 7) // 8 * 8
+    if padded != n:
+        bits = torch.nn.functional.pad(bits, (0, padded - n))
+    bits = bits.view(-1, 8)
+    packed = (bits[:, 0] << 7 | bits[:, 1] << 6 | bits[:, 2] << 5 |
+              bits[:, 3] << 4 | bits[:, 4] << 3 | bits[:, 5] << 2 |
+              bits[:, 6] << 1 | bits[:, 7])
+    return packed.contiguous().to(torch.uint8)
+
+
+def _apply_signs_tensor(w: torch.Tensor, outlier_signs: torch.Tensor) -> torch.Tensor:
+    """Apply side-channel signs to outlier positions of an unpacked tensor."""
+    dev = w.device
+    w = w.cpu()
+    mask = w.abs() > 1.5
+    n = int(mask.sum().item())
+    if n == 0 or outlier_signs is None or outlier_signs.numel() == 0:
+        return w.to(dev)
+    import numpy as np
+    bits = outlier_signs.detach().cpu().flatten()
+    nbytes = (n + 7) // 8
+    if bits.numel() < nbytes:
+        raise ValueError(f"outlier_signs too small: {bits.numel()} bytes for {n} outliers")
+    sign_bits = np.unpackbits(bits[:nbytes].numpy())[:n]
+    signs = torch.from_numpy(sign_bits.astype(np.float32) * 2.0 - 1.0)
+    w = w.clone()
+    w[mask] *= signs
+    return w.to(dev)
+
+
+def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple,
+                          outlier_signs: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Unpack uint8 tensor -> float tensor {-2, -1, 0, +1, +2}.
+
+    Code 11 (outlier) resolves its sign from ``outlier_signs`` bits.
     Uses C++ SIMD unpack on CPU when available (fastest path),
     falls back to Python element-wise ops on the original device.
     """
@@ -289,6 +398,7 @@ def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple) -> torch.Tensor:
         # C++ unpack always runs on CPU, then moves to target device
         target = packed.device
         w = _ternary_ops.unpack_ternary(packed.cpu().contiguous(), list(shape))
+        w = _apply_signs_tensor(w, outlier_signs)
         if target.type != "cpu":
             w = w.to(target)
         return w
@@ -301,7 +411,7 @@ def unpack_ternary_tensor(packed: torch.Tensor, shape: tuple) -> torch.Tensor:
     for d in shape:
         total *= d
     flat = flat[:total]
-    return flat.float().reshape(shape)
+    return _apply_signs_tensor(flat.float().reshape(shape), outlier_signs)
 
 
 def init_ternary_weight(out_features: int, in_features: int, sparsity: float = 0.5,
@@ -463,6 +573,7 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
         scale: float,
         accumulator: torch.Tensor,
         threshold: float,
+        outlier_signs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward with INT8 quantized activations.
 
@@ -473,6 +584,7 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
             scale: ternary weight scale factor
             accumulator: gradient accumulator tensor
             threshold: bit-flip threshold
+            outlier_signs: dense uint8 side-channel signs for code-11 outliers
 
         Returns:
             Output tensor (..., out_features)
@@ -493,9 +605,12 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
         with torch.no_grad():
             if x.device.type == "cpu" and _ternary_ops is not None:
                 # Real int8 matmul via C++ kernel (fast on CPU)
+                sign_args = (outlier_signs.cpu().contiguous()
+                             if outlier_signs is not None else None)
                 int_out = _ternary_ops.ternary_matmul_int8(
                     x_q.contiguous(), packed_w.contiguous(),
                     w_raw.size(0), w_raw.size(1),
+                    sign_args,
                 ).float()
             else:
                 # Pure-PyTorch fallback: dequant -> float matmul
@@ -522,7 +637,7 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
             grad_w.sign_().neg_()
             ctx.accumulator.add_(grad_w)
 
-        return grad_x, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None
 
 
 @torch.no_grad()
@@ -533,11 +648,21 @@ def apply_bit_flips(
     scale: float,
     shape_w: tuple,
     toggle: bool = False,
-) -> None:
+    outlier_signs: Optional[torch.Tensor] = None,
+    outlier_thr_mult: float = 3.0,
+) -> Optional[torch.Tensor]:
     """Check accumulators and flip bits where threshold exceeded.
 
     Called externally every N steps instead of per-step in backward.
     Resets flipped accumulator entries to zero.
+
+    v7 outlier dynamics (code 11 = ±2, sign in a dense side-channel):
+      - promote:  |acc| > outlier_thr_mult × threshold and |w| ≤ 1 → ±2
+                  (sign of acc); acc is parked at ±threshold so it stays
+                  promoted until the leaky decay pulls it below threshold.
+      - demote:   outlier pushed against its sign → ±1 (normal flip path);
+                  outlier whose |acc| drops below threshold → ±1 toward acc.
+      - outliers pushed in their own direction stay put.
 
     Args:
         packed_weights: packed ternary weights (modified in-place)
@@ -548,19 +673,53 @@ def apply_bit_flips(
         toggle: anti-stiction mode — a weight already saturated in the push
             direction (+1 pushed up / -1 pushed down) is kicked to the
             opposite extreme instead of staying a no-op.
+        outlier_signs: dense uint8 sign blob for code-11 weights (row-major
+            scan order, MSB first, 1=positive). None = v6 behavior (no outliers).
+        outlier_thr_mult: promotion threshold multiplier (default 3.0).
+
+    Returns:
+        The rebuilt sign blob tensor (uint8) when ``outlier_signs`` is not
+        None, else None. Callers must store it back (outliers moved).
     """
     flip_up = accumulator > threshold
     flip_down = accumulator < -threshold
-    if flip_up.any() or flip_down.any():
-        w_raw = unpack_ternary_tensor(packed_weights, shape_w)
-        flip_dir = torch.where(flip_up, 1.0, 0.0) + torch.where(flip_down, -1.0, 0.0)
-        w_new = (w_raw + flip_dir).clamp(-1, 1)
-        if toggle:
-            sat_up = (w_raw > 0.5) & flip_up
-            sat_down = (w_raw < -0.5) & flip_down
-            if sat_up.any() or sat_down.any():
-                w_new = torch.where(
-                    sat_up, torch.full_like(w_new, -1.0),
-                    torch.where(sat_down, torch.full_like(w_new, 1.0), w_new))
-        packed_weights.copy_(pack_ternary_tensor(w_new).to(packed_weights.device))
-        accumulator[flip_up | flip_down] = 0.0
+    promote = accumulator.abs() > threshold * outlier_thr_mult
+    if not (flip_up.any() or flip_down.any() or promote.any()):
+        return None
+    w_raw = unpack_ternary_tensor(packed_weights, shape_w, outlier_signs)
+    is_std = w_raw.abs() <= 1.5
+    promote &= is_std
+    out_mask = ~is_std
+    flip_dir = torch.where(flip_up, 1.0, 0.0) + torch.where(flip_down, -1.0, 0.0)
+    w_new = (w_raw + flip_dir).clamp(-1, 1)
+    if toggle:
+        sat_up = (w_raw > 0.5) & flip_up
+        sat_down = (w_raw < -0.5) & flip_down
+        if sat_up.any() or sat_down.any():
+            w_new = torch.where(
+                sat_up, torch.full_like(w_new, -1.0),
+                torch.where(sat_down, torch.full_like(w_new, 1.0), w_new))
+    if promote.any():
+        w_new = torch.where(promote, torch.where(accumulator > 0, 2.0, -2.0), w_new)
+    # Outliers pushed in their own direction stay as outliers
+    same_dir = (w_raw > 0) & flip_up | (w_raw < 0) & flip_down
+    if same_dir.any():
+        w_new = torch.where(out_mask & same_dir, w_raw, w_new)
+    # Outliers whose accumulator relaxed below threshold demote to ±1
+    demote = out_mask & (accumulator.abs() < threshold)
+    if demote.any():
+        direction = torch.where(
+            accumulator > 0, 1.0,
+            torch.where(accumulator < 0, -1.0,
+                        torch.where(w_raw > 0, 1.0, -1.0)))
+        w_new = torch.where(demote, direction, w_new)
+    packed_weights.copy_(pack_ternary_tensor(w_new).to(packed_weights.device))
+    promote_sign = accumulator[promote].sign() if promote.any() else None
+    accumulator[flip_up | flip_down] = 0.0
+    if promote.any():
+        accumulator[promote] = promote_sign * threshold
+    if demote.any():
+        accumulator[demote] = 0.0
+    if outlier_signs is not None:
+        return pack_sign_blob_tensor(w_new).to(packed_weights.device)
+    return None

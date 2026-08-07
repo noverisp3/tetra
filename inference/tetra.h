@@ -54,6 +54,9 @@ struct TernaryWeightXNOR {
     float alpha;               // scalar alpha (default 1.0)
     std::vector<float> alphas; // flat array: per-group = rows*num_groups, per-channel = rows, empty = scalar
     std::vector<float> accumulator; // FP32 learning state (rows*cols), v6 only
+    bool is_v7 = false;        // v7 entry: code 11 = ±2 outlier, sign in outlier_blob
+    std::vector<uint8_t> outlier_blob; // dense sign bits (MSB-first, 1=positive), only
+                                       // ceil(n_outliers/8) bytes, dense-first in scan order
 };
 
 // SIMD dot product: sum(x[i] * w[i]) for i in [0, cols)
@@ -132,15 +135,30 @@ static inline float dot_product_simd(const float* a, const float* b, int n) {
 #define TETRA_PREFETCH(addr) __builtin_prefetch(addr, 0, 3)
 #endif
 
-// Dequantize one row of 2-bit packed ternary -> float array
-static inline void dequantize_row(const uint8_t* packed, int row_offset, int cols, float* out) {
+// Dequantize one row of 2-bit packed ternary -> float array.
+// blob: dense sign bits for code-11 outliers (dense-first in row-major scan
+// order, MSB-first, 1=positive). ``outlier_idx`` is the running counter of
+// code-11 weights already scanned across all rows. blob == nullptr -> v6.
+static inline void dequantize_row(const uint8_t* packed, int row_offset, int cols, float* out,
+                                  const uint8_t* blob, size_t& outlier_idx) {
     static const float lut[4] = {-1.0f, 0.0f, 1.0f, 0.0f};
     int c = 0, num_bytes = (cols + 3) / 4;
     for (int b = 0; b < num_bytes; b++) {
         uint8_t byte = packed[row_offset + b];
         int rem = (cols - c < 4) ? (cols - c) : 4;
         for (int i = 0; i < rem; i++, c++) {
-            out[c] = lut[(byte >> (6 - i * 2)) & 3];
+            int code = (byte >> (6 - i * 2)) & 3;
+            if (code == 3) {
+                if (blob) {
+                    int bit = (int)((blob[outlier_idx >> 3] >> (7 - (outlier_idx & 7))) & 1);
+                    out[c] = bit ? 2.0f : -2.0f;
+                } else {
+                    out[c] = 0.0f;
+                }
+                outlier_idx++;
+            } else {
+                out[c] = lut[code];
+            }
         }
     }
 }
@@ -148,9 +166,12 @@ static inline void dequantize_row(const uint8_t* packed, int row_offset, int col
 // Precompute: dequantize all weights to float at load time
 static void precompute_floats(TernaryWeightXNOR& w) {
     int row_bytes = (w.cols + 3) / 4;
-    w.floats.resize(w.rows * w.cols);
+    w.floats.resize((size_t)w.rows * w.cols);
+    size_t outlier_idx = 0;
     for (int r = 0; r < w.rows; r++) {
-        dequantize_row(w.packed.data(), r * row_bytes, w.cols, w.floats.data() + r * w.cols);
+        dequantize_row(w.packed.data(), r * row_bytes, w.cols,
+                       w.floats.data() + (size_t)r * w.cols,
+                       w.outlier_blob.empty() ? nullptr : w.outlier_blob.data(), outlier_idx);
     }
 }
 
@@ -472,6 +493,7 @@ struct Model {
     float sl_wd_embedding = 0.1f;
     int sl_block_size = 128;
     int sl_toggle = 0;            // anti-stiction toggle kicks
+    float sl_outlier_mult = 3.0f; // v7 promotion threshold multiplier
     bool sl_enabled = false;      // true when a v6 self-learning model was loaded
 };
 
@@ -620,6 +642,17 @@ static Model load_model(const char* path) {
             r.read_bytes(w.accumulator.data(), w.accumulator.size() * sizeof(float));
         }
 
+        // v7: trailing uint32 outlier count + dense sign blob
+        // (ceil(n_outliers/8) bytes, MSB-first, 1=positive, dense-first scan order).
+        if (h.version >= 7) {
+            uint32_t n_outliers = 0;
+            r.read(n_outliers);
+            w.is_v7 = true;
+            size_t nb = ((size_t)n_outliers + 7) / 8;
+            w.outlier_blob.resize(nb);
+            if (nb) r.read_bytes(w.outlier_blob.data(), nb);
+        }
+
         precompute_floats(w);
         model.ternary_weights[name] = std::move(w);
         ternary_count++;
@@ -712,10 +745,11 @@ static Model load_model(const char* path) {
         model.sl_wd_embedding = (float)json_get_num(meta, "sl_wd_embedding", 0.1);
         model.sl_block_size  = (int)json_get_num(meta, "sl_block_size",    128);
         model.sl_toggle      = (int)json_get_num(meta, "sl_toggle",        0);
+        model.sl_outlier_mult = (float)json_get_num(meta, "sl_outlier_mult", 3.0);
         model.sl_enabled = true;
-        fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d toggle=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d\n",
+        fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d toggle=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d outlierMult=%.2f\n",
                 rule.c_str(), model.sl_threshold, model.sl_acc_decay, model.sl_flip_every_n,
-                model.sl_toggle, model.sl_logit_scale, model.sl_lr_embedding, model.sl_wd_embedding, model.sl_block_size);
+                model.sl_toggle, model.sl_logit_scale, model.sl_lr_embedding, model.sl_wd_embedding, model.sl_block_size, model.sl_outlier_mult);
     }
     return model;
 }
@@ -1304,34 +1338,114 @@ static int sample(const std::vector<float>& logits, float temperature, int top_k
 // toggle=true: anti-stiction mode — a weight already saturated in the push
 // direction (+1 pushed up / -1 pushed down) is kicked to the opposite
 // extreme instead of staying a no-op.
-static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = false) {
+// v7 (w.is_v7): code 11 = ±2 outlier with the sign in the dense side-channel
+// blob. Mirrors the Python dynamics:
+//   - promote:  |acc| > outlier_mult * threshold and |w| <= 1 -> ±2 (sign of
+//               acc); acc parked at ±threshold.
+//   - demote:   outlier whose |acc| dropped below threshold -> ±1 toward acc.
+//   - outliers pushed in their own direction stay put (acc reset).
+//   - the sign blob is rebuilt from the packed data at the end.
+static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = false,
+                           float outlier_mult = 3.0f) {
     const int rows = w.rows, cols = w.cols;
     const int row_bytes = (cols + 3) / 4;
+    const size_t n = (size_t)rows * cols;
+    const bool v7 = w.is_v7;
+    const float prom_thr = threshold * outlier_mult;
+    std::vector<int8_t> act(n, 0);  // 0=none, 1=flip up, -1=flip down, 2=promote
+    bool any = false;
+    for (size_t i = 0; i < n; i++) {
+        float a = w.accumulator[i];
+        int8_t f = (a > threshold) ? 1 : ((a < -threshold) ? (int8_t)-1 : (int8_t)0);
+        if (v7 && (a > prom_thr || a < -prom_thr)) f = 2;
+        act[i] = f;
+        if (f) any = true;
+    }
+    if (!any) return 0;
+
     int flips = 0;
     for (int r = 0; r < rows; r++) {
         float* prow = w.floats.data() + (size_t)r * cols;
         uint8_t* packed_row = w.packed.data() + (size_t)r * row_bytes;
         float* acc_row = w.accumulator.data() + (size_t)r * cols;
         for (int c = 0; c < cols; c++) {
-            float a = acc_row[c];
-            if (a > threshold || a < -threshold) {
-                int dir = (a > threshold) ? 1 : -1;
-                float nv;
-                if (toggle && ((prow[c] > 0.5f && dir > 0) || (prow[c] < -0.5f && dir < 0))) {
-                    nv = -prow[c];  // kick to opposite extreme
+            size_t i = (size_t)r * cols + c;
+            int8_t f = act[i];
+            if (!f) continue;
+            float wv = prow[c];
+            bool is_std = (fabsf(wv) <= 1.5f);
+            if (f == 2) {
+                if (!is_std) {
+                    // outlier with huge acc: fall back to normal flip (same-dir stays)
+                    f = (acc_row[c] > 0) ? 1 : -1;
                 } else {
-                    nv = prow[c] + (float)dir;
-                    if (nv > 1.0f) nv = 1.0f;
-                    else if (nv < -1.0f) nv = -1.0f;
+                    prow[c] = (acc_row[c] > 0) ? 2.0f : -2.0f;
+                    acc_row[c] = (acc_row[c] > 0) ? threshold : -threshold;
+                    flips++;
+                    continue;
                 }
-                prow[c] = nv;
-                int enc = (nv < -0.5f) ? 0 : ((nv > 0.5f) ? 2 : 1);
-                int byte_idx = c >> 2;
-                int shift = 6 - (c & 3) * 2;
-                packed_row[byte_idx] = (uint8_t)(
-                    (packed_row[byte_idx] & ~(3 << shift)) | (enc << shift));
-                acc_row[c] = 0.0f;
+            }
+            if (!is_std) {
+                bool same_dir = (wv > 0 && f > 0) || (wv < 0 && f < 0);
+                if (same_dir) { acc_row[c] = 0.0f; continue; }  // stays outlier
+            }
+            float nv;
+            if (toggle && ((wv > 0.5f && f > 0) || (wv < -0.5f && f < 0))) {
+                nv = -wv;  // kick to opposite extreme
+            } else {
+                nv = wv + (float)f;
+            }
+            if (nv > 1.0f) nv = 1.0f;
+            else if (nv < -1.0f) nv = -1.0f;
+            prow[c] = nv;
+            acc_row[c] = 0.0f;
+            flips++;
+        }
+    }
+
+    // v7 demote: outliers whose accumulator relaxed below threshold -> ±1
+    if (v7) {
+        for (size_t i = 0; i < n; i++) {
+            if (act[i]) continue;
+            float wv = w.floats[i];
+            if (fabsf(wv) <= 1.5f) continue;
+            float a = w.accumulator[i];
+            if (fabsf(a) < threshold) {
+                w.floats[i] = (a > 0) ? 1.0f : ((a < 0) ? -1.0f : (wv > 0 ? 1.0f : -1.0f));
+                w.accumulator[i] = 0.0f;
                 flips++;
+            }
+        }
+    }
+
+    // Repack floats -> 2-bit codes and rebuild the dense sign blob.
+    for (int r = 0; r < rows; r++) {
+        float* prow = w.floats.data() + (size_t)r * cols;
+        uint8_t* packed_row = w.packed.data() + (size_t)r * row_bytes;
+        for (int c = 0; c < cols; c++) {
+            float v = prow[c];
+            int enc;  // {-2,-1,0,1,2} -> codes {3,0,1,2,3}; -2's sign lives in the blob
+            if (v > 1.5f) enc = 3;
+            else if (v < -1.5f) enc = 3;
+            else if (v > 0.5f) enc = 2;
+            else if (v < -0.5f) enc = 0;
+            else enc = 1;
+            int byte_idx = c >> 2;
+            int shift = 6 - (c & 3) * 2;
+            packed_row[byte_idx] = (uint8_t)(
+                (packed_row[byte_idx] & ~(3 << shift)) | (enc << shift));
+        }
+    }
+    if (v7) {
+        size_t count = 0;
+        for (size_t i = 0; i < n; i++) if (fabsf(w.floats[i]) > 1.5f) count++;
+        w.outlier_blob.assign((count + 7) / 8, 0);
+        size_t k = 0;
+        for (size_t i = 0; i < n; i++) {
+            float v = w.floats[i];
+            if (fabsf(v) > 1.5f) {
+                if (v > 0) w.outlier_blob[k >> 3] |= (uint8_t)(0x80 >> (k & 7));
+                k++;
             }
         }
     }
@@ -1361,21 +1475,22 @@ static std::string build_sl_metadata(const Model& m) {
     else if (m.sl_rule == 2) rule = "p";
     else if (m.sl_rule == 3) rule = "h";
     else if (m.sl_rule == 4) rule = "e";
-    char buf[512];
+    char buf[576];
     snprintf(buf, sizeof(buf),
-        "{\"_export_version\":6,\"sl_rule\":\"%s\",\"sl_threshold\":%.4f,"
+        "{\"_export_version\":%u,\"sl_rule\":\"%s\",\"sl_threshold\":%.4f,"
         "\"sl_acc_decay\":%.4f,\"sl_flip_every_n\":%d,\"sl_toggle\":%d,"
         "\"sl_logit_scale\":%.8f,"
-        "\"sl_lr_embedding\":%.8f,\"sl_wd_embedding\":%.4f,\"sl_block_size\":%d}",
-        rule, m.sl_threshold, m.sl_acc_decay, m.sl_flip_every_n, m.sl_toggle,
+        "\"sl_lr_embedding\":%.8f,\"sl_wd_embedding\":%.4f,\"sl_block_size\":%d,"
+        "\"sl_outlier_mult\":%.4f}",
+        m.header.version, rule, m.sl_threshold, m.sl_acc_decay, m.sl_flip_every_n, m.sl_toggle,
         m.sl_logit_scale,
-        m.sl_lr_embedding, m.sl_wd_embedding, m.sl_block_size);
+        m.sl_lr_embedding, m.sl_wd_embedding, m.sl_block_size, m.sl_outlier_mult);
     return std::string(buf);
 }
 
-// Serialize the (possibly mutated) model back to a v6 binary. Writes to a
-// .tmp sibling then atomically renames over the destination so a crash never
-// leaves a truncated file.
+// Serialize the (possibly mutated) model back to a binary (v6 or v7, matching
+// the loaded header version). Writes to a .tmp sibling then atomically renames
+// over the destination so a crash never leaves a truncated file.
 static void save_model(Model& model, const char* path) {
     std::string tmp = std::string(path) + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
@@ -1385,7 +1500,7 @@ static void save_model(Model& model, const char* path) {
     uint8_t hdr[64];
     memset(hdr, 0, 64);
     memcpy(hdr, "TETR", 4);
-    uint32_t ver = 6;
+    uint32_t ver = (H.version >= 7) ? 7u : 6u;
     memcpy(hdr + 4, &ver, 4);
     memcpy(hdr + 8,  &H.vocab_size, 4);
     memcpy(hdr + 12, &H.hidden_dim, 4);
@@ -1415,6 +1530,27 @@ static void save_model(Model& model, const char* path) {
         fwrite(w.packed.data(), 1, w.packed.size(), f);
         if (!w.accumulator.empty())
             fwrite(w.accumulator.data(), 4, w.accumulator.size(), f);
+        if (ver >= 7) {
+            // Rebuild the dense sign blob from the dequantized floats so it is
+            // always consistent with the packed code-11 positions, then write
+            // the trimmed ceil(n/8) bytes (matches the Python exporter).
+            const size_t total = (size_t)w.rows * w.cols;
+            size_t count = 0;
+            for (size_t i = 0; i < total; i++)
+                if (fabsf(w.floats[i]) > 1.5f) count++;
+            std::vector<uint8_t> blob((count + 7) / 8, 0);
+            size_t k = 0;
+            for (size_t i = 0; i < total; i++) {
+                float v = w.floats[i];
+                if (fabsf(v) > 1.5f) {
+                    if (v > 0) blob[k >> 3] |= (uint8_t)(0x80 >> (k & 7));
+                    k++;
+                }
+            }
+            uint32_t n_outliers = (uint32_t)count;
+            fwrite(&n_outliers, 4, 1, f);
+            if (!blob.empty()) fwrite(blob.data(), 1, blob.size(), f);
+        }
     }
 
     for (auto& kv : model.fp32_weights) {

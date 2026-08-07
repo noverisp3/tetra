@@ -200,6 +200,10 @@ class DiscreteConfig:
                                # (weakest |acc| first) back to 0
     init_mode: str = "default" # "default" (75%/-1) or "balanced" (33/33/33)
 
+    # v7 outlier promotion: |acc| > outlier_thr_mult × threshold → weight
+    # becomes ±2 (code 11) with its sign in the side-channel blob.
+    outlier_thr_mult: float = 3.0
+
     # Embedding (FP32, trained with plain local SGD since it is not ternary)
     train_embedding: bool = True
     lr_embedding: float = 1e-4
@@ -236,6 +240,7 @@ def build_model_from_config(config: DiscreteConfig) -> StochasticTransformerMode
         ffn_dim=config.ffn_dim,
         max_seq_len=config.max_seq_len,
         threshold=config.threshold,
+        outlier_thr_mult=config.outlier_thr_mult,
     )
     if config.init_mode == "balanced":
         from .quantization import init_ternary_weight
@@ -572,9 +577,13 @@ class DiscreteTrainer:
         from .quantization import apply_bit_flips, pack_ternary_tensor
         cfg = self.config
         for m in self._linear_map.values():
-            apply_bit_flips(
+            blob = apply_bit_flips(
                 m.packed_weights, m.accumulator, m.threshold, m.scale,
-                (m.out_features, m.in_features), toggle=cfg.toggle)
+                (m.out_features, m.in_features), toggle=cfg.toggle,
+                outlier_signs=m.outlier_signs,
+                outlier_thr_mult=m.outlier_thr_mult)
+            if blob is not None:
+                m.outlier_signs[:blob.numel()].copy_(blob)
             m._w_raw_cache = None
             if cfg.zero_center > 0:
                 w = m.get_ternary_weights().float()

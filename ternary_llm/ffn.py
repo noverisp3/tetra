@@ -102,6 +102,7 @@ class StochasticFFN(nn.Module):
         int8: bool = False,
         per_channel: bool = False,
         group_size: int = 0,
+        outlier_thr_mult: float = 3.0,
     ):
         super().__init__()
         from .layers import StochasticTernaryLinear
@@ -109,14 +110,17 @@ class StochasticFFN(nn.Module):
         self.gate_proj = StochasticTernaryLinear(
             hidden_dim, ffn_dim, scale=scale, threshold=threshold,
             int8=int8, per_channel=per_channel, group_size=group_size,
+            outlier_thr_mult=outlier_thr_mult,
         )
         self.up_proj = StochasticTernaryLinear(
             hidden_dim, ffn_dim, scale=scale, threshold=threshold,
             int8=int8, per_channel=per_channel, group_size=group_size,
+            outlier_thr_mult=outlier_thr_mult,
         )
         self.down_proj = StochasticTernaryLinear(
             ffn_dim, hidden_dim, scale=scale, threshold=threshold,
             int8=int8, per_channel=per_channel, group_size=group_size,
+            outlier_thr_mult=outlier_thr_mult,
         )
         self.dropout = nn.Dropout(dropout)
 

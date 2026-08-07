@@ -8,6 +8,9 @@
 #include <cstring>
 #include <algorithm>
 #include <immintrin.h>
+#include <pybind11/pybind11.h>
+
+namespace py = pybind11;
 
 // Pack 16 ternary floats at once using AVX-512
 static void pack_16_floats(const float* data, uint8_t* out, int64_t base, int64_t n) {
@@ -17,7 +20,7 @@ static void pack_16_floats(const float* data, uint8_t* out, int64_t base, int64_
     // Actually, just use the scalar approach for correctness (pack is not hot path)
     for (int i = 0; i < 16 && base + i < n; i++) {
         float f = data[base + i];
-        int v = (f >= 0.5f) ? 2 : (f <= -0.5f) ? 0 : 1;
+        int v = (f >= 1.5f) ? 3 : (f >= 0.5f) ? 2 : (f <= -1.5f) ? 3 : (f <= -0.5f) ? 0 : 1;
         out[base / 4 + i / 4] |= v << (6 - 2 * (i % 4));
     }
 }
@@ -58,12 +61,12 @@ at::Tensor unpack_ternary_avx512(at::Tensor packed, std::vector<int64_t> shape) 
     auto* out = result.data_ptr<float>();
 
     // LUT for 4 possible 2-bit values
-    static const float lut[4] = {-1.0f, 0.0f, 1.0f, 0.0f};
+    static const float lut[4] = {-1.0f, 0.0f, 1.0f, 2.0f};  // code 11 = outlier ±2
     // AVX-512 broadcast LUT into a register for vectorized lookup
-    __m512 lut_v = _mm512_setr_ps(-1.0f, 0.0f, 1.0f, 0.0f,
-                                   -1.0f, 0.0f, 1.0f, 0.0f,
-                                   -1.0f, 0.0f, 1.0f, 0.0f,
-                                   -1.0f, 0.0f, 1.0f, 0.0f);
+    __m512 lut_v = _mm512_setr_ps(-1.0f, 0.0f, 1.0f, 2.0f,
+                                   -1.0f, 0.0f, 1.0f, 2.0f,
+                                   -1.0f, 0.0f, 1.0f, 2.0f,
+                                   -1.0f, 0.0f, 1.0f, 2.0f);
 
     int64_t i = 0;
     // Process in blocks of 16 (4 packed bytes = 16 weights)
@@ -111,7 +114,7 @@ at::Tensor ternary_matmul_avx512(at::Tensor x, at::Tensor packed_weights,
     const auto* x_data = x.data_ptr<float>();
     int64_t tokens = batch * seq;
 
-    static const float lut[4] = {-1.0f, 0.0f, 1.0f, 0.0f};
+    static const float lut[4] = {-1.0f, 0.0f, 1.0f, 2.0f};  // code 11 = outlier ±2
     const int64_t TILE_OF = 16;
 
     for (int64_t t = 0; t < tokens; t++) {
@@ -166,6 +169,7 @@ at::Tensor ternary_matmul_avx512(at::Tensor x, at::Tensor packed_weights,
                     int val = (w[byte_idx] >> shift) & 3;
                     if (val == 0) sum -= row_x[if2];
                     else if (val == 2) sum += row_x[if2];
+                    else if (val == 3) sum += 2.0f * row_x[if2];
                 }
 
                 row_out[of0 + of] = sum * scale;
@@ -178,9 +182,12 @@ at::Tensor ternary_matmul_avx512(at::Tensor x, at::Tensor packed_weights,
 
 // INT8 ternary matmul: int8 activations x packed ternary -> float32 output
 // (scalar implementation, AVX-512 optimization can be added later)
+// Code 11 (outlier ±2) resolves its sign from the dense side-channel bits
+// (row-major scan order, MSB first, 1 = positive).
 
 at::Tensor ternary_matmul_int8_avx512(at::Tensor x_int8, at::Tensor packed_weights,
-                                       int64_t out_features, int64_t in_features) {
+                                       int64_t out_features, int64_t in_features,
+                                       at::Tensor outlier_signs) {
     TORCH_CHECK(x_int8.dtype() == torch::kInt8);
     TORCH_CHECK(packed_weights.dtype() == torch::kUInt8);
     TORCH_CHECK(x_int8.is_contiguous());
@@ -193,6 +200,22 @@ at::Tensor ternary_matmul_int8_avx512(at::Tensor x_int8, at::Tensor packed_weigh
 
     const auto* x_data = x_int8.data_ptr<int8_t>();
     const auto* w = packed_weights.data_ptr<uint8_t>();
+    const bool has_signs = outlier_signs.defined() && outlier_signs.numel() > 0;
+    const auto* signs = has_signs ? outlier_signs.data_ptr<uint8_t>() : nullptr;
+
+    std::vector<int64_t> row_off(out_features + 1, 0);
+    if (has_signs) {
+        for (int64_t of = 0; of < out_features; of++) {
+            const uint8_t* w_row = w + of * in_features / 4;
+            int64_t cnt = 0;
+            for (int64_t if_ = 0; if_ < in_features; if_++) {
+                int shift = 6 - 2 * (if_ % 4);
+                if (((w_row[if_ / 4] >> shift) & 3) == 3) cnt++;
+            }
+            row_off[of + 1] = cnt;
+        }
+        for (int64_t of = 1; of <= out_features; of++) row_off[of] += row_off[of - 1];
+    }
 
     auto result = torch::empty({batch, seq, out_features}, torch::kFloat32);
     auto* out = result.data_ptr<float>();
@@ -203,23 +226,44 @@ at::Tensor ternary_matmul_int8_avx512(at::Tensor x_int8, at::Tensor packed_weigh
 
         for (int64_t of = 0; of < out_features; of++) {
             const uint8_t* w_row = w + of * in_features / 4;
+            int64_t cursor = row_off[of];
             int32_t acc = 0;
 
             int64_t if_ = 0;
             for (; if_ + 3 < in_features; if_ += 4) {
                 uint8_t byte = w_row[if_ / 4];
-                int v0 = (int)((byte >> 6) & 3) - 1;
-                int v1 = (int)((byte >> 4) & 3) - 1;
-                int v2 = (int)((byte >> 2) & 3) - 1;
-                int v3 = (int)(byte & 3) - 1;
-                if (v0 == 1)      acc += (int32_t)x_row[if_];
-                else if (v0 == -1) acc -= (int32_t)x_row[if_];
-                if (v1 == 1)      acc += (int32_t)x_row[if_+1];
-                else if (v1 == -1) acc -= (int32_t)x_row[if_+1];
-                if (v2 == 1)      acc += (int32_t)x_row[if_+2];
-                else if (v2 == -1) acc -= (int32_t)x_row[if_+2];
-                if (v3 == 1)      acc += (int32_t)x_row[if_+3];
-                else if (v3 == -1) acc -= (int32_t)x_row[if_+3];
+                int c0 = (byte >> 6) & 3;
+                int c1 = (byte >> 4) & 3;
+                int c2 = (byte >> 2) & 3;
+                int c3 = byte & 3;
+                if (c0 == 2)      acc += (int32_t)x_row[if_];
+                else if (c0 == 0) acc -= (int32_t)x_row[if_];
+                else if (c0 == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_];
+                }
+                if (c1 == 2)      acc += (int32_t)x_row[if_+1];
+                else if (c1 == 0) acc -= (int32_t)x_row[if_+1];
+                else if (c1 == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_+1];
+                }
+                if (c2 == 2)      acc += (int32_t)x_row[if_+2];
+                else if (c2 == 0) acc -= (int32_t)x_row[if_+2];
+                else if (c2 == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_+2];
+                }
+                if (c3 == 2)      acc += (int32_t)x_row[if_+3];
+                else if (c3 == 0) acc -= (int32_t)x_row[if_+3];
+                else if (c3 == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_+3];
+                }
             }
             for (; if_ < in_features; if_++) {
                 int byte_idx = (of * in_features + if_) / 4;
@@ -227,6 +271,11 @@ at::Tensor ternary_matmul_int8_avx512(at::Tensor x_int8, at::Tensor packed_weigh
                 int code = (w[byte_idx] >> shift) & 3;
                 if (code == 2)       acc += (int32_t)x_row[if_];
                 else if (code == 0)  acc -= (int32_t)x_row[if_];
+                else if (code == 3) {
+                    int s = signs ? ((signs[cursor >> 3] >> (7 - (cursor & 7))) & 1) : 1;
+                    cursor++;
+                    acc += (s ? 2 : -2) * (int32_t)x_row[if_];
+                }
             }
             out_row[of] = (float)acc;
         }
@@ -239,5 +288,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pack_ternary", &pack_ternary_avx512);
     m.def("unpack_ternary", &unpack_ternary_avx512);
     m.def("ternary_matmul", &ternary_matmul_avx512);
-    m.def("ternary_matmul_int8", &ternary_matmul_int8_avx512);
+    m.def("ternary_matmul_int8", &ternary_matmul_int8_avx512,
+          py::arg("x_int8"), py::arg("packed_weights"),
+          py::arg("out_features"), py::arg("in_features"),
+          py::arg("outlier_signs") = at::Tensor());
 }

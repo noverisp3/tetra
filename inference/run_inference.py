@@ -183,7 +183,7 @@ def python_inference(
                 num_layers=config["num_layers"], num_heads=config["num_heads"],
                 ffn_dim=config["ffn_dim"], max_seq_len=config["max_seq_len"],
             )
-        model.load_state_dict(sd)
+        model.load_state_dict(sd, strict=False)
         model.eval()
         print(f"Loaded from {c}")
 
