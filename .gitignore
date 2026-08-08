@@ -15,6 +15,7 @@ data/*.txt
 data/*.bin
 data/*.json
 data/*.rar
+data/fineweb_10bt/
 data_local/
 tinydata/
 data_teacher/

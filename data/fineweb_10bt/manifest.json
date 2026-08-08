@@ -1,9 +1,0 @@
-{
-  "sources": {
-    "fineweb": {
-      "ratio": 1.0
-    }
-  },
-  "total_tokens": 12350000000,
-  "vocab_size": 8192
-}
