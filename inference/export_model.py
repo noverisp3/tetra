@@ -842,6 +842,8 @@ Examples:
                         help="Per-channel flip threshold tau = K * RMS(acc) in the C++ runtime (Exp 3; 0 = fixed scalar threshold)")
     parser.add_argument("--sl-sparsity", type=float, default=0.0,
                         help="Top-k feed: keep only this fraction of per-row |grad| in the C++ runtime (Exp 3; 0 = feed all)")
+    parser.add_argument("--sl-logit-scale", type=float, default=None,
+                        help="Logit scale for C++ CE/embedding-gradient math (None = auto: 1/sqrt(H) for discrete, 1.0 for STE backprop checkpoints)")
     parser.add_argument("--sl-reset-acc", action="store_true",
                         help="Write zeroed accumulators (safe default for toggled runs; the Python acc state is transient — finding #10)")
     parser.add_argument("--v7", action="store_true",
@@ -873,7 +875,16 @@ Examples:
         )
         model.load_state_dict(sd, strict=False)
 
-        logit_scale = 1.0 / (config["hidden_dim"] ** 0.5)
+        # Logit scale for the C++ runtime's CE/embedding-gradient math.
+        # - Discrete trainer checkpoints are calibrated to 1/sqrt(hidden_dim)
+        #   (raw logits explode on init; DiscreteConfig default).
+        # - STE backprop checkpoints (train_baseline_backprop.py) train in the
+        #   natural regime (scale=1.0, see eval_ce default). Using 1/sqrt(H)
+        #   here silently inflates every CE ~+1.8 nats (softmax near-uniform)
+        #   and weakens the embedding gradient the runtime feeds on (Exp 7).
+        logit_scale = args.sl_logit_scale
+        if logit_scale is None:
+            logit_scale = 1.0 / (config["hidden_dim"] ** 0.5) if is_discrete else 1.0
         metadata = dict(config) if not args.no_metadata else {}
         for k in list(metadata.keys()):
             v = metadata[k]
