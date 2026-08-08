@@ -313,6 +313,31 @@ The exported model **continues learning in C++** on raw token streams, implement
 - Tied embedding updated with local SGD: per-row gradient clip (norm<1 → normalize) + decoupled weight decay (`lr=1e-4`, `wd=0.1`)
 - **Atomic write-back**: `.tmp` file + `MoveFileEx` rename (crash-safe save)
 
+**Exp 3 flip mechanics (ported from the Python `DiscreteTrainer`, default off)** — the exact
+mechanism that won Exp 5/6 (real new-domain continual learning on fineweb) is now available
+natively in C++:
+
+- `--energy`: feed the accumulator **gradient magnitude** `-grad` instead of `-sign(grad)` votes.
+  Sign-vote accumulators are near-uniform (`|acc|/RMS < 1.2`) so the adaptive threshold below
+  would freeze them; the magnitude form gives the heavy tail the adaptive τ needs.
+- `--adaptive-thr K`: per-output-channel flip threshold `τ = K · RMS(acc)` instead of the fixed
+  scalar `thr`. Scale-invariant flip budget (independent of gradient/logit scale); idle channels
+  (RMS ~ 0) get a small floor so they don't flip on noise. Promotion/demotion of v7 ±2 outliers
+  uses the same per-channel τ (`promote > τ·outlier_mult`, `demote < τ`).
+- Both are also persisted in the binary metadata (`sl_energy`, `sl_adaptive_thr`) by
+  `export_model.py --sl-energy --sl-adaptive-thr K`, so a device run picks them up automatically.
+  CLI flags override the metadata (same convention as `thr`/`decay`).
+
+Backward-compatible: existing v6/v7 exports (no `sl_energy`/`sl_adaptive_thr`) run bit-identical
+to before the port.
+
+```bash
+# Fixed threshold (v6 behavior, unchanged)
+selflearn.exe model.bin tokens.bin out.bin 200 50 100
+# Exp 3 mechanism: magnitude accumulator + adaptive threshold
+selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0
+```
+
 ### Binary format v6
 
 v6 = v5 + one **FP32 accumulator** (`rows×cols`) appended to every ternary entry + a trailing `META` section containing a JSON blob with the self-learning config (`sl_rule`, `sl_threshold`, `sl_acc_decay`, `sl_flip_every_n`, `sl_logit_scale`, `sl_lr_embedding`, `sl_wd_embedding`, `sl_block_size`, `_export_version`). Export via `export_model.py ... --self-learning`.

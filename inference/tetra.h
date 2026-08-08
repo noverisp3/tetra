@@ -494,6 +494,9 @@ struct Model {
     int sl_block_size = 128;
     int sl_toggle = 0;            // anti-stiction toggle kicks
     float sl_outlier_mult = 3.0f; // v7 promotion threshold multiplier
+    // Exp 3 flip mechanics (ported from the Python DiscreteTrainer):
+    int sl_energy = 0;            // feed -grad (magnitude) into accumulators instead of -sign(grad)
+    float sl_adaptive_thr = 0.0f; // tau = k * RMS(acc) per output channel (0 = fixed scalar threshold)
     bool sl_enabled = false;      // true when a v6 self-learning model was loaded
 };
 
@@ -746,10 +749,13 @@ static Model load_model(const char* path) {
         model.sl_block_size  = (int)json_get_num(meta, "sl_block_size",    128);
         model.sl_toggle      = (int)json_get_num(meta, "sl_toggle",        0);
         model.sl_outlier_mult = (float)json_get_num(meta, "sl_outlier_mult", 3.0);
+        model.sl_energy = (int)json_get_num(meta, "sl_energy", 0);
+        model.sl_adaptive_thr = (float)json_get_num(meta, "sl_adaptive_thr", 0.0);
         model.sl_enabled = true;
-        fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d toggle=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d outlierMult=%.2f\n",
+        fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d toggle=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d outlierMult=%.2f energy=%d adaptiveThr=%.3f\n",
                 rule.c_str(), model.sl_threshold, model.sl_acc_decay, model.sl_flip_every_n,
-                model.sl_toggle, model.sl_logit_scale, model.sl_lr_embedding, model.sl_wd_embedding, model.sl_block_size, model.sl_outlier_mult);
+                model.sl_toggle, model.sl_logit_scale, model.sl_lr_embedding, model.sl_wd_embedding, model.sl_block_size, model.sl_outlier_mult,
+                model.sl_energy, model.sl_adaptive_thr);
     }
     return model;
 }
@@ -1346,18 +1352,34 @@ static int sample(const std::vector<float>& logits, float temperature, int top_k
 //   - outliers pushed in their own direction stay put (acc reset).
 //   - the sign blob is rebuilt from the packed data at the end.
 static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = false,
-                           float outlier_mult = 3.0f) {
+                           float outlier_mult = 3.0f, float adaptive_thr = 0.0f) {
     const int rows = w.rows, cols = w.cols;
     const int row_bytes = (cols + 3) / 4;
     const size_t n = (size_t)rows * cols;
     const bool v7 = w.is_v7;
-    const float prom_thr = threshold * outlier_mult;
+
+    // Exp 3 adaptive threshold: tau per output channel = adaptive_thr * RMS(acc).
+    // Scale-invariant flip budget; near-idle channels (RMS ~ 0) get a small floor
+    // so they don't flip on noise (mirrors Python clamp_min(1e-4)).
+    std::vector<float> tau(rows, threshold);
+    if (adaptive_thr > 0.0f) {
+        for (int r = 0; r < rows; r++) {
+            const float* acc_row = w.accumulator.data() + (size_t)r * cols;
+            double sumsq = 0.0;
+            for (int c = 0; c < cols; c++) sumsq += (double)acc_row[c] * acc_row[c];
+            float rms = (float)std::sqrt(sumsq / (double)cols);
+            tau[r] = adaptive_thr * (rms > 1e-4f ? rms : 1e-4f);
+        }
+    }
+
     std::vector<int8_t> act(n, 0);  // 0=none, 1=flip up, -1=flip down, 2=promote
     bool any = false;
     for (size_t i = 0; i < n; i++) {
+        int r = (int)(i / (size_t)cols);
         float a = w.accumulator[i];
-        int8_t f = (a > threshold) ? 1 : ((a < -threshold) ? (int8_t)-1 : (int8_t)0);
-        if (v7 && (a > prom_thr || a < -prom_thr)) f = 2;
+        float t = tau[r];
+        int8_t f = (a > t) ? 1 : ((a < -t) ? (int8_t)-1 : (int8_t)0);
+        if (v7 && (a > t * outlier_mult || a < -t * outlier_mult)) f = 2;
         act[i] = f;
         if (f) any = true;
     }
@@ -1368,6 +1390,7 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = 
         float* prow = w.floats.data() + (size_t)r * cols;
         uint8_t* packed_row = w.packed.data() + (size_t)r * row_bytes;
         float* acc_row = w.accumulator.data() + (size_t)r * cols;
+        const float t = tau[r];
         for (int c = 0; c < cols; c++) {
             size_t i = (size_t)r * cols + c;
             int8_t f = act[i];
@@ -1380,7 +1403,7 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = 
                     f = (acc_row[c] > 0) ? 1 : -1;
                 } else {
                     prow[c] = (acc_row[c] > 0) ? 2.0f : -2.0f;
-                    acc_row[c] = (acc_row[c] > 0) ? threshold : -threshold;
+                    acc_row[c] = (acc_row[c] > 0) ? t : -t;  // park at per-channel tau
                     flips++;
                     continue;
                 }
@@ -1405,15 +1428,21 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = 
 
     // v7 demote: outliers whose accumulator relaxed below threshold -> ±1
     if (v7) {
-        for (size_t i = 0; i < n; i++) {
-            if (act[i]) continue;
-            float wv = w.floats[i];
-            if (fabsf(wv) <= 1.5f) continue;
-            float a = w.accumulator[i];
-            if (fabsf(a) < threshold) {
-                w.floats[i] = (a > 0) ? 1.0f : ((a < 0) ? -1.0f : (wv > 0 ? 1.0f : -1.0f));
-                w.accumulator[i] = 0.0f;
-                flips++;
+        for (int r = 0; r < rows; r++) {
+            const float t = tau[r];
+            float* prow = w.floats.data() + (size_t)r * cols;
+            float* acc_row = w.accumulator.data() + (size_t)r * cols;
+            for (int c = 0; c < cols; c++) {
+                size_t i = (size_t)r * cols + c;
+                if (act[i]) continue;
+                float wv = prow[c];
+                if (fabsf(wv) <= 1.5f) continue;
+                float a = acc_row[c];
+                if (fabsf(a) < t) {
+                    prow[c] = (a > 0) ? 1.0f : ((a < 0) ? -1.0f : (wv > 0 ? 1.0f : -1.0f));
+                    acc_row[c] = 0.0f;
+                    flips++;
+                }
             }
         }
     }
@@ -1454,14 +1483,23 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = 
 
 // Rule 'c' (predictive coding): feed one block's gradient into the weights.
 //   grad[o][i] += (y_t - y_{t-1})[o] * x_{t-1}[i]   over the block
-//   acc = acc * decay + (-sign(grad))
+//   energy=false: acc = acc * decay + (-sign(grad))      (v6, uniform votes)
+//   energy=true : acc = acc * decay + (-grad)            (Exp 3, keeps magnitude)
+// The magnitude-weighted form is required for the adaptive threshold
+// (tau = k*RMS(acc)): sign-vote accumulators are near-uniform (|acc|/RMS < 1.2)
+// so adaptive tau freezes them (see DiscreteConfig.rule_energy in Python).
 static void sl_feed_predictive(TernaryWeightXNOR& w, const std::vector<float>& grad,
-                               float acc_decay) {
+                               float acc_decay, bool energy = false) {
     const size_t n = (size_t)w.rows * w.cols;
-    for (size_t j = 0; j < n; j++) {
-        float g = grad[j];
-        float d = (g > 0.0f) ? -1.0f : ((g < 0.0f) ? 1.0f : 0.0f);
-        w.accumulator[j] = w.accumulator[j] * acc_decay + d;
+    if (energy) {
+        for (size_t j = 0; j < n; j++)
+            w.accumulator[j] = w.accumulator[j] * acc_decay - grad[j];
+    } else {
+        for (size_t j = 0; j < n; j++) {
+            float g = grad[j];
+            float d = (g > 0.0f) ? -1.0f : ((g < 0.0f) ? 1.0f : 0.0f);
+            w.accumulator[j] = w.accumulator[j] * acc_decay + d;
+        }
     }
 }
 
@@ -1475,16 +1513,17 @@ static std::string build_sl_metadata(const Model& m) {
     else if (m.sl_rule == 2) rule = "p";
     else if (m.sl_rule == 3) rule = "h";
     else if (m.sl_rule == 4) rule = "e";
-    char buf[576];
+    char buf[600];
     snprintf(buf, sizeof(buf),
         "{\"_export_version\":%u,\"sl_rule\":\"%s\",\"sl_threshold\":%.4f,"
         "\"sl_acc_decay\":%.4f,\"sl_flip_every_n\":%d,\"sl_toggle\":%d,"
         "\"sl_logit_scale\":%.8f,"
         "\"sl_lr_embedding\":%.8f,\"sl_wd_embedding\":%.4f,\"sl_block_size\":%d,"
-        "\"sl_outlier_mult\":%.4f}",
+        "\"sl_outlier_mult\":%.4f,\"sl_energy\":%d,\"sl_adaptive_thr\":%.4f}",
         m.header.version, rule, m.sl_threshold, m.sl_acc_decay, m.sl_flip_every_n, m.sl_toggle,
         m.sl_logit_scale,
-        m.sl_lr_embedding, m.sl_wd_embedding, m.sl_block_size, m.sl_outlier_mult);
+        m.sl_lr_embedding, m.sl_wd_embedding, m.sl_block_size, m.sl_outlier_mult,
+        m.sl_energy, m.sl_adaptive_thr);
     return std::string(buf);
 }
 

@@ -88,13 +88,15 @@ int main(int argc, char** argv) {
 
     if (argc < 4) {
         fprintf(stderr,
-            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every] [toggle] [--toggle-window N] [--thr-anneal RATE]\n",
+            "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every] [toggle] [--toggle-window N] [--thr-anneal RATE] [--energy] [--adaptive-thr K]\n",
             argv[0]);
         fprintf(stderr,
             "  thr/decay/flip_every/toggle override the v6 metadata (0 = keep metadata value; -1 for toggle = keep metadata)\n");
         fprintf(stderr,
             "  --toggle-window N: only toggle for the first N blocks, then no-op flips (annealing, finding #12)\n"
-            "  --thr-anneal RATE: raise the flip threshold by RATE per pass (finding #12 refinement)\n");
+            "  --thr-anneal RATE: raise the flip threshold by RATE per pass (finding #12 refinement)\n"
+            "  --energy: feed -grad magnitude into accumulators (Exp 3, needed with --adaptive-thr)\n"
+            "  --adaptive-thr K: per-channel flip threshold tau = K * RMS(acc) (Exp 3, scale-invariant)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -163,6 +165,20 @@ int main(int argc, char** argv) {
             thr_anneal = (float)atof(argv[i + 1]);
         }
     }
+    // Exp 3 flip mechanics: "--energy" switches the accumulator feed from
+    // -sign(grad) votes to -grad magnitude; "--adaptive-thr K" sets the
+    // per-channel flip threshold tau = K * RMS(acc). Negative value = keep the
+    // exported metadata value.
+    bool energy_override = false;
+    float adaptive_override = -1.0f;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--energy") == 0) energy_override = true;
+    }
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--adaptive-thr") == 0) {
+            adaptive_override = (float)atof(argv[i + 1]);
+        }
+    }
 
     auto t0 = std::chrono::high_resolution_clock::now();
     Model model = load_model(model_path);
@@ -194,6 +210,8 @@ int main(int argc, char** argv) {
     const float scale = model.sl_logit_scale;
     const float lr_emb = model.sl_lr_embedding;
     const float wd_emb = model.sl_wd_embedding;
+    const bool energy = energy_override ? true : (model.sl_energy != 0);
+    const float adaptive_thr = adaptive_override >= 0.0f ? adaptive_override : model.sl_adaptive_thr;
 
     // Per-block gradient buffers, keyed by layer name (filled from first capture).
     std::vector<std::string> names;
@@ -216,13 +234,14 @@ int main(int argc, char** argv) {
     std::vector<float> softmax_buf(V);
     auto t1 = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "Init in %.1f ms | block=%d thr=%.1f decay=%.3f flipEvery=%d toggle=%d%s "
-                    "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s%s\n",
+                    "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s%s energy=%d adaptiveThr=%.3f\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
             block, thr, decay, flip_every, toggle ? 1 : 0,
             (toggle_window > 0 ? " (anneal off after block " + std::to_string(toggle_window) + ")" : "").c_str(),
             scale, lr_emb, wd_emb,
             (thr_anneal > 0.0f ? " | thr-anneal +" + std::to_string(thr_anneal) + "/pass" : "").c_str(),
-            no_ternary ? " | embedding-only" : (flip_only ? " | flip-only" : ""));
+            no_ternary ? " | embedding-only" : (flip_only ? " | flip-only" : ""),
+            energy ? 1 : 0, adaptive_thr);
 
     double ms_total = 0.0;
     for (int step = 0; step < steps; step++) {
@@ -313,7 +332,7 @@ int main(int argc, char** argv) {
             for (size_t l = 0; l < names.size(); l++) {
                 auto it = model.ternary_weights.find(names[l] + ".latent_weights");
                 if (it == model.ternary_weights.end()) continue;
-                sl_feed_predictive(it->second, grads[l], decay);
+                sl_feed_predictive(it->second, grads[l], decay, energy);
             }
         }
 
@@ -363,7 +382,8 @@ int main(int argc, char** argv) {
                 const size_t n = w.floats.size();
                 std::vector<float> before(n);
                 memcpy(before.data(), w.floats.data(), n * sizeof(float));
-                total_flips += apply_bit_flips(w, eff_thr, eff_toggle, model.sl_outlier_mult);
+                total_flips += apply_bit_flips(w, eff_thr, eff_toggle, model.sl_outlier_mult,
+                                               adaptive_thr);
                 const float* f = w.floats.data();
                 for (size_t i = 0; i < n; i++)
                     if (f[i] != before[i]) { hist[i]++; real_changes++; }

@@ -506,7 +506,7 @@ def export_self_learning(
     rule="c", threshold=20.0, acc_decay=0.99, flip_every_n=5,
     logit_scale=1.0 / 16.0, lr_embedding=1e-4, wd_embedding=0.1,
     block_size=128, toggle=False, reset_accs=False, metadata=None, verbose=True,
-    v7=False,
+    v7=False, energy=False, adaptive_thr=0.0,
 ):
     """Export a stochastic model to binary format v6/v7 for the C++ self-learning runtime.
 
@@ -516,6 +516,11 @@ def export_self_learning(
 
     v7 = v6 + code-11 outlier signs (dense side-channel blob per entry).
     The C++ runtime resolves the outlier magnitude (±2α) at staging time.
+
+    ``energy`` / ``adaptive_thr`` encode the Exp 3 flip mechanics: energy feeds
+    ``-grad`` magnitude into the accumulators (instead of -sign(grad) votes) and
+    ``adaptive_thr`` sets the per-channel flip threshold ``tau = k*RMS(acc)``.
+    Both default off so existing v6/v7 exports keep their exact behavior.
 
     ``reset_accs`` zeroes every exported accumulator: the Python accumulator
     state is transient and unsafe to replay on device (finding #10) — toggled
@@ -671,6 +676,8 @@ def export_self_learning(
             "sl_wd_embedding": float(wd_embedding),
             "sl_block_size": int(block_size),
             "sl_outlier_mult": float(outlier_mult),
+            "sl_energy": int(energy),
+            "sl_adaptive_thr": float(adaptive_thr),
             "_info": {k: v for k, v in info.items() if k != "mode"},
         })
         write_metadata(f, meta)
@@ -828,6 +835,10 @@ Examples:
     parser.add_argument("--sl-block-size", type=int, default=128)
     parser.add_argument("--sl-toggle", action="store_true",
                         help="Anti-stiction toggle kicks in the C++ self-learning runtime")
+    parser.add_argument("--sl-energy", action="store_true",
+                        help="Feed -grad magnitude into accumulators (Exp 3; needed with --sl-adaptive-thr)")
+    parser.add_argument("--sl-adaptive-thr", type=float, default=0.0,
+                        help="Per-channel flip threshold tau = K * RMS(acc) in the C++ runtime (Exp 3; 0 = fixed scalar threshold)")
     parser.add_argument("--sl-reset-acc", action="store_true",
                         help="Write zeroed accumulators (safe default for toggled runs; the Python acc state is transient — finding #10)")
     parser.add_argument("--v7", action="store_true",
@@ -883,6 +894,8 @@ Examples:
             metadata=metadata,
             verbose=not args.quiet,
             v7=args.v7,
+            energy=args.sl_energy,
+            adaptive_thr=args.sl_adaptive_thr,
         )
         return
 
