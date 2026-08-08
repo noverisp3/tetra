@@ -363,6 +363,17 @@ selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptiv
     context) to ~6% (long context) of forward time — the real hotspots are **attn_scores** (up to 70%
     at long context) and **gate_up** FFN matmul (~37% at short context), both dense ±1 ternary GEMMs.
   - CE cost: +0.011 nats (7.7877 → 7.7988 on 2000 pos). Use FP32 (default) when precision matters.
+- **Long-context attention optimization (2 commits)**:
+  - `attention_weighted_sum`: the weighted-sum loop was `d`-outer / `t`-inner, re-scanning the whole V
+    cache `HD` times at `stride=H` (4 of every 64 bytes per cache line used — 16× bandwidth waste). Now
+    `t`-outer with SIMD accumulation: each V row read once, contiguous.
+  - **Head-major KV cache layout**: `[head*max_len*HD + t*HD + d]` instead of `[t*H + head*HD + d]`
+    (same footprint since NH·HD == H). The score loop for a fixed head now reads one contiguous block
+    instead of 1 KB-strided rows. Combined result on `exp7_v6_lr5` (AVX2, FP32 lmhead):
+    - 2000 pos: **123 → 234 tok/s (+90%)**; 200 pos: 353 → ~400 tok/s; prefill 16 tokens: 14.5 → 8.4 ms
+    - CE bit-identical (8.0847 @ 2000, 7.7877 @ 1000, 7.2016 @ 200, 6.8753 @ 100)
+    - Profile @2000: `attn_scores` 70.5% → 39.8%; remaining time is memory-bandwidth-bound (each token
+      reads the full KV cache, ~24 MB at 2000 pos — the inherent cost of softmax attention).
 - **`--compare-lmhead <model.bin> <tokens.bin> [n]`**: runs the same context through FP32 and INT8
   lm_heads and reports Top-1 agreement, Top-5 cross-containment, and per-position CE drift (capped at
   1000 positions). On `exp7_v6_lr5`: Top-1 identical 28.4% but **100% of Top-1 predictions stay inside
