@@ -161,6 +161,49 @@ static inline float dot_product_simd(const float* a, const float* b, int n) {
 }
 #endif
 
+// out[d] += sum_t attn[t] * vbase[t * stride + d]  for d in [0, HD)
+// vbase points at the head's first element; rows are `stride` floats apart.
+// t-outer order walks each V row once (contiguous, prefetch-friendly), instead of
+// the old d-outer form that re-scanned the whole cache `HD` times at stride
+// (16x cache-line waste at 64B lines).
+static inline void attention_weighted_sum(
+    const float* attn, const float* vbase, int stride,
+    int actual_len, int HD, float* out)
+{
+    for (int d = 0; d < HD; d++) out[d] = 0.0f;
+#if defined(__AVX10_1__) || defined(__AVX10__) || defined(__AVX512F__)
+    for (int t = 0; t < actual_len; t++) {
+        __m512 a = _mm512_set1_ps(attn[t]);
+        const float* row = vbase + (size_t)t * stride;
+        for (int d = 0; d + 16 <= HD; d += 16) {
+            __m512 o = _mm512_loadu_ps(out + d);
+            __m512 vr = _mm512_loadu_ps(row + d);
+            _mm512_storeu_ps(out + d, _mm512_fmadd_ps(a, vr, o));
+        }
+        for (int d = HD - HD % 16; d < HD; d++)
+            out[d] += attn[t] * row[d];
+    }
+#elif defined(__AVX2__)
+    for (int t = 0; t < actual_len; t++) {
+        __m256 a = _mm256_set1_ps(attn[t]);
+        const float* row = vbase + (size_t)t * stride;
+        for (int d = 0; d + 8 <= HD; d += 8) {
+            __m256 o = _mm256_loadu_ps(out + d);
+            __m256 vr = _mm256_loadu_ps(row + d);
+            _mm256_storeu_ps(out + d, _mm256_fmadd_ps(a, vr, o));
+        }
+        for (int d = HD - HD % 8; d < HD; d++)
+            out[d] += attn[t] * row[d];
+    }
+#else
+    for (int t = 0; t < actual_len; t++) {
+        const float* row = vbase + (size_t)t * stride;
+        for (int d = 0; d < HD; d++)
+            out[d] += attn[t] * row[d];
+    }
+#endif
+}
+
 // Prefetch helper
 #ifdef _MSC_VER
 #define TETRA_PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
@@ -986,12 +1029,9 @@ static std::vector<float> forward(
                         attn_scores[t] = s;
                     }
                     softmax(attn_scores.data(), actual_len);
-                    for (int d = 0; d < HD; d++) {
-                        float sum = 0.0f;
-                        for (int t = 0; t < actual_len; t++)
-                            sum += attn_scores[t] * cache.v_full_cache[l][t * H + head * HD + d];
-                        attn_out[head * HD + d] = sum;
-                    }
+                    attention_weighted_sum(attn_scores.data(),
+                        cache.v_full_cache[l].data() + head * HD, H,
+                        actual_len, HD, attn_out.data() + head * HD);
                 }
                 std::vector<float> proj_out(H);
                 float o_scale = absmean(attn_out.data(), H);
@@ -1028,12 +1068,9 @@ static std::vector<float> forward(
                         attn_scores[t] = s;
                     }
                     softmax(attn_scores.data(), actual_len);
-                    for (int d = 0; d < HD; d++) {
-                        float sum = 0.0f;
-                        for (int t = 0; t < actual_len; t++)
-                            sum += attn_scores[t] * cache.v_cache[l][t * H + head * HD + d];
-                        attn_out[head * HD + d] = sum;
-                    }
+                    attention_weighted_sum(attn_scores.data(),
+                        cache.v_cache[l].data() + head * HD, H,
+                        actual_len, HD, attn_out.data() + head * HD);
                 }
 #ifdef TETRA_PROFILE
                 TP_T1(3);
@@ -1205,12 +1242,9 @@ static std::vector<float> forward(
                         attn_local[t] = s;
                     }
                     softmax(attn_local.data(), actual_len);
-                    for (int d = 0; d < HD; d++) {
-                        float sum = 0.0f;
-                        for (int t = 0; t < actual_len; t++)
-                            sum += attn_local[t] * cache.v_full_cache[l][t * H + head * HD + d];
-                        out_j[head * HD + d] = sum;
-                    }
+                    attention_weighted_sum(attn_local.data(),
+                        cache.v_full_cache[l].data() + head * HD, H,
+                        actual_len, HD, out_j + head * HD);
                 }
 
                 float os = absmean(out_j, H);
@@ -1252,12 +1286,9 @@ static std::vector<float> forward(
                         attn_local[t] = s;
                     }
                     softmax(attn_local.data(), actual_len);
-                    for (int d = 0; d < HD; d++) {
-                        float sum = 0.0f;
-                        for (int t = 0; t < actual_len; t++)
-                            sum += attn_local[t] * cache.v_cache[l][t * H + head * HD + d];
-                        attn_out[j * H + head * HD + d] = sum;
-                    }
+                    attention_weighted_sum(attn_local.data(),
+                        cache.v_cache[l].data() + head * HD, H,
+                        actual_len, HD, attn_out.data() + j * H + head * HD);
                 }
             }
 
