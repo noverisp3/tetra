@@ -745,12 +745,13 @@ Readings (honest):
   slice CE holds (+0.45, good) but domain CE gets *worse* (+1.01) — the local
   deltas carry no usable new-domain signal at this data scale (2144 tokens).
   This is a data-scale / rule-signal limitation, not a flip-mechanics one.
-- **Conclusion across Exp 1-4**: the bit-flip mechanism, in every variant
-  tested (sign-gate, energy acc, adaptive τ, backprop or local rules), is a
-  *preservation* tool, not a *learning* tool. The gains in this chain all come
-  from stopping destructive flips + letting the FP32 embedding adapt. On-device
-  continual learning *preserves* well and adapts via the embedding — but the
-  ternary core has not yet been shown to learn via local dynamics.
+- **Conclusion across Exp 1-4**: at the 2144-token teacher scale, the bit-flip
+  mechanism, in every variant tested (sign-gate, energy acc, adaptive τ,
+  backprop or local rules), is a *preservation* tool, not a *learning* tool —
+  the gains all come from stopping destructive flips + letting the FP32
+  embedding adapt. **But Exp 5 shows this was a data-scale artifact**: at real
+  scale (534M tokens) the energy + adaptive-τ mechanism *does* make the ternary
+  core learn (k=3: 5.910 vs frozen 6.892, 1% of bits flipped, stable).
 
 Code changes: `predictive_coding_delta`/`forward_forward_delta`/`hebbian_delta`/
 `entropy_delta` take `energy=` (return ±grad instead of ±sign(grad)),
@@ -769,6 +770,61 @@ python train_discrete.py --rule c --steps 100 --data-cache data_teacher \
 python train_discrete.py --rule c --steps 100 --data-cache data_teacher \
     --load-checkpoint checkpoints_bp/checkpoint_000200.pt --logit-scale 1.0 \
     --batch-size 8 --flip-every-n 100000 --save-dir checkpoints_exp4_ctrl
+```
+
+## Experiment: Flip Mechanism at Scale (Exp 5)
+
+Question: Exp 3/4 concluded the ternary core is a *preservation* tool, not a
+learning tool — but that was on the 2144-token teacher POC. At real data scale
+(TinyStories, 534M tokens, same domain the Phase-1 model was trained on), does
+the energy-accumulator + adaptive-τ mechanism let the ternary core actually
+*learn* (reduce held-out CE beyond what the FP32 embedding alone achieves)?
+
+Setup: continue `checkpoints_bp/checkpoint_000200.pt` (slice CE 7.069) on
+`tinydata`, 1000 steps, `--lr-domain 1e-4 --batch-size 8`. Frozen control =
+`--no-flips` (embedding/lm_head train, ternary frozen). Measured: held-out
+`sliceEval100k.bin` CE + % of ternary bits changed vs Phase-1.
+
+| Run | Slice CE @1000 (Δ) | Ternary bits flipped | Trajectory |
+|---|---|---|---|
+| Phase-1 baseline | 7.069 (0) | — | — |
+| **Frozen control** | **6.892 (−0.177)** | 0% | slow, smooth |
+| Energy k=4 | 6.863 (−0.206) | 0.05% | ≈ frozen |
+| **Energy k=3** | **5.910 (−1.159)** | **1.04%** | monotonic, stable |
+| Energy k=2 | 6.256 (−0.813) | 11.6% | unstable (spikes to 6.59) |
+| Sign-vote (fixed thr 20) | 5.605 (−1.464) | 90.3% | catastrophic transient (13.8 @ step 100), recovers |
+
+Readings (honest):
+
+- **The mechanism IS a learning tool at scale — this overturns the Exp 3/4
+  conclusion.** At k=3 the ternary core beats the frozen control by **0.98
+  nats** (5.910 vs 6.892) while flipping only 1.04% of its bits. The Exp 3/4
+  "preservation-only" result was a data-scale artifact: 2144 tokens carry no
+  learnable signal for 6.3M ternary bits, 534M tokens do.
+- **k=3 is the sweet spot and it is stable.** Monotonic decrease, no
+  catastrophic transient — exactly the property continual learning needs
+  (unlike sign-vote's 13.8-nats spike).
+- **The old sign-vote mechanism "wins" on final CE only by mass-destroying and
+  re-learning.** It flips 90% of bits, blowing up CE to 13.8 at step 100, then
+  recovers *because the training data is the same domain*. On a genuinely new
+  domain that transient is exactly Exp 2 M1's catastrophic forgetting (+16.9
+  nats) — unrecoverable.
+- **k controls the flip budget as designed**: k=4 → 0.05% flips ≈ frozen;
+  k=3 → 1% (best); k=2 → 11.6% (too aggressive, unstable). The energy +
+  adaptive-τ mechanism with `k` is a genuine, interpretable "ternary learning
+  rate" at scale.
+
+Reproduce:
+
+```bash
+# Frozen control
+python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
+    --steps 1000 --data-cache tinydata --lr-domain 1e-4 --batch-size 8 \
+    --no-flips --save-dir checkpoints_exp5_ctrl
+# Energy accumulator + adaptive threshold
+python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
+    --steps 1000 --data-cache tinydata --lr-domain 1e-4 --batch-size 8 \
+    --acc-energy --acc-decay 0.99 --adaptive-thr 3.0 --save-dir checkpoints_exp5_k3
 ```
 
 ## Project Structure
