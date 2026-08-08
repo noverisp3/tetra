@@ -837,8 +837,8 @@ teacher POC. Does it hold on a real domain shift at scale?
 Setup: `data/fineweb_10bt/` (494 shards × 25M tokens = 12.3B tokens, same BPE
 vocab 8192 — a genuine domain shift vs Phase-1 TinyStories). Added
 `manifest.json` (multi-source format, ratio 1.0) + carved a held-out eval slice
-from the last shard (`data_fineweb_eval/fineweb_eval100k.bin`). Continue the
-same Phase-1 checkpoint, 1000 steps, `--lr-domain 1e-4 --batch-size 8`, on
+from the last shard (`examples/continual/fineweb_eval100k.bin`, committed).
+Continue the same Phase-1 checkpoint, 1000 steps, `--lr-domain 1e-4 --batch-size 8`, on
 fineweb. Phase-1 baseline: slice 7.069, **domain (fineweb) 8.922** (~1.85 nats
 harder — real shift).
 
@@ -875,13 +875,13 @@ Reproduce:
 python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
     --steps 1000 --data-cache data/fineweb_10bt \
     --eval-slice examples/discrete/sliceEval100k.bin \
-    --domain-eval data_fineweb_eval/fineweb_eval100k.bin \
+    --domain-eval examples/continual/fineweb_eval100k.bin \
     --lr-domain 1e-4 --batch-size 8 --no-flips --save-dir checkpoints_exp6_ctrl
 # Energy accumulator + adaptive threshold (ternary core learns the new domain)
 python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
     --steps 1000 --data-cache data/fineweb_10bt \
     --eval-slice examples/discrete/sliceEval100k.bin \
-    --domain-eval data_fineweb_eval/fineweb_eval100k.bin \
+    --domain-eval examples/continual/fineweb_eval100k.bin \
     --lr-domain 1e-4 --batch-size 8 \
     --acc-energy --acc-decay 0.99 --adaptive-thr 3.0 --save-dir checkpoints_exp6_k3
 ```
@@ -942,6 +942,7 @@ tests/
 examples/
   tiny/                     # Trained tiny checkpoints, loss plots, training history
   discrete/                 # Committed token slices (slice100k.bin, sliceEval100k.bin)
+  continual/                # FineWeb held-out eval slice (fineweb_eval100k.bin) for Exp 6
   v7/                       # v7 ternary-outlier binaries (tetra_v7_smoke.bin, tetra_v7_dbg.bin)
 ```
 

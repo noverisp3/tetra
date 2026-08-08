@@ -41,6 +41,7 @@ checkpoints_*/
 !tokenizer/vocab_info.json
 !examples/discrete/*.bin
 !examples/v7/*.bin
+!examples/continual/*.bin
 
 # IDE
 .vscode/
