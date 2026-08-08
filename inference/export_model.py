@@ -506,7 +506,7 @@ def export_self_learning(
     rule="c", threshold=20.0, acc_decay=0.99, flip_every_n=5,
     logit_scale=1.0 / 16.0, lr_embedding=1e-4, wd_embedding=0.1,
     block_size=128, toggle=False, reset_accs=False, metadata=None, verbose=True,
-    v7=False, energy=False, adaptive_thr=0.0,
+    v7=False, energy=False, adaptive_thr=0.0, sparsity=0.0,
 ):
     """Export a stochastic model to binary format v6/v7 for the C++ self-learning runtime.
 
@@ -678,6 +678,7 @@ def export_self_learning(
             "sl_outlier_mult": float(outlier_mult),
             "sl_energy": int(energy),
             "sl_adaptive_thr": float(adaptive_thr),
+            "sl_sparsity": float(sparsity),
             "_info": {k: v for k, v in info.items() if k != "mode"},
         })
         write_metadata(f, meta)
@@ -839,6 +840,8 @@ Examples:
                         help="Feed -grad magnitude into accumulators (Exp 3; needed with --sl-adaptive-thr)")
     parser.add_argument("--sl-adaptive-thr", type=float, default=0.0,
                         help="Per-channel flip threshold tau = K * RMS(acc) in the C++ runtime (Exp 3; 0 = fixed scalar threshold)")
+    parser.add_argument("--sl-sparsity", type=float, default=0.0,
+                        help="Top-k feed: keep only this fraction of per-row |grad| in the C++ runtime (Exp 3; 0 = feed all)")
     parser.add_argument("--sl-reset-acc", action="store_true",
                         help="Write zeroed accumulators (safe default for toggled runs; the Python acc state is transient — finding #10)")
     parser.add_argument("--v7", action="store_true",
@@ -896,6 +899,7 @@ Examples:
             v7=args.v7,
             energy=args.sl_energy,
             adaptive_thr=args.sl_adaptive_thr,
+            sparsity=args.sl_sparsity,
         )
         return
 

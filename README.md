@@ -324,9 +324,17 @@ natively in C++:
   scalar `thr`. Scale-invariant flip budget (independent of gradient/logit scale); idle channels
   (RMS ~ 0) get a small floor so they don't flip on noise. Promotion/demotion of v7 ±2 outliers
   uses the same per-channel τ (`promote > τ·outlier_mult`, `demote < τ`).
-- Both are also persisted in the binary metadata (`sl_energy`, `sl_adaptive_thr`) by
-  `export_model.py --sl-energy --sl-adaptive-thr K`, so a device run picks them up automatically.
-  CLI flags override the metadata (same convention as `thr`/`decay`).
+- `--sparsity S`: **top-k feed** — keep only the top fraction `S` of per-output-row gradient
+  (`|grad|`) each block, zeroing the rest (which only decay). Rule-'c' gradients (outer products
+  of activations) are nearly Gaussian, so a plain energy accumulator has **no heavy tail**: no
+  weight ever reaches `|acc| > k·RMS`, nothing flips, nothing resets, and the accumulator (and
+  hence τ) grows unbounded — a permanent 0-flip freeze. Sparsifying concentrates energy on the
+  few highest-gradient weights: RMS drops ~√S while survivors keep full magnitude, giving the
+  accumulator the heavy tail the adaptive threshold selects. **Without it, `--adaptive-thr` on a
+  gradient-free run freezes (Exp 7 finding); with `--sparsity 0.01` the ternary core learns.**
+- All three are persisted in the binary metadata (`sl_energy`, `sl_adaptive_thr`, `sl_sparsity`)
+  by `export_model.py --sl-energy --sl-adaptive-thr K --sl-sparsity S`, so a device run picks
+  them up automatically. CLI flags override the metadata (same convention as `thr`/`decay`).
 
 Backward-compatible: existing v6/v7 exports (no `sl_energy`/`sl_adaptive_thr`) run bit-identical
 to before the port.
@@ -336,6 +344,52 @@ to before the port.
 selflearn.exe model.bin tokens.bin out.bin 200 50 100
 # Exp 3 mechanism: magnitude accumulator + adaptive threshold
 selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0
+# Exp 7: + top-k feed (heavy tail for the adaptive tau — required on gradient-free rule 'c')
+selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0 --sparsity 0.01
+```
+
+## Experiment: Gradient-Free Continual Learning in C++ (Exp 7)
+
+Question: Exp 6 proved the energy-accumulator + adaptive-threshold mechanism wins on both axes
+(new-domain CE and old-domain retention) — but that run used **STE backprop gradients** (heavy
+tail). The C++ runtime is the real product: **gradient-free** rule 'c' on the device. Does the
+mechanism survive without backprop?
+
+Setup: same Phase-1 checkpoint, exported to v6 (`--sl-reset-acc`), trained with
+`selflearn_avx2.exe --energy --adaptive-thr 3.0` on fineweb shard 0 for 300 blocks (~214K
+tokens). Control = embedding-only (`--no-ternary`, no flips). Baseline CE (1000 pos): slice
+8.8564, fineweb 8.9680.
+
+| Run | Slice CE Δ (retention) | Fineweb CE Δ (adapt) |
+|---|---|---|
+| Control (embedding-only, 300 blk) | 8.7174 (−0.139) | 8.9220 (−0.046) |
+| **Energy k=3 + sparsity 0.01 (300 blk)** | **8.6245 (−0.232)** | **8.8558 (−0.112)** |
+
+Readings (honest):
+
+- **The mechanism works gradient-free — with sparsity.** Plain `--energy --adaptive-thr 3.0`
+  flips nothing on rule 'c' (0 real changes; accumulator grows unbounded, τ grows with it, a
+  permanent 0-flip freeze). This is the exact pitfall the Python sign-vote warning anticipated,
+  now seen on magnitude accumulators too. **Top-k sparsification fixes it**: concentrating energy
+  on the top-1% per-row gradient gives the accumulator the heavy tail the adaptive τ selects.
+- **Both axes again, now on-device.** Energy k=3 + sparsity adapts to fineweb **2.4× more than
+  the embedding-only control** (−0.112 vs −0.046) while retaining TinyStories **better** than
+  control (−0.232 vs −0.139 slice). Same qualitative win as Exp 6's STE run — the ternary core
+  learns the new domain and protects the old, without backprop.
+- **Scope honesty**: 300 blocks is a much smaller budget than Exp 6's 1000 steps over 12.3B
+  tokens, and both runs also benefit from the embedding SGD channel. The absolute deltas are
+  small; the *relative* mechanism-vs-control win on both axes is the result. Gradient-free is
+  noisier/slower than STE (larger flip budget per useful bit) but the direction matches.
+
+Reproduce:
+
+```bash
+python inference/export_model.py checkpoints_bp/checkpoint_000200.pt -o checkpoints/exp7_v6.bin \
+    --self-learning --sl-reset-acc --sl-energy --sl-adaptive-thr 3.0 --sl-sparsity 0.01
+cd inference && build.bat avx2
+selflearn_avx2.exe ..\checkpoints\exp7_v6.bin ..\data\fineweb_10bt\fineweb_0000.bin ..\checkpoints\exp7_trained.bin 300 100 0
+selflearn_avx2.exe --eval ..\checkpoints\exp7_trained.bin ..\examples\continual\fineweb_eval100k.bin 1000
+selflearn_avx2.exe --eval ..\checkpoints\exp7_trained.bin ..\examples\discrete\sliceEval100k.bin 1000
 ```
 
 ### Binary format v6

@@ -96,7 +96,8 @@ int main(int argc, char** argv) {
             "  --toggle-window N: only toggle for the first N blocks, then no-op flips (annealing, finding #12)\n"
             "  --thr-anneal RATE: raise the flip threshold by RATE per pass (finding #12 refinement)\n"
             "  --energy: feed -grad magnitude into accumulators (Exp 3, needed with --adaptive-thr)\n"
-            "  --adaptive-thr K: per-channel flip threshold tau = K * RMS(acc) (Exp 3, scale-invariant)\n");
+            "  --adaptive-thr K: per-channel flip threshold tau = K * RMS(acc) (Exp 3, scale-invariant)\n"
+            "  --sparsity S: top-k feed — keep only the top fraction S of per-row |grad| (Exp 3, heavy tail)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -167,16 +168,21 @@ int main(int argc, char** argv) {
     }
     // Exp 3 flip mechanics: "--energy" switches the accumulator feed from
     // -sign(grad) votes to -grad magnitude; "--adaptive-thr K" sets the
-    // per-channel flip threshold tau = K * RMS(acc). Negative value = keep the
-    // exported metadata value.
+    // per-channel flip threshold tau = K * RMS(acc); "--sparsity S" keeps only
+    // the top fraction S of per-row gradient (heavy tail for the adaptive tau).
+    // Negative values keep the exported metadata value.
     bool energy_override = false;
     float adaptive_override = -1.0f;
+    float sparsity_override = -1.0f;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--energy") == 0) energy_override = true;
     }
     for (int i = 1; i + 1 < argc; i++) {
         if (strcmp(argv[i], "--adaptive-thr") == 0) {
             adaptive_override = (float)atof(argv[i + 1]);
+        }
+        if (strcmp(argv[i], "--sparsity") == 0) {
+            sparsity_override = (float)atof(argv[i + 1]);
         }
     }
 
@@ -212,6 +218,7 @@ int main(int argc, char** argv) {
     const float wd_emb = model.sl_wd_embedding;
     const bool energy = energy_override ? true : (model.sl_energy != 0);
     const float adaptive_thr = adaptive_override >= 0.0f ? adaptive_override : model.sl_adaptive_thr;
+    const float sparsity = sparsity_override >= 0.0f ? sparsity_override : model.sl_sparsity;
 
     // Per-block gradient buffers, keyed by layer name (filled from first capture).
     std::vector<std::string> names;
@@ -234,14 +241,14 @@ int main(int argc, char** argv) {
     std::vector<float> softmax_buf(V);
     auto t1 = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "Init in %.1f ms | block=%d thr=%.1f decay=%.3f flipEvery=%d toggle=%d%s "
-                    "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s%s energy=%d adaptiveThr=%.3f\n",
+                    "scale=%.6f lrEmb=%.1e wdEmb=%.2f%s%s energy=%d adaptiveThr=%.3f sparsity=%.3f\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
             block, thr, decay, flip_every, toggle ? 1 : 0,
             (toggle_window > 0 ? " (anneal off after block " + std::to_string(toggle_window) + ")" : "").c_str(),
             scale, lr_emb, wd_emb,
             (thr_anneal > 0.0f ? " | thr-anneal +" + std::to_string(thr_anneal) + "/pass" : "").c_str(),
             no_ternary ? " | embedding-only" : (flip_only ? " | flip-only" : ""),
-            energy ? 1 : 0, adaptive_thr);
+            energy ? 1 : 0, adaptive_thr, sparsity);
 
     double ms_total = 0.0;
     for (int step = 0; step < steps; step++) {
@@ -332,7 +339,7 @@ int main(int argc, char** argv) {
             for (size_t l = 0; l < names.size(); l++) {
                 auto it = model.ternary_weights.find(names[l] + ".latent_weights");
                 if (it == model.ternary_weights.end()) continue;
-                sl_feed_predictive(it->second, grads[l], decay, energy);
+                sl_feed_predictive(it->second, grads[l], decay, energy, sparsity);
             }
         }
 

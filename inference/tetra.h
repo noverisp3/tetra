@@ -497,6 +497,7 @@ struct Model {
     // Exp 3 flip mechanics (ported from the Python DiscreteTrainer):
     int sl_energy = 0;            // feed -grad (magnitude) into accumulators instead of -sign(grad)
     float sl_adaptive_thr = 0.0f; // tau = k * RMS(acc) per output channel (0 = fixed scalar threshold)
+    float sl_sparsity = 0.0f;     // top-k feed: keep only this fraction of per-row |grad| (0 = all)
     bool sl_enabled = false;      // true when a v6 self-learning model was loaded
 };
 
@@ -751,11 +752,12 @@ static Model load_model(const char* path) {
         model.sl_outlier_mult = (float)json_get_num(meta, "sl_outlier_mult", 3.0);
         model.sl_energy = (int)json_get_num(meta, "sl_energy", 0);
         model.sl_adaptive_thr = (float)json_get_num(meta, "sl_adaptive_thr", 0.0);
+        model.sl_sparsity = (float)json_get_num(meta, "sl_sparsity", 0.0);
         model.sl_enabled = true;
-        fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d toggle=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d outlierMult=%.2f energy=%d adaptiveThr=%.3f\n",
+        fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d toggle=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d outlierMult=%.2f energy=%d adaptiveThr=%.3f sparsity=%.3f\n",
                 rule.c_str(), model.sl_threshold, model.sl_acc_decay, model.sl_flip_every_n,
                 model.sl_toggle, model.sl_logit_scale, model.sl_lr_embedding, model.sl_wd_embedding, model.sl_block_size, model.sl_outlier_mult,
-                model.sl_energy, model.sl_adaptive_thr);
+                model.sl_energy, model.sl_adaptive_thr, model.sl_sparsity);
     }
     return model;
 }
@@ -1488,12 +1490,42 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = 
 // The magnitude-weighted form is required for the adaptive threshold
 // (tau = k*RMS(acc)): sign-vote accumulators are near-uniform (|acc|/RMS < 1.2)
 // so adaptive tau freezes them (see DiscreteConfig.rule_energy in Python).
+//
+// sparsity in (0,1): top-k feed — keep only the top `sparsity`-fraction of
+// per-output-row gradient entries (largest |grad|), zeroing the rest (which
+// only decay). Rule-'c' gradients (outer products of activations) are nearly
+// Gaussian, so a plain energy accumulator has no heavy tail and |acc|/RMS < k
+// for any useful k — the accumulator grows unbounded (never flipped, never
+// reset) and adaptive tau grows with it, a permanent 0-flip freeze. Sparsifying
+// the feed concentrates energy on the few highest-gradient weights: RMS drops
+// ~sqrt(sparsity) while the survivors keep full magnitude, giving |acc|/RMS a
+// heavy tail the adaptive threshold can select (the STE CE-gradient equivalent).
 static void sl_feed_predictive(TernaryWeightXNOR& w, const std::vector<float>& grad,
-                               float acc_decay, bool energy = false) {
+                               float acc_decay, bool energy = false, float sparsity = 0.0f) {
     const size_t n = (size_t)w.rows * w.cols;
     if (energy) {
-        for (size_t j = 0; j < n; j++)
-            w.accumulator[j] = w.accumulator[j] * acc_decay - grad[j];
+        if (sparsity > 0.0f && sparsity < 1.0f) {
+            const int rows = w.rows, cols = w.cols;
+            const size_t keep = (std::max)((size_t)1, (size_t)((float)cols * sparsity));
+            std::vector<float> mags((size_t)cols);
+            for (int r = 0; r < rows; r++) {
+                const float* gr = grad.data() + (size_t)r * cols;
+                for (int c = 0; c < cols; c++) mags[c] = fabsf(gr[c]);
+                std::nth_element(mags.begin(), mags.begin() + (cols - keep), mags.end());
+                const float thr = mags[cols - keep];
+                float* acc_r = w.accumulator.data() + (size_t)r * cols;
+                for (int c = 0; c < cols; c++) {
+                    const float g = gr[c];
+                    if (fabsf(g) >= thr)
+                        acc_r[c] = acc_r[c] * acc_decay - g;
+                    else
+                        acc_r[c] = acc_r[c] * acc_decay;
+                }
+            }
+        } else {
+            for (size_t j = 0; j < n; j++)
+                w.accumulator[j] = w.accumulator[j] * acc_decay - grad[j];
+        }
     } else {
         for (size_t j = 0; j < n; j++) {
             float g = grad[j];
@@ -1513,17 +1545,18 @@ static std::string build_sl_metadata(const Model& m) {
     else if (m.sl_rule == 2) rule = "p";
     else if (m.sl_rule == 3) rule = "h";
     else if (m.sl_rule == 4) rule = "e";
-    char buf[600];
+    char buf[612];
     snprintf(buf, sizeof(buf),
         "{\"_export_version\":%u,\"sl_rule\":\"%s\",\"sl_threshold\":%.4f,"
         "\"sl_acc_decay\":%.4f,\"sl_flip_every_n\":%d,\"sl_toggle\":%d,"
         "\"sl_logit_scale\":%.8f,"
         "\"sl_lr_embedding\":%.8f,\"sl_wd_embedding\":%.4f,\"sl_block_size\":%d,"
-        "\"sl_outlier_mult\":%.4f,\"sl_energy\":%d,\"sl_adaptive_thr\":%.4f}",
+        "\"sl_outlier_mult\":%.4f,\"sl_energy\":%d,\"sl_adaptive_thr\":%.4f,"
+        "\"sl_sparsity\":%.4f}",
         m.header.version, rule, m.sl_threshold, m.sl_acc_decay, m.sl_flip_every_n, m.sl_toggle,
         m.sl_logit_scale,
         m.sl_lr_embedding, m.sl_wd_embedding, m.sl_block_size, m.sl_outlier_mult,
-        m.sl_energy, m.sl_adaptive_thr);
+        m.sl_energy, m.sl_adaptive_thr, m.sl_sparsity);
     return std::string(buf);
 }
 
