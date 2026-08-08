@@ -348,69 +348,6 @@ selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptiv
 selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0 --sparsity 0.01
 ```
 
-## Experiment: Gradient-Free Continual Learning in C++ (Exp 7)
-
-Question: Exp 6 proved the energy-accumulator + adaptive-threshold mechanism wins on both axes
-(new-domain CE and old-domain retention) — but that run used **STE backprop gradients** (heavy
-tail). The C++ runtime is the real product: **gradient-free** rule 'c' on the device. Does the
-mechanism survive without backprop?
-
-Setup: same Phase-1 checkpoint, exported to v6 (`--sl-reset-acc`), trained with
-`selflearn_avx2.exe --energy --adaptive-thr 3.0` on fineweb shard 0 for 300 blocks (~214K
-tokens). Control = embedding-only (`--no-ternary`, no flips).
-
-> **Correction (logit-scale bug):** an earlier version of this section reported baseline slice
-> 8.8564 / fineweb 8.9680 and small deltas (−0.232/−0.112). Those numbers came from
-> `export_model.py` always writing `sl_logit_scale = 1/sqrt(hidden_dim) = 0.0625` — the discrete
-> trainer's calibration — **even for STE backprop checkpoints that train in the natural regime
-> (scale=1.0)**. The C++ runtime then compressed every softmax toward uniform, inflating all CE
-> by ~+1.8 nats and shrinking the embedding gradient's effective LR by ~√V. This silently
-> **under-reported the mechanism**: the qualitative Exp 7 result survives at the correct scale
-> with larger deltas. Fixed in `export_model.py` (STE → scale 1.0; discrete → 1/sqrt(H);
-> `--sl-logit-scale` override).
-
-**Embedding LR at the natural scale:** at `sl_lr_embedding=1e-4` (the value tuned for the
-compressed scale) the natural-regime gradient concentrates full magnitude on the target row, so
-300 blocks of embedding SGD **catastrophically destroy** the model (held-out CE ~12.2, worse
-than the 9.01 random floor, on both axes). With `--sl-lr-embedding 1e-5` the run is stable.
-Baseline CE (10000 pos, scale 1.0): slice **7.6135**, fineweb **9.2062**.
-
-| Run (lr_emb 1e-5) | Slice CE Δ (retention) | Fineweb CE Δ (adapt) |
-|---|---|---|
-| Control (embedding-only, 500 blk) | 7.7890 (+0.18) | 9.0530 (−0.15) |
-| Energy k=3 + sparsity 0.01 (300 blk) | 7.2135 (−0.40) | 8.8900 (−0.32) |
-| **Energy k=3 + sparsity 0.01 (500 blk)** | **7.2094 (−0.40)** | **8.8003 (−0.41)** |
-
-Readings (honest):
-
-- **The mechanism works gradient-free — with sparsity.** Plain `--energy --adaptive-thr 3.0`
-  flips nothing on rule 'c' (0 real changes; accumulator grows unbounded, τ grows with it, a
-  permanent 0-flip freeze). This is the exact pitfall the Python sign-vote warning anticipated,
-  now seen on magnitude accumulators too. **Top-k sparsification fixes it**: concentrating energy
-  on the top-1% per-row gradient gives the accumulator the heavy tail the adaptive τ selects.
-- **Both axes again, now on-device — and the win grows with budget.** Energy k=3 + sparsity
-  adapts to fineweb **2.7× more than the embedding-only control** (−0.41 vs −0.15) **and
-  protects the old domain where control loses it** (−0.40 vs +0.18 slice: the ternary core holds
-  TinyStories retention while embedding-only SGD forgets). Going 300 → 500 blocks keeps slice
-  retention flat (−0.40 → −0.40, no tradeoff) while fineweb adaptation deepens (−0.32 → −0.41).
-  Same qualitative win as Exp 6's STE run, now with bigger deltas than the buggy-scale readings.
-- **Scope honesty**: 500 blocks is still a much smaller budget than Exp 6's 1000 steps over
-  12.3B tokens, and both runs also benefit from the embedding SGD channel. The absolute deltas
-  are small; the *relative* mechanism-vs-control win on both axes is the result. Gradient-free is
-  noisier/slower than STE (larger flip budget per useful bit) but the direction matches.
-
-Reproduce:
-
-```bash
-python inference/export_model.py checkpoints_bp/checkpoint_000200.pt -o checkpoints/exp7_v6.bin \
-    --self-learning --sl-reset-acc --sl-energy --sl-adaptive-thr 3.0 --sl-sparsity 0.01 \
-    --sl-lr-embedding 1e-5
-cd inference && build.bat avx2
-selflearn_avx2.exe ..\checkpoints\exp7_v6.bin ..\data\fineweb_10bt\fineweb_0000.bin ..\checkpoints\exp7_trained.bin 500 100 0
-selflearn_avx2.exe --eval ..\checkpoints\exp7_trained.bin ..\examples\continual\fineweb_eval100k.bin 10000
-selflearn_avx2.exe --eval ..\checkpoints\exp7_trained.bin ..\examples\discrete\sliceEval100k.bin 10000
-```
-
 ### Binary format v6
 
 v6 = v5 + one **FP32 accumulator** (`rows×cols`) appended to every ternary entry + a trailing `META` section containing a JSON blob with the self-learning config (`sl_rule`, `sl_threshold`, `sl_acc_decay`, `sl_flip_every_n`, `sl_logit_scale`, `sl_lr_embedding`, `sl_wd_embedding`, `sl_block_size`, `_export_version`). Export via `export_model.py ... --self-learning`.
@@ -982,6 +919,70 @@ python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
     --domain-eval examples/continual/fineweb_eval100k.bin \
     --lr-domain 1e-4 --batch-size 8 \
     --acc-energy --acc-decay 0.99 --adaptive-thr 3.0 --save-dir checkpoints_exp6_k3
+```
+
+
+## Experiment: Gradient-Free Continual Learning in C++ (Exp 7)
+
+Question: Exp 6 proved the energy-accumulator + adaptive-threshold mechanism wins on both axes
+(new-domain CE and old-domain retention) — but that run used **STE backprop gradients** (heavy
+tail). The C++ runtime is the real product: **gradient-free** rule 'c' on the device. Does the
+mechanism survive without backprop?
+
+Setup: same Phase-1 checkpoint, exported to v6 (`--sl-reset-acc`), trained with
+`selflearn_avx2.exe --energy --adaptive-thr 3.0` on fineweb shard 0 for 300 blocks (~214K
+tokens). Control = embedding-only (`--no-ternary`, no flips).
+
+> **Correction (logit-scale bug):** an earlier version of this section reported baseline slice
+> 8.8564 / fineweb 8.9680 and small deltas (−0.232/−0.112). Those numbers came from
+> `export_model.py` always writing `sl_logit_scale = 1/sqrt(hidden_dim) = 0.0625` — the discrete
+> trainer's calibration — **even for STE backprop checkpoints that train in the natural regime
+> (scale=1.0)**. The C++ runtime then compressed every softmax toward uniform, inflating all CE
+> by ~+1.8 nats and shrinking the embedding gradient's effective LR by ~√V. This silently
+> **under-reported the mechanism**: the qualitative Exp 7 result survives at the correct scale
+> with larger deltas. Fixed in `export_model.py` (STE → scale 1.0; discrete → 1/sqrt(H);
+> `--sl-logit-scale` override).
+
+**Embedding LR at the natural scale:** at `sl_lr_embedding=1e-4` (the value tuned for the
+compressed scale) the natural-regime gradient concentrates full magnitude on the target row, so
+300 blocks of embedding SGD **catastrophically destroy** the model (held-out CE ~12.2, worse
+than the 9.01 random floor, on both axes). With `--sl-lr-embedding 1e-5` the run is stable.
+Baseline CE (10000 pos, scale 1.0): slice **7.6135**, fineweb **9.2062**.
+
+| Run (lr_emb 1e-5) | Slice CE Δ (retention) | Fineweb CE Δ (adapt) |
+|---|---|---|
+| Control (embedding-only, 500 blk) | 7.7890 (+0.18) | 9.0530 (−0.15) |
+| Energy k=3 + sparsity 0.01 (300 blk) | 7.2135 (−0.40) | 8.8900 (−0.32) |
+| **Energy k=3 + sparsity 0.01 (500 blk)** | **7.2094 (−0.40)** | **8.8003 (−0.41)** |
+
+Readings (honest):
+
+- **The mechanism works gradient-free — with sparsity.** Plain `--energy --adaptive-thr 3.0`
+  flips nothing on rule 'c' (0 real changes; accumulator grows unbounded, τ grows with it, a
+  permanent 0-flip freeze). This is the exact pitfall the Python sign-vote warning anticipated,
+  now seen on magnitude accumulators too. **Top-k sparsification fixes it**: concentrating energy
+  on the top-1% per-row gradient gives the accumulator the heavy tail the adaptive τ selects.
+- **Both axes again, now on-device — and the win grows with budget.** Energy k=3 + sparsity
+  adapts to fineweb **2.7× more than the embedding-only control** (−0.41 vs −0.15) **and
+  protects the old domain where control loses it** (−0.40 vs +0.18 slice: the ternary core holds
+  TinyStories retention while embedding-only SGD forgets). Going 300 → 500 blocks keeps slice
+  retention flat (−0.40 → −0.40, no tradeoff) while fineweb adaptation deepens (−0.32 → −0.41).
+  Same qualitative win as Exp 6's STE run, now with bigger deltas than the buggy-scale readings.
+- **Scope honesty**: 500 blocks is still a much smaller budget than Exp 6's 1000 steps over
+  12.3B tokens, and both runs also benefit from the embedding SGD channel. The absolute deltas
+  are small; the *relative* mechanism-vs-control win on both axes is the result. Gradient-free is
+  noisier/slower than STE (larger flip budget per useful bit) but the direction matches.
+
+Reproduce:
+
+```bash
+python inference/export_model.py checkpoints_bp/checkpoint_000200.pt -o checkpoints/exp7_v6.bin \
+    --self-learning --sl-reset-acc --sl-energy --sl-adaptive-thr 3.0 --sl-sparsity 0.01 \
+    --sl-lr-embedding 1e-5
+cd inference && build.bat avx2
+selflearn_avx2.exe ..\checkpoints\exp7_v6.bin ..\data\fineweb_10bt\fineweb_0000.bin ..\checkpoints\exp7_trained.bin 500 100 0
+selflearn_avx2.exe --eval ..\checkpoints\exp7_trained.bin ..\examples\continual\fineweb_eval100k.bin 10000
+selflearn_avx2.exe --eval ..\checkpoints\exp7_trained.bin ..\examples\discrete\sliceEval100k.bin 10000
 ```
 
 
