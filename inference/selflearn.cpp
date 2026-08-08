@@ -40,18 +40,49 @@ static std::vector<uint16_t> read_tokens(const char* path, size_t max_bytes = 0)
     return toks;
 }
 
+// Quantize an FP32 weight in-place to INT8 (per-tensor scale = max|w|/127,
+// matching export_model.py quantize_fp32_to_int8) so forward() takes the
+// matmul_int8_decode LM-head path (4x less memory bandwidth).
+static void quantize_fp32_to_int8(FP32Weight& w) {
+    float mx = 0.0f;
+    for (float v : w.data) mx = (std::max)(mx, std::fabs(v));
+    float scale = (mx < 1e-10f) ? 1.0f : mx / 127.0f;
+    w.int8_scale = scale;
+    w.int8_data.resize(w.data.size());
+    for (size_t i = 0; i < w.data.size(); i++) {
+        float q = std::round(w.data[i] / scale);
+        q = (std::max)(-128.0f, (std::min)(127.0f, q));
+        w.int8_data[i] = (int8_t)q;
+    }
+    fprintf(stderr, "quantized %s -> int8 (scale=%.6f, %zu elems)\n",
+            "token_embedding.weight", scale, w.data.size());
+}
+
 int main(int argc, char** argv) {
-    // Eval-only mode: --eval <model.bin> <tokens.bin> [max_positions]
+    // Eval-only mode: --eval <model.bin> <tokens.bin> [max_positions] [--fast-lmhead]
     // Reports average next-token cross-entropy without any learning.
+    // --fast-lmhead: quantize the (tied) embedding to INT8 in memory so the
+    // LM head uses matmul_int8_decode (4x less memory bandwidth). Use with
+    // --compare-lmhead to measure the Top-1/Top-5 prediction divergence.
     if (argc >= 4 && strcmp(argv[1], "--eval") == 0) {
+        bool fast_lmhead = false;
+        int pos_arg = 4;
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "--fast-lmhead") == 0) fast_lmhead = true;
+            else if (pos_arg == 4) pos_arg = i;
+        }
         Model model = load_model(argv[2]);
+        if (fast_lmhead) {
+            quantize_fp32_to_int8(model.fp32_weights.at("token_embedding.weight"));
+        }
         std::vector<uint16_t> tokens = read_tokens(argv[3]);
         size_t limit = tokens.size() > 1 ? tokens.size() - 1 : 0;
-        if (argc > 4) {
-            long n = atol(argv[4]);
+        if (argc > pos_arg) {
+            long n = atol(argv[pos_arg]);
             if (n > 0 && (size_t)n < limit) limit = (size_t)n;
         }
-        fprintf(stderr, "Eval: %zu tokens (%zu positions)\n", tokens.size(), limit);
+        fprintf(stderr, "Eval: %zu tokens (%zu positions) lmhead=%s\n",
+                tokens.size(), limit, fast_lmhead ? "INT8" : "FP32");
         if (limit == 0) { fprintf(stderr, "No tokens\n"); return 1; }
 
         const int H = model.header.hidden_dim;
@@ -64,6 +95,7 @@ int main(int argc, char** argv) {
         std::vector<float> softmax_buf(V);
         double loss = 0.0;
         size_t pos = 0;
+        auto t_start = std::chrono::steady_clock::now();
         for (size_t t = 0; t < limit; t++) {
             if (t > 0 && t % (size_t)model.header.max_seq_len == 0) cache.clear();
             std::vector<int> single = {tokens[t]};
@@ -81,8 +113,105 @@ int main(int argc, char** argv) {
             if (pos % 1000 == 0)
                 fprintf(stderr, "  eval %zu | avg CE %.4f\n", pos, loss / pos);
         }
-        fprintf(stderr, "Eval done. avg CE %.4f | PPL %.4f | %zu positions\n",
-                loss / pos, std::exp(loss / pos), pos);
+        auto t_end = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(t_end - t_start).count();
+        fprintf(stderr, "Eval done. avg CE %.4f | PPL %.4f | %zu positions | %.2f s | %.1f tokens/s\n",
+                loss / pos, std::exp(loss / pos), pos, secs, pos / secs);
+#ifdef TETRA_PROFILE
+        tetra_profile_report();
+#endif
+        return 0;
+    }
+
+    // Compare LM head precision: --compare-lmhead <model.bin> <tokens.bin> [max_positions]
+    // Runs FP32 and INT8 lm_head on the same context and reports Top-1/Top-5
+    // agreement, CE, and per-position logit drift.
+    if (argc >= 4 && strcmp(argv[1], "--compare-lmhead") == 0) {
+        Model model = load_model(argv[2]);
+        std::vector<uint16_t> tokens = read_tokens(argv[3]);
+        size_t limit = tokens.size() > 1 ? tokens.size() - 1 : 0;
+        if (argc > 4) {
+            long n = atol(argv[4]);
+            if (n > 0 && (size_t)n < limit) limit = (size_t)n;
+        }
+        if (limit > 1000) limit = 1000;
+        fprintf(stderr, "Compare lm_head FP32 vs INT8: %zu positions\n", limit);
+        if (limit == 0) { fprintf(stderr, "No tokens\n"); return 1; }
+
+        const int H = model.header.hidden_dim;
+        const int V = model.header.vocab_size;
+        const float scale = model.sl_logit_scale;
+        FP32Weight& emb = model.fp32_weights.at("token_embedding.weight");
+
+        // Pass 1: FP32 logits
+        std::vector<int> top1_fp32(limit), top1_int8(limit);
+        std::vector<std::vector<int>> top5_fp32(limit), top5_int8(limit);
+        std::vector<float> ce_fp32(limit), ce_int8(limit);
+        // top-5: keep indices of the 5 highest logits in ascending order
+        auto top5_of = [&](const std::vector<float>& logits) {
+            std::vector<int> idx(V);
+            for (int i = 0; i < V; i++) idx[i] = i;
+            std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
+                              [&](int a, int b) { return logits[a] > logits[b]; });
+            idx.resize(5);
+            return idx;
+        };
+        auto run_pass = [&](std::vector<int>* t1_out,
+                            std::vector<std::vector<int>>* t5_out,
+                            std::vector<float>* ce_out) {
+            KVCache cache;
+            cache.init(model.header.num_layers, model.header.max_seq_len, H,
+                       model.is_mla, model.kv_latent_dim, model.rope_dim);
+            for (size_t t = 0; t < limit; t++) {
+                if (t > 0 && t % (size_t)model.header.max_seq_len == 0) cache.clear();
+                std::vector<float> logits = forward(model, {tokens[t]}, cache, nullptr);
+                (*t1_out)[t] = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+                (*t5_out)[t] = top5_of(logits);
+                float mx = -1e30f;
+                for (int i = 0; i < V; i++) mx = (std::max)(mx, logits[i] * scale);
+                double sum = 0.0;
+                for (int i = 0; i < V; i++) sum += std::exp((double)logits[i] * scale - mx);
+                int target = tokens[t + 1];
+                (*ce_out)[t] = (float)(-std::log((double)(std::exp((double)logits[target] * scale - mx) / sum) + 1e-12));
+            }
+        };
+        run_pass(&top1_fp32, &top5_fp32, &ce_fp32);
+
+        // Pass 2: INT8 logits (quantize in place)
+        quantize_fp32_to_int8(emb);
+        run_pass(&top1_int8, &top5_int8, &ce_int8);
+
+        // Compare
+        int same_top1 = 0, t1_in5_f = 0, t1_in5_i = 0;
+        double drift_accum = 0.0;
+        std::vector<double> ce_delta(limit), logit_delta(limit);
+        for (size_t t = 0; t < limit; t++) {
+            if (top1_fp32[t] == top1_int8[t]) same_top1++;
+            if (std::find(top5_int8[t].begin(), top5_int8[t].end(), top1_fp32[t]) != top5_int8[t].end())
+                t1_in5_i++;
+            if (std::find(top5_fp32[t].begin(), top5_fp32[t].end(), top1_int8[t]) != top5_fp32[t].end())
+                t1_in5_f++;
+            ce_delta[t] = ce_int8[t] - ce_fp32[t];
+            drift_accum += ce_delta[t];
+        }
+        double ce_f = 0, ce_i = 0;
+        for (size_t t = 0; t < limit; t++) { ce_f += ce_fp32[t]; ce_i += ce_int8[t]; }
+        auto max_abs = [](const std::vector<double>& v) {
+            return *std::max_element(v.begin(), v.end(),
+                [](double a, double b) { return std::fabs(a) < std::fabs(b); });
+        };
+        fprintf(stderr,
+                "\n=== lm_head FP32 vs INT8 (%zu positions) ===\n"
+                "  Top-1 identical:        %d/%zu (%.1f%%)\n"
+                "  FP32 top-1 in INT8 top-5: %d/%zu (%.1f%%)\n"
+                "  INT8 top-1 in FP32 top-5: %d/%zu (%.1f%%)\n"
+                "  CE FP32: %.4f | CE INT8: %.4f | delta: %+.4f\n"
+                "  CE drift: mean %+.5f | max %+.4f\n",
+                limit, same_top1, limit, 100.0 * same_top1 / limit,
+                t1_in5_i, limit, 100.0 * t1_in5_i / limit,
+                t1_in5_f, limit, 100.0 * t1_in5_f / limit,
+                ce_f / limit, ce_i / limit, (ce_i - ce_f) / limit,
+                drift_accum / limit, max_abs(ce_delta));
         return 0;
     }
 

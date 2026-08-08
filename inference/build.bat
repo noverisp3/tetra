@@ -39,6 +39,7 @@ set OPENMP=/openmp
 if /I "%1"=="avx2" goto :avx2
 if /I "%1"=="avx10" goto :avx10
 if /I "%1"=="avx512" goto :avx512
+if /I "%1"=="profile" goto :profile
 if "%1"=="" goto :scalar
 goto :usage
 
@@ -46,6 +47,12 @@ goto :usage
 cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX2 /Fe:tetra_avx2.exe %SRC%
 cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX2 /Fe:selflearn_avx2.exe %SRC2%
 echo Build: tetra_avx2.exe + selflearn_avx2.exe (AVX2+FMA)
+goto :done
+
+:profile
+cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX2 /DTETRA_PROFILE /Fe:tetra_prof.exe %SRC%
+cl /EHsc /O2 /std:c++17 %OPENMP% /arch:AVX2 /DTETRA_PROFILE /Fe:selflearn_prof.exe %SRC2%
+echo Build: tetra_prof.exe + selflearn_prof.exe (AVX2 + TETRA_PROFILE)
 goto :done
 
 :avx10

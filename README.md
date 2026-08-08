@@ -348,6 +348,33 @@ selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptiv
 selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0 --sparsity 0.01
 ```
 
+### Eval tooling: profiling, fast lm_head, precision comparison
+
+`selflearn.cpp --eval` doubles as a benchmark/profiler for the forward pass:
+
+- **Throughput + per-stage profile**: `--eval` prints avg CE, wall seconds, and tokens/s. Building with
+  `build.bat profile` (`/DTETRA_PROFILE`) adds a per-stage breakdown (emb / attn_norm / qkv_matmul /
+  attn_scores / o_proj / ffn_norm / gate_up / down_proj / lm_head) accumulated over the whole run.
+- **`--fast-lmhead`**: quantizes the tied embedding to INT8 in memory (per-tensor scale `max|w|/127`,
+  matching `export_model.py --quantize-int8`) so the LM head uses `matmul_int8_decode` (4× less memory
+  bandwidth). Measured on `exp7_v6_lr5` (6×256, AVX2):
+  - +12.6% tokens/s at short context (200 pos: 353 → 398 tok/s); +4.6% at 2000 pos (123 → 129 tok/s).
+    The modest gain is structural, not a bug: per-stage profiling shows lm_head is only ~18% (short
+    context) to ~6% (long context) of forward time — the real hotspots are **attn_scores** (up to 70%
+    at long context) and **gate_up** FFN matmul (~37% at short context), both dense ±1 ternary GEMMs.
+  - CE cost: +0.011 nats (7.7877 → 7.7988 on 2000 pos). Use FP32 (default) when precision matters.
+- **`--compare-lmhead <model.bin> <tokens.bin> [n]`**: runs the same context through FP32 and INT8
+  lm_heads and reports Top-1 agreement, Top-5 cross-containment, and per-position CE drift (capped at
+  1000 positions). On `exp7_v6_lr5`: Top-1 identical 28.4% but **100% of Top-1 predictions stay inside
+  the other's Top-5** — the int8 head does not corrupt generation (low Top-1 agreement reflects the
+  weak near-uniform model, not quantization; CE drift mean +0.011, worst −0.44).
+
+```bash
+selflearn_avx2.exe --eval ..\checkpoints\exp7_v6_lr5_fp32emb.bin ..\examples\discrete\sliceEval100k.bin 2000 --fast-lmhead
+build.bat profile && selflearn_prof.exe --eval ..\checkpoints\exp7_v6_lr5_fp32emb.bin ..\examples\discrete\sliceEval100k.bin 2000
+selflearn_avx2.exe --compare-lmhead ..\checkpoints\exp7_v6_lr5_fp32emb.bin ..\examples\discrete\sliceEval100k.bin 1000
+```
+
 ### Binary format v6
 
 v6 = v5 + one **FP32 accumulator** (`rows×cols`) appended to every ternary entry + a trailing `META` section containing a JSON blob with the self-learning config (`sl_rule`, `sl_threshold`, `sl_acc_decay`, `sl_flip_every_n`, `sl_logit_scale`, `sl_lr_embedding`, `sl_wd_embedding`, `sl_block_size`, `_export_version`). Export via `export_model.py ... --self-learning`.
@@ -1032,11 +1059,11 @@ ternary_llm/
 inference/
   tetra.h                   # C++ inference engine (RMSNorm, SiLU, softmax, sampling, forward, v6/v7 loader)
   tetra.cpp                 # CLI entry point, generation loop
-  selflearn.cpp             # C++ self-learning runtime (rule c, accumulator bit-flips, --eval mode)
+  selflearn.cpp             # C++ self-learning runtime (rule c, accumulator bit-flips, --eval profiling, --fast-lmhead, --compare-lmhead)
   export_model.py           # Checkpoint → binary format (v4/v6/v7, INT8 embedding, --self-learning, --v7)
   run_inference.py          # Python wrapper around C++ inference
   benchmark_ppl.py          # Perplexity measurement
-  build.bat                 # MSVC build script (auto-detects VS via vswhere)
+  build.bat                 # MSVC build script (auto-detects VS via vswhere; `profile` target = AVX2 + TETRA_PROFILE timing)
 
 tests/
   test_quantization.py

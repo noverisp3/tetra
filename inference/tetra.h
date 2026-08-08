@@ -37,6 +37,39 @@
 
 #include <immintrin.h>
 
+#ifdef TETRA_PROFILE
+#include <chrono>
+namespace tetra {
+struct TetraProfile {
+    double secs[32] = {0.0};
+    unsigned counts[32] = {0};
+    const char* names[32] = {nullptr};
+};
+inline TetraProfile& tp() {
+    static TetraProfile p; return p;
+}
+#define TP_DEF(n, i) do { if (!tp().names[i]) tp().names[i] = (n); } while (0)
+#define TP_T0() do { tp_t0 = std::chrono::steady_clock::now(); } while (0)
+#define TP_T1(i) do { \
+    auto tp_t1 = std::chrono::steady_clock::now(); \
+    tp().secs[i] += std::chrono::duration<double>(tp_t1 - tp_t0).count(); \
+    tp().counts[i]++; tp_t0 = tp_t1; \
+} while (0)
+inline void tetra_profile_report() {
+    fprintf(stderr, "\n--- profile ---\n");
+    double tot = 0;
+    for (int i = 0; i < 32; i++) if (tp().names[i]) tot += tp().secs[i];
+    for (int i = 0; i < 32; i++) {
+        if (!tp().names[i]) continue;
+        fprintf(stderr, "  %-24s %8.1f ms  %7.1f%%  (n=%u)\n",
+                tp().names[i], tp().secs[i] * 1000.0,
+                tot > 0 ? tp().secs[i] / tot * 100.0 : 0.0, tp().counts[i]);
+    }
+    fprintf(stderr, "  %-24s %8.1f ms\n", "TOTAL", tot * 1000.0);
+}
+}
+#endif
+
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #define TETRA_HAS_NEON 1
@@ -865,6 +898,13 @@ static std::vector<float> forward(
             for (int i = 0; i < H; i++)
                 x[i] = tok_emb[tokens.back() * H + i] + pos_emb[pos * H + i];
         }
+#ifdef TETRA_PROFILE
+        std::chrono::steady_clock::time_point tp_t0 = std::chrono::steady_clock::now();
+        TP_DEF("emb", 0); TP_DEF("attn_norm", 1); TP_DEF("qkv_matmul", 2);
+        TP_DEF("attn_scores", 3); TP_DEF("o_proj", 4); TP_DEF("ffn_norm", 5);
+        TP_DEF("gate_up", 6); TP_DEF("down_proj", 7); TP_DEF("silu", 8);
+        TP_DEF("lm_head", 9); TP_T0(); TP_T1(0);
+#endif
 
         for (int l = 0; l < L; l++) {
             char pfx[64];
@@ -872,8 +912,14 @@ static std::vector<float> forward(
 
             // Attention (pre-norm)
             std::vector<float> normed = x;
+#ifdef TETRA_PROFILE
+            TP_T0();
+#endif
             rmsnorm(normed.data(), model.fw_ptr(std::string(pfx) + "attn_norm.weight"), H);
             float x_scale = absmean(normed.data(), H);
+#ifdef TETRA_PROFILE
+            TP_T1(1);
+#endif
 
             if (model.is_mla) {
                 const int KV = model.kv_latent_dim;
@@ -963,6 +1009,9 @@ static std::vector<float> forward(
                 cap_fill(cap, std::string(pfx) + "attn.q_proj", normed.data(), H, q.data(), H);
                 cap_fill(cap, std::string(pfx) + "attn.k_proj", normed.data(), H, k.data(), H);
                 cap_fill(cap, std::string(pfx) + "attn.v_proj", normed.data(), H, v.data(), H);
+#ifdef TETRA_PROFILE
+                TP_T1(2);
+#endif
 
                 for (int i = 0; i < H; i++) {
                     cache.k_cache[l][pos * H + i] = k[i];
@@ -986,18 +1035,27 @@ static std::vector<float> forward(
                         attn_out[head * HD + d] = sum;
                     }
                 }
+#ifdef TETRA_PROFILE
+                TP_T1(3);
+#endif
 
                 std::vector<float> proj_out(H);
                 float o_scale = absmean(attn_out.data(), H);
                 ternary_matmul_auto(attn_out.data(), model.tw(on), proj_out.data(), o_scale, decode);
                 cap_fill(cap, std::string(pfx) + "attn.o_proj", attn_out.data(), H, proj_out.data(), H);
                 for (int i = 0; i < H; i++) x[i] += proj_out[i];
+#ifdef TETRA_PROFILE
+                TP_T1(4);
+#endif
             }
 
             // FFN (pre-norm) — shared between MLA and standard
             std::vector<float> ffn_normed = x;
             rmsnorm(ffn_normed.data(), model.fw_ptr(std::string(pfx) + "ffn_norm.weight"), H);
             float ffn_scale = absmean(ffn_normed.data(), H);
+#ifdef TETRA_PROFILE
+            TP_T1(5);
+#endif
 
             std::string fused_n = std::string(pfx) + "ffn.gate_up_proj.latent_weights";
             std::string down_n = std::string(pfx) + "ffn.down_proj.latent_weights";
@@ -1007,16 +1065,25 @@ static std::vector<float> forward(
             cap_fill(cap, std::string(pfx) + "ffn.gate_up_proj", ffn_normed.data(), H, fused.data(), 2 * FFN);
             for (int i = 0; i < FFN; i++) { gate[i] = fused[i]; up[i] = fused[FFN + i]; }
             for (int i = 0; i < FFN; i++) hidden[i] = silu(gate[i]) * up[i];
+#ifdef TETRA_PROFILE
+            TP_T1(6);
+#endif
 
             float h_scale = absmean(hidden.data(), FFN);
             ternary_matmul_auto(hidden.data(), model.tw(down_n), ffn_out.data(), h_scale, decode);
             cap_fill(cap, std::string(pfx) + "ffn.down_proj", hidden.data(), FFN, ffn_out.data(), H);
             for (int i = 0; i < H; i++) x[i] += ffn_out[i];
+#ifdef TETRA_PROFILE
+            TP_T1(7);
+#endif
         }
 
         rmsnorm(x.data(), model.fw_ptr("norm.weight"), H);
         if (cap) cap->h.assign(x.data(), x.data() + H);
         std::vector<float> logits(V);
+#ifdef TETRA_PROFILE
+        TP_T1(9);  // lm_head timer spans final rmsnorm + lm_head matmul
+#endif
         {
             const auto& emb = model.fp32_weights.at("token_embedding.weight");
             if (!emb.int8_data.empty()) {
@@ -1025,6 +1092,9 @@ static std::vector<float> forward(
                 matmul_fp32_decode(x.data(), tok_emb, logits.data(), V, H);
             }
         }
+#ifdef TETRA_PROFILE
+        TP_T1(9);
+#endif
         cache.pos++;
         return logits;
     }
