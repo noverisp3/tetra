@@ -523,7 +523,7 @@ Reproduce the sustained case with:
 1. Gap to backprop is ~0.09 nats at 3.7× the token budget — a longer/tuned backprop run (or a proper AdamW schedule without early overfitting) may widen it.
 2. Backprop baseline showed late-training instability (LR decayed too fast → final CE rose to 8.0); its reported best (step 200) may understate what a tuned run achieves.
 3. ~~**Ternary learning is starved by saturation**~~ → **fixed by the toggle rule** (#8–#12): 94–100% no-op flips on ±1-saturated weights disappear; toggled runs keep diversity and reach 6.43 held-out CE. ~~Left to verify: toggle stability past 1000+ steps~~ → **answered by #12: not stable** — the ±20 wall crossing is periodic from zeroed accs (re-hits every ~25 blocks), sustained toggle scrambles every weight, the post-kick "rescue" state evals at 12.43 held-out, and annealing fails both ways (rising threshold either lets one ~2M kick through → 8.00, or never fires → 6.85 = embedding-only). Toggle is a transient rescue/search operator; its gains live in the Python 250–500-step window or the one-time base-model rescue (6.838).
-4. **The ternary substrate learns, but its on-device headroom is small**: cut-the-tail shows the ternary learned during Python training is worth ~1 nat over random, but continued C++ flips add only ~0.008 nats (only 0.18% of weights move). Toggle raises that to ~0.16 nats on-device (6.996 → 6.838) — but only in the transient ≤500-block window, after which sustained toggle destroys structure (#12).
+4. **The ternary substrate learns, but its on-device headroom is small**: cut-the-tail shows the ternary learned during Python training is worth ~1 nat over random, but continued C++ flips add only ~0.008 nats (only 0.18% of weights move). Toggle raises that to ~0.16 nats on-device (6.996 → 6.838) — but only in the transient ≤500-block window, after which sustained toggle destroys structure (#12). ~~The Exp 1 caveat "gated flips only stop destroying, never add" is answered for continual learning: at the correct logit scale, plain sign-grad flips from the Phase-1 checkpoint beat a frozen core on both axes (Exp 1 RESOLVED note: slice −0.68, fineweb −0.23 @10000 pos).~~
 5. Still no standard-quality generation (CE ~7 → PPL ~1090) — gradient-free learning is proven effective but far from fluent text; scaling tokens/steps is untested.
 
 ## Experiment: Surprise-Gated Bit Flips (Exp 1)
@@ -561,6 +561,18 @@ Readings:
   beats a frozen core" (CE_active < CE_frozen) is not yet demonstrated;
   the current sign-grad flip rule is net destructive (densification
   50%→33% sparsity + randomization).
+  - **RESOLVED (Exp 7 rerun at the correct logit scale):** continuing the
+    Phase-1 backprop checkpoint on fineweb shard 0 for 300 blocks, the plain
+    sign-grad flip rule (thr=20, no energy/sparsity) **beats a frozen core**
+    on both axes (10000 pos, lr_emb 1e-5): slice **7.0175 vs 7.7022**
+    (active −0.68), fineweb **8.8644 vs 9.0954** (active −0.23). On a
+    *trained* Phase-1 checkpoint the sign-grad rule is **additive, not
+    destructive** — it holds TinyStories retention while embedding-only SGD
+    forgets (+0.09 slice). The earlier "net destructive" verdict held only for
+    flips from a random init (Exp 1's own setup); from a trained base, "learn
+    where surprised" is demonstrated. (Caveat applies to from-init stochastic
+    training; the resolution is continual learning — the two are different
+    regimes.)
 
 Code changes: `quantization.apply_bit_flips(ungated=, stats=)`,
 `StochasticTernaryLinear.ungated` + flip counters, `train.py --flip-ungated`,
