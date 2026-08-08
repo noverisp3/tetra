@@ -282,8 +282,11 @@ def write_fp32_entry(f, name, param, quantize_int8=False):
     f.write(name_bytes)
     f.write(struct.pack("<B", ndim))
 
-    is_int8_candidate = name in ("token_embedding.weight", "pos_embedding.weight")
-    use_int8 = is_int8_candidate or quantize_int8
+    # Embeddings (incl. lm_head tied weights) stay FP32 by default so the
+    # exported model matches the checkpoint exactly (int8 shifts lm_head
+    # logits ~0.18 and opens a spurious C++/Python CE gap). Only quantize
+    # when --quantize-int8 is explicitly requested.
+    use_int8 = quantize_int8
 
     if use_int8:
         scale, w_int8 = quantize_fp32_to_int8(param.data)
@@ -358,8 +361,8 @@ def detect_model_info(model) -> dict:
                 info["group_size"] = getattr(mod, 'group_size', 0)
                 break
 
-    # Check for int8 embeddings
-    info["int8_embeddings"] = True  # we always quantize embeddings to int8
+    # Embeddings are FP32 by default; INT8 only with --quantize-int8.
+    info["int8_embeddings"] = False
 
     # Total params
     ternary_count, fp32_count = count_params(model)
@@ -753,7 +756,7 @@ def export_model(model, output_path, mode="ste", quantize_int8=False,
             kv_latent_dim=info.get("kv_latent_dim", 0),
             rope_per_head=info.get("rope_per_head", 0),
             group_size=info.get("group_size", 0),
-            int8_embeddings=info.get("int8_embeddings", False),
+            int8_embeddings=bool(quantize_int8),
             version=7 if v7 else 5,
         )
 

@@ -937,8 +937,6 @@ static std::vector<float> forward(
                         float* krh = cache.k_rope_cache[l].data() + t * RD + head * RP;
                         float s = dot_product_simd(qh, kh, HD) * eff_scale;
                         s += dot_product_simd(qrh, krh, RP) * eff_scale;
-                        if (s > 80.0f) s = 80.0f;
-                        else if (s < -80.0f) s = -80.0f;
                         attn_scores[t] = s;
                     }
                     softmax(attn_scores.data(), actual_len);
@@ -978,8 +976,6 @@ static std::vector<float> forward(
                     for (int t = 0; t < actual_len; t++) {
                         float s = dot_product_simd(q_head,
                             cache.k_cache[l].data() + t * H + head * HD, HD) * scale;
-                        if (s > 80.0f) s = 80.0f;
-                        else if (s < -80.0f) s = -80.0f;
                         attn_scores[t] = s;
                     }
                     softmax(attn_scores.data(), actual_len);
@@ -1136,8 +1132,6 @@ static std::vector<float> forward(
                         float* krh = cache.k_rope_cache[l].data() + t * RD + head * RP;
                         float s = dot_product_simd(qh, kh, HD) * eff_scale;
                         s += dot_product_simd(qrh, krh, RP) * eff_scale;
-                        if (s > 80.0f) s = 80.0f;
-                        else if (s < -80.0f) s = -80.0f;
                         attn_local[t] = s;
                     }
                     softmax(attn_local.data(), actual_len);
@@ -1185,8 +1179,6 @@ static std::vector<float> forward(
                     for (int t = 0; t < actual_len; t++) {
                         float s = dot_product_simd(q_head,
                             cache.k_cache[l].data() + t * H + head * HD, HD) * scale;
-                        if (s > 80.0f) s = 80.0f;
-                        else if (s < -80.0f) s = -80.0f;
                         attn_local[t] = s;
                     }
                     softmax(attn_local.data(), actual_len);
