@@ -74,7 +74,8 @@ class TestTernaryLinear:
         layer = TernaryLinear(16, 32)
         w_ternary = layer.get_ternary_weights()
         unique = w_ternary.unique()
-        assert all(v in [-1.0, 0.0, 1.0] for v in unique.tolist())
+        # v7 outlier encoding allows ±2 (code 11); ternary set is {-2,-1,0,1,2}.
+        assert all(v in [-2.0, -1.0, 0.0, 1.0, 2.0] for v in unique.tolist())
 
     def test_get_num_bits(self):
         layer = TernaryLinear(16, 32)

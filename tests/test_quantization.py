@@ -11,7 +11,9 @@ class TestTernaryQuantizer:
         w = torch.randn(64, 64) * 2
         w_ternary = TernaryQuantizer.apply(w)
         unique = w_ternary.unique()
-        assert all(v in [-1.0, 0.0, 1.0] for v in unique.tolist())
+        # v7 outlier encoding: |W| > 1.5Δ promotes to ±2 (code 11), sign in a
+        # dense side-channel blob. Valid quantized values are in {-2,-1,0,1,2}.
+        assert all(v in [-2.0, -1.0, 0.0, 1.0, 2.0] for v in unique.tolist())
 
     def test_output_shape_preserved(self):
         w = torch.randn(32, 16)
@@ -97,7 +99,8 @@ class TestHelperFunctions:
         w = torch.randn(32, 32)
         w_ternary = ternary_quantize(w)
         unique = w_ternary.unique()
-        assert all(v in [-1.0, 0.0, 1.0] for v in unique.tolist())
+        # v7 outlier encoding allows ±2 (code 11); see test_output_values_are_ternary.
+        assert all(v in [-2.0, -1.0, 0.0, 1.0, 2.0] for v in unique.tolist())
 
     def test_int8_quantize_returns_float(self):
         x = torch.randn(32, 32)

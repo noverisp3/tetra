@@ -138,7 +138,10 @@ class TernaryQuantizer(torch.autograd.Function):
     Lower scale increases entropy (fewer zeros in ternary matrix),
     preventing model collapse (all weights -> 0).
 
-    Forward:  clamp(W/Δ, -1, 1) -> round -> {-1, 0, +1}
+    v7 outlier encoding: |W| > 1.5Δ promotes to ±2 (2-bit code 11, sign in a
+    dense side-channel blob). Valid outputs are in {-2, -1, 0, +1, +2}.
+
+    Forward:  round(W/Δ) -> clamp(-2, 2) -> {-2, -1, 0, +1, +2}
     Backward: STE passes grad straight through
     """
 
