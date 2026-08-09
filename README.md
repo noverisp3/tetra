@@ -1209,6 +1209,8 @@ behavioral shift:
 | erc-nocommit (R, commits off) | +0.0415 | +0.0276 | −0.0989 | −0.1367 |
 | erc-freeze (R, core frozen) | +0.0703 | **+0.0000** | −0.0582 | +0.0000 |
 | erc-common (R lr 0.01, commit 2) | +0.0430 | +0.0282 | −0.0986 | −0.1380 |
+| **erc-hot** (R lr 0.1, no decay, commit 10) | +0.0110 | **−0.0012** | −0.1124 | −0.0603 |
+| **erc-hotc** (R lr 0.05, no decay, commit 2) | +0.0426 | **−0.0061** | −0.1088 | −0.0713 |
 
 Readings:
 
@@ -1235,6 +1237,23 @@ Readings:
   still adapting the core (domain core-only −0.139).
 - The residual stays bounded below 0.5 level between commits, so
   `--commit-erc` export loses only sub-level noise.
+- **Hot residual arms** (no decay, high R LR): erc-hot (R lr 0.1) cuts
+  behavioral slice forgetting to +0.011 (vs +0.048 at lr 0.01) and the
+  core-only slice CE *improves* (−0.0012) — the residual absorbs the new
+  domain's gradient before it can touch the core. Domain adaptation (R
+  active, −0.112) matches the best lr-0.01 arm, but core-only domainCE
+  (−0.060) lags (−0.139 at lr 0.01): the hot residual carries more of the
+  adaptation itself, so less is consolidated into the core within 30 steps.
+  erc-hotc (R lr 0.05, commit 2) sits between: core-only sliceCE −0.006,
+  core-only domainCE −0.071. Combined with erc-freeze, the picture is
+  consistent: the core's forgetting is set by how much new gradient reaches
+  it, and the residual LR trades behavioral speed against core consolidation.
+- **C++ parity**: `--commit-erc` full carry emits a plain v7 ternary binary
+  (`checkpoints_erc/erc-hot.bin`, no residual side path), and the C++
+  self-learning runtime matches PyTorch exactly: `verify_export` reports
+  51/51 tensors bit-exact (max diff 0.0) and eval CE matches — 4.9488 vs
+  4.9572 (PyTorch KV cache) on 384 positions, 5.7122 vs 5.7778 (trainer
+  sliceCEcore) on 20k positions.
 
 Reproduce (default runs all 6 arms; subset with `--arms`):
 
@@ -1249,7 +1268,9 @@ python scripts/erc_transfer_test.py --smoke --arms erc-nocommit,erc-freeze
 Arms (defined in `ARMS` dict of the driver): `baseline`,
 `baseline-lowlr` (LR/10 control), `erc`, `erc-nocommit`
 (`--erc-commit-interval 0`), `erc-freeze` (`--erc-freeze-core`),
-`erc-common` (commit every 2 steps). Each arm's `eval_history.json` also
+`erc-common` (commit every 2 steps), plus the hot arms `erc-hot`
+(R lr 0.1, no decay, commit 10) and `erc-hotc` (R lr 0.05, no decay,
+commit 2). Each arm's `eval_history.json` also
 logs `slice_core_ces`/`domain_core_ces` (R zeroed) for core-only metrics.
 
 Unit tests: `tests/test_erc.py` (9 tests — commit math, forward parity,
