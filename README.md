@@ -1113,6 +1113,43 @@ smooth-surrogate warmup, and the code is retained only as a documented dead end.
 side-channel sign blob covers ~half the matrix — a scale >0.9 would push the distribution
 back toward ±1 and shrink the side channel; untested.)
 
+## Experiment: Ternary-Scale Tuning (Exp 9)
+
+The Exp 8 diagnostic surfaced a suspicious distribution: at `--ternary-scale 0.7` (default)
+**46% of trained weights sit in the ±2 outlier band**, so the v7 side-channel sign blob covers
+nearly half the matrix. Since Δ = scale × mean|W|, a larger scale widens the ±1 plateau and
+should shift the distribution back toward {-1, 0, +1} — while also changing what the model
+can represent. Sweep (300 steps, preset tiny, tinydata, STE, `scripts/diagnose_soft_quant.py`
+for occupancy):
+
+| Scale | Final train CE @300 | Dead zone | Plateau ±1 | Outlier ±2 |
+|---|---|---|---|---|
+| 0.7 (default) | 5.8817 | 17.9% | 35.7% | 46.4% |
+| 0.9 | 5.8184 | 23.0% | 45.7% | 31.3% |
+| **1.0** | **5.7844** | 25.5% | 50.4% | 24.1% |
+| 1.3 | 5.8671 | 33.1% | 61.8% | 5.2% |
+
+Readings (honest):
+
+- **Scale 1.0 is a free win on both axes**: lower CE (−0.097 vs default) *and* outlier share
+  halved (46.4% → 24.1%), shrinking the deployment side-channel blob by ~half. The plateau
+  becomes the majority bin (50.4%) — the distribution moves from outlier-dominant bimodal to
+  a balanced {-1, 0, +1} profile.
+- **There is a real optimum, not a monotone direction**: 1.3 overturns the trend (5.8671) as
+  the dead zone grows to 33% (scale 1.3: 33.1% dead / 61.8% plateau / 5.2% outlier) — too many
+  weights quantize to 0 and the model loses representational capacity. Optimum ≈ 1.0–1.1.
+- The CE deltas (~0.1) are single-seed; the occupancy shift is structural and robust. Worth
+  re-benchmarking the 0.7 vs 1.0 comparison on the production 15k-step budget and with the
+  C++ runtime before promoting 1.0 to the default.
+
+Reproduce:
+
+```bash
+python train.py --preset tiny --steps 300 --data-cache tinydata --mode ste --ternary-scale 1.0 \
+    --save-dir checkpoints_exp9_s10
+python scripts/diagnose_soft_quant.py checkpoints_exp9_s10/checkpoint_000300.pt "SCALE 1.0"
+```
+
 ## Project Structure
 
 ```
