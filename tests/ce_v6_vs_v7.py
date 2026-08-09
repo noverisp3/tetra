@@ -49,7 +49,10 @@ def parse_ternary_meta(path):
         p += psz
         if version >= 6:
             p += rows * cols * 4  # accumulator
-        if version >= 7:
+        if version >= 8:
+            n_out = int(np.frombuffer(d[p:p + 4], dtype="<u4")[0])
+            p += 4 + n_out  # v8: raw int8 magnitude per outlier
+        elif version >= 7:
             n_out = int(np.frombuffer(d[p:p + 4], dtype="<u4")[0])
             p += 4 + (n_out + 7) // 8  # blob
         out[name] = (rows, cols, gs, alphas, packed)
@@ -162,7 +165,10 @@ def main():
         else:
             w = tensors[name]
         tensors[name] = apply_alphas(w, gs, alphas)
-    print(f"version={version} mode={'v6 (code11->0)' if args.v6 else 'v7 (blob)'}")
+    if version >= 8:
+        print(f"version={version} mode='v8 (top-k true values)'")
+    else:
+        print(f"version={version} mode={'v6 (code11->0)' if args.v6 else 'v7 (blob)'}")
 
     model = TorchModel(tensors, V, H, L, NH, FFN, seq)
     toks = np.fromfile(args.tokens, dtype="<u2")

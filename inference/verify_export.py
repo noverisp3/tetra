@@ -62,6 +62,10 @@ def load_binary_model(path: str) -> tuple[dict, dict]:
             flags, kv_latent_dim, rope_per_head, group_size = struct.unpack(
                 "<HHHH", header[48:56])
 
+        v8_k = 0
+        if version >= 8:
+            v8_k = struct.unpack("<H", header[56:58])[0]
+
         header_info = {
             "version": version,
             "vocab_size": vocab_size,
@@ -76,6 +80,7 @@ def load_binary_model(path: str) -> tuple[dict, dict]:
             "kv_latent_dim": kv_latent_dim,
             "rope_per_head": rope_per_head,
             "group_size": group_size,
+            "v8_k": v8_k,
         }
 
         print(f"Header v{version}: vocab={vocab_size} hidden={hidden_dim} "
@@ -130,7 +135,21 @@ def load_binary_model(path: str) -> tuple[dict, dict]:
             if version >= 6:
                 f.read(rows * cols * 4)  # skip FP32 accumulator (v6/v7)
 
-            if version >= 7:
+            if version >= 8:
+                # v8: trailing uint32 outlier count + one int8 fixed-point
+                # magnitude per outlier (round((W/Δ)·32), scan order). Resolves
+                # code-11 positions to their true value instead of ±2.
+                n_outliers = struct.unpack("<I", f.read(4))[0]
+                if n_outliers > 0:
+                    blob = f.read(n_outliers)
+                    mags = np.frombuffer(blob, dtype=np.int8).astype(np.float32) / 32.0
+                    flat = arr.reshape(-1).astype(np.float32)
+                    idx = np.flatnonzero(np.abs(flat) > 1.5)
+                    assert len(idx) == n_outliers, (
+                        f"{name}: code-11 count {len(idx)} != blob count {n_outliers}")
+                    flat[idx] = mags
+                    arr = flat.reshape(rows, cols)
+            elif version >= 7:
                 # v7: trailing uint32 outlier count + dense sign blob (MSB-first,
                 # row-major scan order, 1 = positive). Signs resolve code-11 ±2.
                 n_outliers = struct.unpack("<I", f.read(4))[0]
@@ -350,10 +369,41 @@ def verify_export(checkpoint_path: str, binary_path: str, mode: str = None,
                 print(f"  MISSING: {name}")
                 continue
             if is_ternary:
-                # Quantize in float32: the checkpoint stores fp16 latents, but
-                # the export quantizes the fp32 model param; fp16 arithmetic
-                # flips ~0.1% of knife-edge round() boundaries.
-                py_w = TernaryQuantizer.apply(param.data.float()).cpu().numpy()
+                if header_info.get("version", 0) >= 8:
+                    from ternary_llm.quantization import v8_quantize
+                    mod_path = name.rsplit(".latent_weights", 1)[0]
+                    mod = model
+                    for part in mod_path.split("."):
+                        mod = getattr(mod, part)
+                    py_w, blob = v8_quantize(
+                        param.data,
+                        k=header_info.get("v8_k") or 0,
+                        per_channel=getattr(mod, "per_channel", False),
+                        scale=getattr(mod, "ternary_scale", 1.0))
+                    # The quantizer's core keeps ±2 markers at outlier positions;
+                    # resolve them to the true fixed-point values from the blob,
+                    # exactly like the file format does, before comparing.
+                    py_w = py_w.cpu().numpy()
+                    flat = py_w.reshape(-1)
+                    idx = np.flatnonzero(np.abs(flat) > 1.5)
+                    mags = np.frombuffer(blob, dtype=np.int8).astype(np.float32) / 32.0
+                    if len(idx) != len(mags):
+                        print(f"  BLOB MISMATCH: {name} markers={len(idx)} blob={len(mags)}")
+                    else:
+                        flat[idx] = mags
+                    py_w = flat.reshape(py_w.shape)
+                else:
+                    # Quantize in float32 with the module's ternary_scale: the
+                    # checkpoint stores fp16 latents, but the export quantizes
+                    # the fp32 model param; fp16 arithmetic flips ~0.1% of
+                    # knife-edge round() boundaries.
+                    mod_path = name.rsplit(".latent_weights", 1)[0]
+                    mod = model
+                    for part in mod_path.split("."):
+                        mod = getattr(mod, part)
+                    py_w = TernaryQuantizer.apply(
+                        param.data.float(),
+                        getattr(mod, "ternary_scale", 1.0)).cpu().numpy()
             else:
                 py_w = param.data.float().cpu().numpy()
             bin_w = bin_weights[name]
@@ -372,11 +422,14 @@ def verify_export(checkpoint_path: str, binary_path: str, mode: str = None,
     print(f"  Exact match: {total_ok}/{total_compared}")
     print(f"  Max diff: {max_diff:.6f}")
 
-    passed = max_diff < 1e-3
+    # v8 outliers are stored as int8 fixed-point (1/32Δ steps), so a tiny
+    # quantization error on the true values is expected and tolerated.
+    tol = 0.05 if header_info.get("version", 0) >= 8 else 1e-3
+    passed = max_diff < tol
     if passed:
-        print(f"\n  [OK] Verification passed (max_diff < 1e-3)")
+        print(f"\n  [OK] Verification passed (max_diff < {tol})")
     else:
-        print(f"\n  [WARN] Verification failed (max_diff >= 1e-3)")
+        print(f"\n  [WARN] Verification failed (max_diff >= {tol})")
     print(f"{'='*50}\n")
     return passed
 

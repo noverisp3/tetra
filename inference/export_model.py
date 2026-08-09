@@ -161,8 +161,12 @@ def quantize_fp32_to_int8(tensor: torch.Tensor):
 def write_header_v5(f, *, vocab_size, hidden_dim, num_layers, num_heads,
                      ffn_dim, max_seq_len, ternary_count, fp32_count,
                      is_mla=False, kv_latent_dim=0, rope_per_head=0,
-                     group_size=0, int8_embeddings=False, version=5):
-    """Write 64-byte v5/v6 header."""
+                     group_size=0, int8_embeddings=False, version=5, v8_k=0):
+    """Write 64-byte v5/v6/v7/v8 header.
+
+    v8 uses the reserved bytes 56-57 to store the per-row top-k outlier
+    budget (k) so verifiers can re-quantize with the same selection rule.
+    """
     flags = 0
     if is_mla:
         flags |= 1
@@ -187,12 +191,14 @@ def write_header_v5(f, *, vocab_size, hidden_dim, num_layers, num_heads,
         group_size,
         b"\x00" * 8,
     )
+    if v8_k:
+        header = header[:56] + struct.pack("<H", v8_k) + header[58:]
     assert len(header) == HEADER_V5_SIZE, f"Header size mismatch: {len(header)} != {HEADER_V5_SIZE}"
     f.write(header)
 
 
 def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None, accumulator=None,
-                        outlier_blob=None):
+                        outlier_blob=None, v8_blob=False):
     """Write a ternary weight entry.
 
     When ``accumulator`` (FP32, rows*cols) is given the entry is written in
@@ -202,6 +208,10 @@ def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None, accumulator=
     When ``outlier_blob`` (dense sign bits for code-11 ±2 weights, row-major
     MSB-first) is given the entry is written in v7 form: a uint32 outlier
     count followed by the sign blob is appended at the end of the entry.
+
+    ``v8_blob`` switches to the v8 form: the blob is a raw int8 fixed-point
+    magnitude per outlier (round((W/Δ)·32), one byte each, scan order) and the
+    uint32 count is just len(blob).
     """
     nb = new_name.encode("utf-8")
     f.write(struct.pack("<I", len(nb)))
@@ -230,14 +240,20 @@ def write_ternary_entry(f, tensor, new_name, mod=None, alphas=None, accumulator=
         f.write(acc.reshape(-1).astype(np.float32).tobytes())
 
     if outlier_blob is not None:
-        n_outliers = int((tensor.abs() > 1.5).sum())
-        f.write(struct.pack("<I", n_outliers))
-        # Fused gate+up blobs are concatenated per-sub-blob byte-padded; the
-        # dense outlier bits (MSB-first) are repacked so the blob is exactly
-        # ceil(n_outliers/8) bytes. No-op for single-module blobs.
-        bits = np.unpackbits(np.frombuffer(outlier_blob, dtype=np.uint8))
-        blob = np.packbits(bits[:n_outliers]).tobytes()
-        f.write(blob)
+        if v8_blob:
+            n_outliers = len(outlier_blob)
+            f.write(struct.pack("<I", n_outliers))
+            if n_outliers:
+                f.write(outlier_blob)
+        else:
+            n_outliers = int((tensor.abs() > 1.5).sum())
+            f.write(struct.pack("<I", n_outliers))
+            # Fused gate+up blobs are concatenated per-sub-blob byte-padded; the
+            # dense outlier bits (MSB-first) are repacked so the blob is exactly
+            # ceil(n_outliers/8) bytes. No-op for single-module blobs.
+            bits = np.unpackbits(np.frombuffer(outlier_blob, dtype=np.uint8))
+            blob = np.packbits(bits[:n_outliers]).tobytes()
+            f.write(blob)
 
 
 def count_outliers_in_packed(packed: torch.Tensor) -> int:
@@ -377,13 +393,16 @@ def detect_model_info(model) -> dict:
 # Export: STE mode
 # ──────────────────────────────────────────────────────────────
 
-def export_ste(f, model, quantize_int8=False, v7=False):
+def export_ste(f, model, quantize_int8=False, v7=False, v8=False, v8_k=32):
     """Export STE-mode ternary weights (per-channel Δ + per-group alphas).
 
     v7: |W| > 1.5Δ weights are exported as ±2 outliers (code 11) with their
     signs in a per-entry side-channel blob.
+
+    v8: the core is pure ternary {-1,0,+1} and the k largest |W/Δ| weights
+    per row keep their true value (int8 fixed-point, 1/32Δ) in the blob.
     """
-    from ternary_llm.quantization import TernaryQuantizer, pack_sign_blob
+    from ternary_llm.quantization import TernaryQuantizer, pack_sign_blob, v8_quantize
 
     for name, param in model.named_parameters():
         is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
@@ -393,21 +412,31 @@ def export_ste(f, model, quantize_int8=False, v7=False):
         mod = model
         for part in mod_path.split("."):
             mod = getattr(mod, part)
-        if getattr(mod, "per_channel", False):
+        if v8:
+            w_ternary, blob = v8_quantize(
+                param.detach(), k=v8_k,
+                per_channel=getattr(mod, "per_channel", False),
+                scale=getattr(mod, "ternary_scale", 1.0))
+            alphas = (mod.alphas.detach().float().reshape(-1)
+                      if getattr(mod, "per_channel", False) else None)
+        elif getattr(mod, "per_channel", False):
             delta = param.detach().abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * mod.ternary_scale
             w_ternary = (param.detach() / delta).round().clamp(-2, 2)
             alphas = mod.alphas.detach().float().reshape(-1)  # learned per-row alpha (forward: out * alphas)
+            blob = pack_sign_blob(w_ternary) if v7 else None
         else:
-            delta = param.detach().abs().mean().clamp(min=1e-6) * mod.ternary_scale
-            w_ternary = TernaryQuantizer.apply(param.data)
+            # Per-tensor: delta = mean(|W|) * mod.ternary_scale, matching the
+            # training-time FusedTernaryLinear forward. TernaryQuantizer must
+            # receive that scale explicitly (its default is 1.0).
+            w_ternary = TernaryQuantizer.apply(param.data, getattr(mod, "ternary_scale", 1.0))
             alphas = None  # per-tensor: PyTorch forward does NOT scale (alphas=None)
-        blob = pack_sign_blob(w_ternary) if v7 else None
+            blob = pack_sign_blob(w_ternary) if v7 else None
         w_ternary = w_ternary.to(torch.int8)
-        # v6/v7 layouts always carry an FP32 accumulator (self-learning state)
+        # v6/v7/v8 layouts always carry an FP32 accumulator (self-learning state)
         # so the C++ reader never has to guess; STE exports write zeros.
-        zero_acc = torch.zeros(int(w_ternary.numel()), dtype=torch.float32) if v7 else None
+        zero_acc = torch.zeros(int(w_ternary.numel()), dtype=torch.float32) if (v7 or v8) else None
         write_ternary_entry(f, w_ternary, name, mod, alphas=alphas,
-                            accumulator=zero_acc, outlier_blob=blob)
+                            accumulator=zero_acc, outlier_blob=blob, v8_blob=v8)
 
     for name, param in model.named_parameters():
         is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
@@ -707,7 +736,7 @@ def export_self_learning(
 # ──────────────────────────────────────────────────────────────
 
 def export_model(model, output_path, mode="ste", quantize_int8=False,
-                 metadata=None, verbose=True, v7=False):
+                 metadata=None, verbose=True, v7=False, v8=False, v8_k=32):
     """Export model weights to binary format.
 
     Args:
@@ -718,6 +747,8 @@ def export_model(model, output_path, mode="ste", quantize_int8=False,
         metadata: optional dict to store as JSON metadata section
         verbose: print detailed stats
         v7: write code-11 outlier side-channel (format version 7)
+        v8: write top-k true-value outliers (format version 8, STE only)
+        v8_k: per-row outlier budget for v8
     """
     model.eval()
 
@@ -727,7 +758,7 @@ def export_model(model, output_path, mode="ste", quantize_int8=False,
 
     if verbose:
         print(f"\n{'='*50}")
-        print(f"  Tetra Export v5")
+        print(f"  Tetra Export v{'8' if v8 else ('7' if v7 else '5')}")
         print(f"{'='*50}")
         print(f"  Mode:          {info['mode']}")
         print(f"  MLA:           {info['is_mla']}")
@@ -764,19 +795,20 @@ def export_model(model, output_path, mode="ste", quantize_int8=False,
             rope_per_head=info.get("rope_per_head", 0),
             group_size=info.get("group_size", 0),
             int8_embeddings=bool(quantize_int8),
-            version=7 if v7 else 5,
+            version=8 if v8 else (7 if v7 else 5),
+            v8_k=v8_k if v8 else 0,
         )
 
         # Write ternary + FP32 weights
         if mode == "stochastic":
             export_stochastic(f, model, quantize_int8=quantize_int8, v7=v7)
         else:
-            export_ste(f, model, quantize_int8=quantize_int8, v7=v7)
+            export_ste(f, model, quantize_int8=quantize_int8, v7=v7, v8=v8, v8_k=v8_k)
 
         # Write metadata section
         if metadata:
             meta = dict(metadata)
-            meta["_export_version"] = 7 if v7 else 5
+            meta["_export_version"] = 8 if v8 else (7 if v7 else 5)
             meta["_export_time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             meta["_info"] = {
                 k: v for k, v in info.items()
@@ -858,6 +890,11 @@ Examples:
                         help="Write zeroed accumulators (safe default for toggled runs; the Python acc state is transient — finding #10)")
     parser.add_argument("--v7", action="store_true",
                         help="Write v7 format: code-11 outlier (±2) side-channel blobs (header version 7)")
+    parser.add_argument("--v8", action="store_true",
+                        help="Write v8 format: top-k true-value outliers per row (int8 fixed-point blob, STE only)")
+    parser.add_argument("--v8-k", type=int, default=0,
+                        help="v8 per-row outlier budget (default 0 = keep every |W/Δ| > 1.5 "
+                             "outlier with its true value; ~1 byte per outlier vs 1 bit in v7)")
     parser.add_argument("--commit-erc", action="store_true",
                         help="ERC checkpoints: bake the residual (R, level units) into the "
                              "latent core, drop R, then export a plain 2-bit ternary binary")
@@ -1009,6 +1046,8 @@ Examples:
             metadata["dataset"] = args.metadata_dataset
         if not is_discrete:
             metadata["sl_logit_scale"] = 1.0  # STE trains at natural logit scale
+        if args.v8:
+            metadata["v8_k"] = args.v8_k
 
     info = export_model(
         model, args.output, mode=mode,
@@ -1016,6 +1055,8 @@ Examples:
         metadata=metadata,
         verbose=not args.quiet,
         v7=args.v7,
+        v8=args.v8,
+        v8_k=args.v8_k,
     )
 
     # Auto-verify

@@ -88,8 +88,11 @@ struct TernaryWeightXNOR {
     std::vector<float> alphas; // flat array: per-group = rows*num_groups, per-channel = rows, empty = scalar
     std::vector<float> accumulator; // FP32 learning state (rows*cols), v6 only
     bool is_v7 = false;        // v7 entry: code 11 = ±2 outlier, sign in outlier_blob
-    std::vector<uint8_t> outlier_blob; // dense sign bits (MSB-first, 1=positive), only
-                                       // ceil(n_outliers/8) bytes, dense-first in scan order
+    bool is_v8 = false;        // v8 entry: code 11 = top-k outlier, true value as
+                               // int8 fixed-point ((W/Δ)·32) in outlier_blob
+    std::vector<uint8_t> outlier_blob; // v7: dense sign bits (MSB-first, 1=positive);
+                                       // v8: one int8 magnitude byte per outlier,
+                                       // dense-first in scan order
 };
 
 // SIMD dot product: sum(x[i] * w[i]) for i in [0, cols)
@@ -212,11 +215,13 @@ static inline void attention_weighted_sum(
 #endif
 
 // Dequantize one row of 2-bit packed ternary -> float array.
-// blob: dense sign bits for code-11 outliers (dense-first in row-major scan
-// order, MSB-first, 1=positive). ``outlier_idx`` is the running counter of
-// code-11 weights already scanned across all rows. blob == nullptr -> v6.
+// blob: v7 = dense sign bits for code-11 outliers (dense-first in row-major
+// scan order, MSB-first, 1=positive); v8 = one int8 fixed-point magnitude per
+// code-11 outlier (true value in level units, /32). ``outlier_idx`` is the
+// running counter of code-11 weights already scanned across all rows.
+// blob == nullptr -> v6.
 static inline void dequantize_row(const uint8_t* packed, int row_offset, int cols, float* out,
-                                  const uint8_t* blob, size_t& outlier_idx) {
+                                  const uint8_t* blob, bool is_v8, size_t& outlier_idx) {
     static const float lut[4] = {-1.0f, 0.0f, 1.0f, 0.0f};
     int c = 0, num_bytes = (cols + 3) / 4;
     for (int b = 0; b < num_bytes; b++) {
@@ -226,8 +231,12 @@ static inline void dequantize_row(const uint8_t* packed, int row_offset, int col
             int code = (byte >> (6 - i * 2)) & 3;
             if (code == 3) {
                 if (blob) {
-                    int bit = (int)((blob[outlier_idx >> 3] >> (7 - (outlier_idx & 7))) & 1);
-                    out[c] = bit ? 2.0f : -2.0f;
+                    if (is_v8) {
+                        out[c] = (float)(int8_t)blob[outlier_idx] / 32.0f;
+                    } else {
+                        int bit = (int)((blob[outlier_idx >> 3] >> (7 - (outlier_idx & 7))) & 1);
+                        out[c] = bit ? 2.0f : -2.0f;
+                    }
                 } else {
                     out[c] = 0.0f;
                 }
@@ -247,7 +256,8 @@ static void precompute_floats(TernaryWeightXNOR& w) {
     for (int r = 0; r < w.rows; r++) {
         dequantize_row(w.packed.data(), r * row_bytes, w.cols,
                        w.floats.data() + (size_t)r * w.cols,
-                       w.outlier_blob.empty() ? nullptr : w.outlier_blob.data(), outlier_idx);
+                       w.outlier_blob.empty() ? nullptr : w.outlier_blob.data(),
+                       w.is_v8, outlier_idx);
     }
 }
 
@@ -339,6 +349,8 @@ struct ModelHeader {
     uint16_t kv_latent_dim;
     uint16_t rope_per_head;
     uint16_t group_size;
+    // v8 field (header bytes 56-57)
+    uint16_t v8_k;          // per-row top-k outlier budget (0 = not v8)
 };
 
 // Decode FP32 matmul with prefetch
@@ -640,6 +652,11 @@ static Model load_model(const char* path) {
         memcpy(&h.rope_per_head, header_buf + 52, 2);
         memcpy(&h.group_size,    header_buf + 54, 2);
     }
+    // v8 field (bytes 56-57)
+    h.v8_k = 0;
+    if (h.version >= 8) {
+        memcpy(&h.v8_k, header_buf + 56, 2);
+    }
 
     fprintf(stderr, "Tetra: %d layers, hidden=%d, heads=%d, ffn=%d, vocab=%d, seq=%d",
             h.num_layers, h.hidden_dim, h.num_heads, h.ffn_dim, h.vocab_size, h.max_seq_len);
@@ -722,9 +739,18 @@ static Model load_model(const char* path) {
             r.read_bytes(w.accumulator.data(), w.accumulator.size() * sizeof(float));
         }
 
-        // v7: trailing uint32 outlier count + dense sign blob
-        // (ceil(n_outliers/8) bytes, MSB-first, 1=positive, dense-first scan order).
-        if (h.version >= 7) {
+        // v8: trailing uint32 outlier count + one int8 fixed-point magnitude
+        // per outlier (round((W/Δ)·32), scan order) — code-11 positions keep
+        // their true value instead of a ±2 clamp.
+        if (h.version >= 8) {
+            uint32_t n_outliers = 0;
+            r.read(n_outliers);
+            w.is_v8 = true;
+            w.outlier_blob.resize(n_outliers);
+            if (n_outliers) r.read_bytes(w.outlier_blob.data(), n_outliers);
+        } else if (h.version >= 7) {
+            // v7: trailing uint32 outlier count + dense sign blob
+            // (ceil(n_outliers/8) bytes, MSB-first, 1=positive, dense-first scan order).
             uint32_t n_outliers = 0;
             r.read(n_outliers);
             w.is_v7 = true;
@@ -1514,6 +1540,11 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = 
             if (!f) continue;
             float wv = prow[c];
             bool is_std = (fabsf(wv) <= 1.5f);
+            if (w.is_v8 && !is_std) {
+                // v8: top-k outliers hold true values in the blob — frozen.
+                acc_row[c] = 0.0f;
+                continue;
+            }
             if (f == 2) {
                 if (!is_std) {
                     // outlier with huge acc: fall back to normal flip (same-dir stays)
@@ -1687,7 +1718,7 @@ static void save_model(Model& model, const char* path) {
     uint8_t hdr[64];
     memset(hdr, 0, 64);
     memcpy(hdr, "TETR", 4);
-    uint32_t ver = (H.version >= 7) ? 7u : 6u;
+    uint32_t ver = (H.version >= 8) ? 8u : ((H.version >= 7) ? 7u : 6u);
     memcpy(hdr + 4, &ver, 4);
     memcpy(hdr + 8,  &H.vocab_size, 4);
     memcpy(hdr + 12, &H.hidden_dim, 4);
@@ -1701,6 +1732,7 @@ static void save_model(Model& model, const char* path) {
     memcpy(hdr + 50, &H.kv_latent_dim, 2);
     memcpy(hdr + 52, &H.rope_per_head, 2);
     memcpy(hdr + 54, &H.group_size, 2);
+    if (ver >= 8) memcpy(hdr + 56, &H.v8_k, 2);
     fwrite(hdr, 1, 64, f);
 
     for (auto& kv : model.ternary_weights) {
@@ -1717,7 +1749,27 @@ static void save_model(Model& model, const char* path) {
         fwrite(w.packed.data(), 1, w.packed.size(), f);
         if (!w.accumulator.empty())
             fwrite(w.accumulator.data(), 4, w.accumulator.size(), f);
-        if (ver >= 7) {
+        if (ver >= 8) {
+            // v8: rebuild the raw int8 magnitude blob (round(W·32), true-value
+            // fixed point at 1/32Δ resolution) from the dequantized floats so
+            // it always matches the packed code-11 positions. Outliers are
+            // frozen during learning, so values are exact unless demoted.
+            const size_t total = (size_t)w.rows * w.cols;
+            size_t count = 0;
+            for (size_t i = 0; i < total; i++)
+                if (fabsf(w.floats[i]) > 1.5f) count++;
+            std::vector<uint8_t> blob(count);
+            size_t k = 0;
+            for (size_t i = 0; i < total; i++) {
+                float v = w.floats[i];
+                if (fabsf(v) > 1.5f) {
+                    blob[k++] = (uint8_t)(int8_t)llroundf(v * 32.0f);
+                }
+            }
+            uint32_t n_outliers = (uint32_t)count;
+            fwrite(&n_outliers, 4, 1, f);
+            if (!blob.empty()) fwrite(blob.data(), 1, blob.size(), f);
+        } else if (ver >= 7) {
             // Rebuild the dense sign blob from the dequantized floats so it is
             // always consistent with the packed code-11 positions, then write
             // the trimmed ceil(n/8) bytes (matches the Python exporter).

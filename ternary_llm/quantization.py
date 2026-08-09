@@ -347,6 +347,41 @@ def pack_sign_blob(weights: torch.Tensor) -> bytes:
     return bytes(packed.tolist())
 
 
+def v8_quantize(w: torch.Tensor, k: int = 32, per_channel: bool = False,
+                scale: float = 1.0) -> tuple:
+    """v8 top-k outlier quantization (format v8, STE export/verify path).
+
+    The core stays pure ternary {-1, 0, +1} (clamp ±1, no ±2 clamp). Per row,
+    the ``k`` weights with the largest |W/Δ| above the 1.5Δ outlier boundary
+    keep their *true* value: code 11 marks the position and the side-channel
+    blob stores round((W/Δ)·32) as a signed int8 (level units, 1/32Δ
+    resolution, range ±3.97Δ). Everything else rounds to ±1 or 0.
+
+    Returns (core tensor with ±2 markers at outlier positions, blob bytes).
+    """
+    if per_channel:
+        delta = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * scale
+    else:
+        delta = w.abs().mean().clamp(min=1e-6) * scale
+    x_n = w / delta
+    core = x_n.round().clamp(-1, 1)
+    mask = x_n.abs() > 1.5
+    if k > 0 and mask.any():
+        vals = x_n.abs() * mask
+        kk = min(k, int(mask.sum(dim=1).max().item()))
+        if kk > 0:
+            cutoff = torch.topk(vals, kk, dim=1).values[:, -1:]
+            mask = mask & (vals >= cutoff)
+    out = core.clone()
+    if not mask.any():
+        return out, b""
+    out[mask] = torch.where(x_n[mask] >= 0,
+                            torch.full_like(x_n[mask], 2.0),
+                            torch.full_like(x_n[mask], -2.0))
+    blob = (x_n[mask] * 32).round().clamp(-127, 127).to(torch.int8)
+    return out, blob.cpu().numpy().tobytes()
+
+
 def _apply_sign_blob(flat: torch.Tensor, sign_blob: bytes) -> torch.Tensor:
     """Apply sign bits to outlier positions of a flat weight tensor."""
     import numpy as np
