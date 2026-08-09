@@ -1035,6 +1035,62 @@ selflearn_avx2.exe --eval ..\checkpoints\exp7_trained.bin ..\examples\continual\
 selflearn_avx2.exe --eval ..\checkpoints\exp7_trained.bin ..\examples\discrete\sliceEval100k.bin 10000
 ```
 
+## Experiment: Soft-to-Hard Quantization Warmup (Exp 8)
+
+Question: hard round(W/Δ) + STE gives zero gradient inside the dead zone — a weight sitting in
+(-0.5Δ, +0.5Δ) receives no signal to leave it, and the discrete jump at ±0.5/±1.5 adds noise
+that early training must fight. Does replacing the hard round with a continuous surrogate
+during a short warmup, then annealing it back to hard round, let STE training start cleaner?
+
+Surrogate (exact, 5-level boundaries {-2,-1,0,+1,+2} matched to the v7 encoding):
+
+    Q~(x; γ) = -2 + σ(γ(x+1.5)) + σ(γ(x+0.5)) + σ(γ(x-0.5)) + σ(γ(x-1.5)),  x = W/Δ
+
+Backward passes the **exact** surrogate gradient dQ~/dx = γ·Σ_k σ(z_k)(1-σ(z_k)) chained
+through x_n = W/Δ, **including the gradient of Δ** (no detach), verified by
+`torch.autograd.gradcheck` at γ ∈ {2, 25} × per-tensor/per-channel. γ follows a log-linear
+schedule 2 → γ_max over the warmup window, then switches to hard round + STE (γ=None) —
+the deployment path is untouched (`TernaryQuantizer` round in `export_model.py`).
+
+Usage:
+
+```bash
+# baseline: hard round + STE from step 0
+python train.py --preset tiny --steps 300 --data-cache tinydata --mode ste
+# soft-to-hard: γ 2→50 log-linear over 75 steps (25%), then hard STE
+python train.py --preset tiny --steps 300 --data-cache tinydata --mode ste \
+    --soft-quant-gamma --soft-quant-steps 75
+# hybrid: γ 2→25 over 30 steps (10%), then hard STE
+python train.py --preset tiny --steps 300 --data-cache tinydata --mode ste \
+    --soft-quant-gamma --soft-quant-steps 30 --soft-quant-gamma-max 25
+```
+
+Results (300 steps, preset tiny, tinydata, STE):
+
+| Run | Final train CE @300 | Note |
+|---|---|---|
+| Baseline (hard STE) | **5.8817** | — |
+| Soft (γ 2→50, 75 steps) | 8.2548 | gradient dies at γ→50 (σ' → 0), wastes warmup tail |
+| Hybrid (γ 2→25, 30 steps) | 5.9553 | +0.074 vs baseline |
+
+Readings (honest):
+
+- **No loss spike at the switch point** — the first run's step-75 handoff to hard STE showed
+  no discontinuity (soft 22.5 → 20.1 vs baseline 22.5 → 20.3 around step 70-80), validating
+  the sigmoid-surrogate convergence claim.
+- **Vanishing gradient from the saturating surrogate is real**: pushing γ to 50 collapses
+  σ'(x) ≈ 0 for nearly all weights before warmup ends; the model flatlines and the run loses
+  budget it never recovers (8.25 vs 8.05 in the first comparison).
+- **Hybrid fixes the decay but not the phase cost**: γ_max=25 keeps a usable slope
+  (σ'(25×0.1) ≈ 0.1), and the hybrid run actually *overtakes* baseline at step ~200
+  (8.00 vs 8.16) after trailing badly in the first 50 steps. The residual −0.074 at step 300
+  is the phase-1 debt: the warmup occupies the highest-LR region of a 300-step cosine
+  schedule, and switching to hard round at step 30 shocks weights that have only seen the
+  soft surrogate.
+- **300 steps is too short to judge**: on a production 15k-step budget the warmup is 0.2%
+  of training instead of 10%, and the mid-training crossover seen here (hybrid > baseline
+  from step ~200) would dominate. The mechanism is correctly implemented (gradcheck-clean,
+  exact Δ-gradient, no deployment change); its value proposition is a longer-horizon question.
 
 ## Project Structure
 

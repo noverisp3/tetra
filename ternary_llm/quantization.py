@@ -168,6 +168,16 @@ class FusedTernaryLinear(torch.autograd.Function):
     Forward:  clamp(W/Δ, -1, 1) -> round -> matmul(x, W_ternary)
     Backward: grad_x = grad @ W_ternary.T, grad_W = x^T @ grad (STE)
 
+    Soft-to-hard surrogate (``gamma`` not None, Exp 8): instead of hard round,
+    the quantizer is a sum of shifted sigmoids with a dead zone around 0 and
+    matched 5-level boundaries {-2,-1,0,+1,+2}:
+
+        Q~(x; γ) = -2 + σ(γ(x+1.5)) + σ(γ(x+0.5)) + σ(γ(x-0.5)) + σ(γ(x-1.5))
+
+    As γ: 2 -> 50+ the surrogate converges to round(W/Δ) without a
+    discontinuity, and the backward passes the *exact* surrogate gradient
+    (no STE clip). Pass gamma=None for the standard hard-round + STE path.
+
     Saves ternary weights to avoid recomputing abs()
     in backward - avoids OOM on memory-constrained devices.
     """
@@ -176,16 +186,35 @@ class FusedTernaryLinear(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, latent_weights: torch.Tensor,
                 scale: float = 0.7, per_channel: bool = False,
                 alphas: Optional[torch.Tensor] = None,
-                group_size: int = 0) -> torch.Tensor:
+                group_size: int = 0,
+                gamma: Optional[float] = None) -> torch.Tensor:
         if per_channel:
             delta = latent_weights.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * scale
         else:
             delta = latent_weights.abs().mean().clamp(min=1e-6) * scale
         # |W| > 1.5Δ promotes to an outlier (±2, code 11 in the 2-bit format);
         # the learned per-group alpha scales it to ±2α at inference time.
-        w_ternary = (latent_weights / delta).round().clamp(-2, 2).to(x.dtype)
-        ctx.save_for_backward(x, w_ternary.detach(), alphas.detach() if alphas is not None else alphas)
+        x_n = latent_weights / delta
+        if gamma is not None and gamma > 0:
+            # Sum of shifted sigmoids: dead zone around 0, 5-level boundaries
+            # at ±0.5 and ±1.5, converges to round(x) as γ -> ∞.
+            gx = gamma * x_n
+            w_ternary = (-2.0
+                         + torch.sigmoid(gx + 1.5 * gamma)
+                         + torch.sigmoid(gx + 0.5 * gamma)
+                         + torch.sigmoid(gx - 0.5 * gamma)
+                         + torch.sigmoid(gx - 1.5 * gamma))
+        else:
+            w_ternary = x_n.round().clamp(-2, 2)
+        w_ternary = w_ternary.to(x.dtype)
+        ctx.save_for_backward(x, w_ternary.detach(),
+                              alphas.detach() if alphas is not None else alphas,
+                              x_n.detach() if gamma is not None and gamma > 0 else x_n)
         ctx.group_size = group_size
+        ctx.gamma = gamma
+        ctx.delta = delta.detach()
+        ctx.per_channel = per_channel
+        ctx.scale = scale
         if alphas is not None and group_size > 0:
             in_features = x.size(-1)
             num_groups = (in_features + group_size - 1) // group_size
@@ -201,7 +230,7 @@ class FusedTernaryLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x, w_ternary, alphas = ctx.saved_tensors
+        x, w_ternary, alphas, x_n = ctx.saved_tensors
         w_ternary = w_ternary.to(grad_output.dtype)
         x = x.to(grad_output.dtype)
         in_features = x.size(-1)
@@ -211,6 +240,7 @@ class FusedTernaryLinear(torch.autograd.Function):
 
         if alphas is not None and ctx.group_size > 0:
             num_groups = ctx.num_groups
+            alphas = ctx.alphas
             alphas_expanded = torch.repeat_interleave(alphas, ctx.group_size, dim=1)
             if in_features % ctx.group_size != 0:
                 alphas_expanded = alphas_expanded[:, :in_features]
@@ -233,7 +263,35 @@ class FusedTernaryLinear(torch.autograd.Function):
             grad_x = F.linear(grad_output, w_ternary.T)
             grad_w = torch.mm(grad_output_flat.T, x_flat)
             grad_alpha = None
-        return grad_x, grad_w.float(), None, None, grad_alpha, None
+
+        if ctx.gamma is not None and ctx.gamma > 0:
+            # Exact surrogate gradient: dQ~/dx = γ·Σ_k σ(γ(x-b_k))·(1-σ(γ(x-b_k))).
+            # Chain to latent weights through x_n = W/Δ, where Δ = scale·mean|W|
+            # (per-tensor) or scale·rowmean|W| (per-channel). Δ is a function of
+            # W, so we propagate through it exactly instead of detaching:
+            #   dL/dΔ = Σ_j dL/dx_n_j · dx_n_j/dΔ,  dx_n_j/dΔ = -x_n_j/Δ
+            #   dΔ/dW = scale·sign(W)/N (per-tensor), scale·sign(W)/K (per-channel)
+            # sign(x_n) = sign(W) because Δ > 0, so no extra save of W needed.
+            g = ctx.gamma
+            gx = g * x_n
+            s1 = torch.sigmoid(gx + 1.5 * g)
+            s2 = torch.sigmoid(gx + 0.5 * g)
+            s3 = torch.sigmoid(gx - 0.5 * g)
+            s4 = torch.sigmoid(gx - 1.5 * g)
+            # Q~'(x_n) = γ·Σ_k σ(z_k)·(1-σ(z_k)); 1-σ(z) = σ(-z);
+            # slope already contains the γ factor, so dL/dx_n = grad_w·slope.
+            slope = g * (s1 * torch.sigmoid(-(gx + 1.5 * g))
+                         + s2 * torch.sigmoid(-(gx + 0.5 * g))
+                         + s3 * torch.sigmoid(-(gx - 0.5 * g))
+                         + s4 * torch.sigmoid(-(gx - 1.5 * g)))
+            d_xn = grad_w * slope   # dL/dx_n
+            if ctx.per_channel:
+                grad_delta = -((d_xn * x_n).sum(dim=1, keepdim=True) / ctx.delta)
+                grad_w = d_xn / ctx.delta + grad_delta * (ctx.scale / x_n.size(-1)) * torch.sign(x_n)
+            else:
+                grad_delta = -((d_xn * x_n).sum() / ctx.delta)
+                grad_w = d_xn / ctx.delta + grad_delta * (ctx.scale / x_n.numel()) * torch.sign(x_n)
+        return grad_x, grad_w.float(), None, None, grad_alpha, None, None
 
 
 def ternary_quantize(weights: torch.Tensor) -> torch.Tensor:

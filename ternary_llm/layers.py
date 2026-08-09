@@ -70,6 +70,9 @@ class TernaryLinear(nn.Module):
         self.per_channel = per_channel
         self.group_size = group_size
         self.num_groups = (in_features + group_size - 1) // group_size if group_size > 0 else 0
+        # Exp 8 soft-to-hard surrogate: None = hard round + STE (default).
+        # A float value = smooth sigmoid-surrogate quantizer with this gamma.
+        self.soft_gamma: float | None = None
 
         # Latent weights (FP32) - shadow weights for gradient updates
         self.latent_weights = nn.Parameter(
@@ -113,11 +116,18 @@ class TernaryLinear(nn.Module):
         """
         output = FusedTernaryLinear.apply(
             x, self.latent_weights, self.ternary_scale, self.per_channel,
-            self.alphas, self.group_size,
+            self.alphas, self.group_size, self.soft_gamma,
         )
         if self.bias is not None:
             output = output + self.bias
         return output
+
+    def set_soft_gamma(self, gamma: float | None) -> None:
+        """Exp 8: set the soft-to-hard surrogate temperature.
+
+        None -> hard round(W/Δ) with STE (standard path).
+        """
+        self.soft_gamma = gamma
 
     def get_ternary_weights(self) -> torch.Tensor:
         """Get quantized ternary weights for deployment."""

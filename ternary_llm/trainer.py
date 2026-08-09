@@ -165,6 +165,12 @@ class TrainingConfig:
     ternary_scale: float = 0.7  # Δ = scale x mean(|W|), lower -> more {-1,+1}, higher -> more 0
     per_channel: bool = False    # Per-channel vs per-tensor threshold
 
+    # Exp 8: soft-to-hard quantization schedule (STE mode)
+    soft_quant: bool = False             # enable sigmoid-surrogate warmup
+    soft_quant_gamma_init: float = 2.0   # starting surrogate temperature
+    soft_quant_gamma_max: float = 50.0   # final temperature (then hard STE)
+    soft_quant_steps: int = 0            # warmup length (0 = 25% of max_steps)
+
     # STE robustness (rank-collapse fixes, finding #11)
     init_mode: str = "kaiming"   # "kaiming" or "balanced" (33/33/33 ternary init)
     ortho_reg: float = 0.0       # orthogonalization penalty weight on latent rows
@@ -582,6 +588,23 @@ class TernaryTrainer:
                 self.scheduler.step()
                 step += 1
                 pbar.update(1)
+
+                # Exp 8: soft-to-hard gamma schedule (log-linear warmup then
+                # switch to hard STE at the end of the warmup window)
+                if self.config.soft_quant and self.config.mode == "ste":
+                    warm = self.config.soft_quant_steps
+                    if warm <= 0:
+                        warm = max(1, int(self.config.max_steps * 0.25))
+                    if step < warm:
+                        p = max(0.0, step / warm)
+                        g_init = self.config.soft_quant_gamma_init
+                        g_max = self.config.soft_quant_gamma_max
+                        gamma = g_init * (g_max / g_init) ** p  # log-linear
+                    else:
+                        gamma = None  # hard round + STE (matches baseline)
+                    for m in self.model.modules():
+                        if hasattr(m, "set_soft_gamma"):
+                            m.set_soft_gamma(gamma)
 
                 # Logging
                 if step % self.config.log_interval == 0:

@@ -130,6 +130,15 @@ def main():
                         help="[STE] Per-channel quantization threshold (instead of per-tensor)")
     parser.add_argument("--group-size", type=int, default=0,
                         help="Block size for per-group scaling alphas (STE + Stochastic) (default: 0 = off)")
+    parser.add_argument("--soft-quant-gamma", action="store_true",
+                        help="[STE] Exp 8: soft-to-hard sigmoid-surrogate quantization warmup "
+                             "(gamma 2->50 over warmup, then hard round+STE)")
+    parser.add_argument("--soft-quant-steps", type=int, default=0, metavar="N",
+                        help="[STE] Exp 8: warmup length for the soft surrogate (default: 25%% of --steps)")
+    parser.add_argument("--soft-quant-gamma-init", type=float, default=2.0, metavar="G",
+                        help="[STE] Exp 8: starting surrogate temperature (default: 2.0)")
+    parser.add_argument("--soft-quant-gamma-max", type=float, default=50.0, metavar="G",
+                        help="[STE] Exp 8: final temperature at end of warmup, then hard STE (default: 50.0)")
     parser.add_argument("--init", type=str, default="kaiming", choices=["kaiming", "balanced"],
                         help="[STE] Latent init: kaiming (default) or balanced 33/33/33 ternary (anti rank-collapse)")
     parser.add_argument("--ortho-reg", type=float, default=0.0, metavar="LAMBDA",
@@ -251,6 +260,14 @@ def main():
     config.ternary_scale = args.ternary_scale
     config.per_channel = args.per_channel
     config.group_size = args.group_size
+    if args.soft_quant_gamma:
+        config.soft_quant = True
+        if args.soft_quant_steps > 0:
+            config.soft_quant_steps = args.soft_quant_steps
+        config.soft_quant_gamma_init = args.soft_quant_gamma_init
+        config.soft_quant_gamma_max = args.soft_quant_gamma_max
+        print(f"Exp 8 soft-to-hard quant: gamma {config.soft_quant_gamma_init} -> "
+              f"{config.soft_quant_gamma_max} over {config.soft_quant_steps or '25% of steps'} steps")
     config.init_mode = args.init
     config.ortho_reg = args.ortho_reg
     config.rank_monitor_interval = args.rank_monitor_interval
