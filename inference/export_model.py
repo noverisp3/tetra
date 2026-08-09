@@ -396,15 +396,22 @@ def export_ste(f, model, quantize_int8=False, v7=False):
         if getattr(mod, "per_channel", False):
             delta = param.detach().abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * mod.ternary_scale
             w_ternary = (param.detach() / delta).round().clamp(-2, 2)
+            alphas = mod.alphas.detach().float().reshape(-1)  # learned per-row alpha (forward: out * alphas)
         else:
+            delta = param.detach().abs().mean().clamp(min=1e-6) * mod.ternary_scale
             w_ternary = TernaryQuantizer.apply(param.data)
+            alphas = None  # per-tensor: PyTorch forward does NOT scale (alphas=None)
         blob = pack_sign_blob(w_ternary) if v7 else None
         w_ternary = w_ternary.to(torch.int8)
-        write_ternary_entry(f, w_ternary, name, mod, outlier_blob=blob)
+        # v6/v7 layouts always carry an FP32 accumulator (self-learning state)
+        # so the C++ reader never has to guess; STE exports write zeros.
+        zero_acc = torch.zeros(int(w_ternary.numel()), dtype=torch.float32) if v7 else None
+        write_ternary_entry(f, w_ternary, name, mod, alphas=alphas,
+                            accumulator=zero_acc, outlier_blob=blob)
 
     for name, param in model.named_parameters():
         is_ternary = any(t in name for t in TERNARY_PARAM_NAMES)
-        if is_ternary or name == "lm_head.weight":
+        if is_ternary:
             continue
         write_fp32_entry(f, name, param, quantize_int8=quantize_int8)
 
@@ -1000,6 +1007,8 @@ Examples:
             metadata["training_loss"] = args.metadata_loss
         if args.metadata_dataset is not None:
             metadata["dataset"] = args.metadata_dataset
+        if not is_discrete:
+            metadata["sl_logit_scale"] = 1.0  # STE trains at natural logit scale
 
     info = export_model(
         model, args.output, mode=mode,

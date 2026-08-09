@@ -90,6 +90,8 @@ class TorchModel:
         self.V, self.H, self.L, self.NH, self.FFN, self.seq = V, H, L, NH, FFN, seq
         self.HD = H // NH
         self.emb = torch.tensor(tensors["token_embedding.weight"], dtype=torch.float32)
+        self.head = (torch.tensor(tensors["lm_head.weight"], dtype=torch.float32)
+                     if "lm_head.weight" in tensors else self.emb)
         self.pos = torch.tensor(tensors["pos_embedding.weight"], dtype=torch.float32)
         self.ternary = {k: torch.tensor(v, dtype=torch.float32)
                         for k, v in tensors.items() if k.endswith("latent_weights")}
@@ -124,7 +126,7 @@ class TorchModel:
             hidden = torch.nn.functional.silu(gate) * up
             x = x + self.ternary[p + "ffn.down_proj.latent_weights"] @ hidden
         x = self.rmsnorm(x, self.norms["norm.weight"])
-        logits = self.emb @ x
+        logits = self.head @ x
         cache["pos"] += 1
         return logits
 

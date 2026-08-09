@@ -654,10 +654,10 @@ class TernaryTrainer:
                         n_committed, n_positions = commit_erc(self.model)
                         self.erc_total_commits += n_committed
                         self.erc_committed_frac = n_committed / max(1, n_positions)
-                        if self.config.debug:
+                        if n_committed > 0:
                             tqdm.write(
                                 f"  ERC commit: {n_committed:,}/{n_positions:,} "
-                                f"positions ({self.erc_committed_frac*100:.3f}%) "
+                                f"positions ({n_committed/max(1,n_positions)*100:.3f}%) "
                                 f"carried into core")
 
                 # Stochastic Bit-Flip: apply accumulated flips every N steps
@@ -896,6 +896,15 @@ class TernaryTrainer:
                     state_dict[k] = v.half()
                 else:
                     state_dict[k] = v
+
+        # ERC: full-carry the residual into the latent core BEFORE saving, then
+        # drop the residual keys. The saved checkpoint is therefore a plain
+        # ternary model — ERC-free. R is committed, not lost.
+        if self.config.erc and not is_stochastic:
+            from ternary_llm.erc import commit_erc_state_dict
+            n = commit_erc_state_dict(state_dict, self.config.__dict__)
+            self.erc_total_commits += n
+            print(f"ERC full-carry on save: {n:,} residual positions baked into core")
 
         # Quantize optimizer states to FP16
         opt_state = self.optimizer.state_dict()

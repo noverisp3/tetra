@@ -268,7 +268,7 @@ static void ternary_matmul_precomputed(
             }
             out[r] = sum;
         }
-    } else if (!w.alphas.empty()) {
+    } else if (w.alphas.size() > 1) {
         for (int r = 0; r < w.rows; r++) {
             out[r] = dot_product_simd(x, data + r * w.cols, w.cols) * w.alphas[r];
         }
@@ -299,7 +299,7 @@ static void ternary_matmul_precomputed_decode(
             }
             out[r] = sum;
         }
-    } else if (!w.alphas.empty()) {
+    } else if (w.alphas.size() > 1) {
         for (int r = 0; r < rows; r++) {
             if (r + 2 < rows) TETRA_PREFETCH(data + (r + 2) * cols);
             out[r] = dot_product_simd(x, data + r * cols, cols) * w.alphas[r];
@@ -1134,7 +1134,10 @@ static std::vector<float> forward(
         TP_T1(9);  // lm_head timer spans final rmsnorm + lm_head matmul
 #endif
         {
-            const auto& emb = model.fp32_weights.at("token_embedding.weight");
+            const FP32Weight* head = &model.fp32_weights.at("token_embedding.weight");
+            auto hf = model.fp32_weights.find("lm_head.weight");
+            if (hf != model.fp32_weights.end()) head = &hf->second;
+            const auto& emb = *head;
             if (!emb.int8_data.empty()) {
                 matmul_int8_decode(x.data(), emb.int8_data.data(), logits.data(), V, H, emb.int8_scale);
             } else {

@@ -192,6 +192,14 @@ def verify_export(checkpoint_path: str, binary_path: str, mode: str = None,
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = ckpt["config"]
     sd = ckpt["model_state_dict"]
+
+    # ERC: the export bakes the residual into the latent core before writing,
+    # so verification must apply the same carry or every baked position shows
+    # up as a spurious diff.
+    if any(k.endswith(".residual") for k in sd):
+        from ternary_llm.erc import commit_erc_state_dict
+        commit_erc_state_dict(sd, config)
+
     if mode is None:
         mode = config.get("mode", "ste")
 
@@ -342,7 +350,10 @@ def verify_export(checkpoint_path: str, binary_path: str, mode: str = None,
                 print(f"  MISSING: {name}")
                 continue
             if is_ternary:
-                py_w = TernaryQuantizer.apply(param.data).cpu().numpy()
+                # Quantize in float32: the checkpoint stores fp16 latents, but
+                # the export quantizes the fp32 model param; fp16 arithmetic
+                # flips ~0.1% of knife-edge round() boundaries.
+                py_w = TernaryQuantizer.apply(param.data.float()).cpu().numpy()
             else:
                 py_w = param.data.float().cpu().numpy()
             bin_w = bin_weights[name]

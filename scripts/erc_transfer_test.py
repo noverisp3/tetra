@@ -38,6 +38,8 @@ ARMS = {
     "erc-nocommit": ("erc (R, no commit)", ["--erc", "--erc-lr", "0.01", "--erc-decay", "0.99", "--erc-commit-interval", "0"]),
     "erc-freeze": ("erc (R, core frozen)", ["--erc", "--erc-lr", "0.01", "--erc-decay", "0.99", "--erc-commit-interval", "10", "--erc-freeze-core"]),
     "erc-common": ("erc (R lr 0.01, commit 2)", ["--erc", "--erc-lr", "0.01", "--erc-decay", "0.99", "--erc-commit-interval", "2"]),
+    "erc-hot": ("erc (R lr 0.1, no decay)", ["--erc", "--erc-lr", "0.1", "--erc-decay", "1.0", "--erc-commit-interval", "10"]),
+    "erc-hotc": ("erc (R lr 0.05, no decay, commit 2)", ["--erc", "--erc-lr", "0.05", "--erc-decay", "1.0", "--erc-commit-interval", "2"]),
 }
 
 
