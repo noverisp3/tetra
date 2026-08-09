@@ -851,6 +851,9 @@ Examples:
                         help="Write zeroed accumulators (safe default for toggled runs; the Python acc state is transient — finding #10)")
     parser.add_argument("--v7", action="store_true",
                         help="Write v7 format: code-11 outlier (±2) side-channel blobs (header version 7)")
+    parser.add_argument("--commit-erc", action="store_true",
+                        help="ERC checkpoints: bake the residual (R, level units) into the "
+                             "latent core, drop R, then export a plain 2-bit ternary binary")
     args = parser.parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -858,6 +861,14 @@ Examples:
     config = ckpt["config"]
     sd = ckpt["model_state_dict"]
     mode = config.get("mode", "ste")
+
+    # ERC: full-carry the residual into the latent core before export so the
+    # binary is a plain 2-bit ternary model (no residual side path).
+    if args.commit_erc or any(k.endswith(".residual") for k in sd):
+        from ternary_llm.erc import commit_erc_state_dict
+        n_committed = commit_erc_state_dict(sd, config)
+        print(f"ERC commit: {n_committed:,} residual positions baked into the latent core")
+
 
     # Detect discrete (gradient-free) checkpoints: DiscreteConfig has a "rule".
     is_discrete = "rule" in config and "acc_decay" in config

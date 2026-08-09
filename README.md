@@ -1160,6 +1160,67 @@ slightly-better (mean −0.039) and the side-channel shrink is deterministic, so
 default is strictly safer than the old one. To reproduce the old behavior pass
 `--ternary-scale 0.7`.
 
+## Experiment: ERC — Echo Residual Committer (STE continual learning)
+
+Backprop fine-tuning on a new domain destroys the ternary core (Exp 2:
+slice CE +17 nats). ERC attacks the forgetting-adaptation tradeoff with a
+**two-timescale decomposition of every ternary weight matrix**:
+
+    W_effective = Ternary(W_core) + R
+
+- **Fast residual R** (FP32/FP16, init 0, *level units*: 1.0 = one ternary
+  level): trained at a high LR (`--erc-lr`, default 0.01) with an optional
+  leaky EMA decay (`--erc-decay` < 1). R absorbs the new domain's gradient
+  surprise without overwriting the long-term ternary memory.
+- **Slow latent core**: keeps the normal (low) STE LR, or is frozen
+  entirely (`--erc-freeze-core`, residual-only learning).
+- **Consolidation**: every `--erc-commit-interval` steps, positions with
+  |R| >= 0.5 level commit:
+
+      W_core += sign(R) * Delta      (crosses exactly one ternary level)
+      R      -= sign(R)              (keeps only the sub-level remainder)
+
+  This is output-neutral: the quantizer is `round(W/Delta)` (integer
+  levels, no post-round Delta multiply), so a Delta-sized latent bump
+  shifts the ternary output by exactly ±1, which the residual decrease
+  cancels 1:1. At export, `export_model.py --commit-erc` performs the full
+  carry, drops R, and emits a plain 2-bit ternary binary for the C++ engine.
+
+Implementation: `ternary_llm/erc.py` (`ERCLinear`, `enable_erc`,
+`commit_erc`, `decay_erc`, `commit_erc_state_dict`), wired into
+`TernaryTrainer` (param groups, per-step decay, periodic commit hook) and
+`train.py` (`--erc*` flags). No C++ change needed.
+
+Smoke transfer test (GPU, Intel Iris Xe / DML): Phase-1 = 300-step
+TinyStories checkpoint (`checkpoints_exp9_s10_seed1/checkpoint_000300.pt`),
+Phase-2 = 60 FineWeb steps at LR 1e-4, eval every 30 steps, 10k positions
+on the old slice (`sliceEval100k.bin`) and new domain
+(`finewebEval100k.bin`, held-out last shard):
+
+| Arm | Δ sliceCE(old) — forgetting | Δ domainCE(new) — adaptation |
+|---|---|---|
+| baseline (hard-STE, LR 1e-4) | +0.1520 | −0.2172 |
+| **ERC** (R at LR 0.01, decay 0.99) | **+0.0402** (3.8× less) | −0.1000 (slower) |
+
+Readings: ERC cuts catastrophic forgetting ~3.8× vs plain backprop
+fine-tune at the same core LR, at the cost of ~2× slower new-domain
+adaptation (the residual LR / commit cadence control this tradeoff; a
+higher `--erc-lr` adapts faster at the price of more forgetting). The
+residual stays bounded below 0.5 level between commits (max 0.054 after
+60 steps), so `--commit-erc` export loses only sub-level noise.
+
+Reproduce:
+
+```bash
+python scripts/erc_transfer_test.py \
+    --phase1-checkpoint checkpoints_exp9_s10_seed1/checkpoint_000300.pt \
+    --phase2-steps 60 --eval-every 30 --eval-positions 10000
+```
+
+Unit tests: `tests/test_erc.py` (9 tests — commit math, forward parity,
+gradient flow to both paths, level-unit commit, output neutrality, full
+carry == state-dict carry, fp16 residual).
+
 ## Project Structure
 
 ```
@@ -1172,6 +1233,7 @@ scripts/
   prepare_data.py           # Stream data from HF → tokenized chunks
   train_tokenizer.py        # Train BPE tokenizer on TinyStories
   pad_model.py              # Lossless FFN zero-padding expansion (v6/v7 binary)
+  erc_transfer_test.py      # ERC vs baseline continual-learning transfer test
 
 ternary_llm/
   quantization.py           # STE + Stochastic Bit-Flip autograd functions, pack/unpack
@@ -1186,6 +1248,7 @@ ternary_llm/
   data.py                   # ChunkedDataset, MultiSourceChunkedDataset
   trainer.py                # TernaryTrainer + DMLAdamW
   int8.py                   # INT8 fake-quantization
+  erc.py                    # Echo Residual Committer: ERCLinear, enable_erc, commit/decay, full-carry export
   csrc/
     ternary_ops_avx2.cpp    # C++ SIMD pack/unpack (AVX2)
     ternary_ops_avx512.cpp  # C++ SIMD pack/unpack (AVX-512)
@@ -1195,7 +1258,7 @@ inference/
   tetra.h                   # C++ inference engine (RMSNorm, SiLU, softmax, sampling, forward, v6/v7 loader)
   tetra.cpp                 # CLI entry point, generation loop
   selflearn.cpp             # C++ self-learning runtime (rule c, accumulator bit-flips, --eval profiling, --fast-lmhead, --compare-lmhead)
-  export_model.py           # Checkpoint → binary format (v4/v6/v7, INT8 embedding, --self-learning, --v7)
+  export_model.py           # Checkpoint → binary format (v4/v6/v7, INT8 embedding, --self-learning, --v7, --commit-erc)
   run_inference.py          # Python wrapper around C++ inference
   benchmark_ppl.py          # Perplexity measurement
   build.bat                 # MSVC build script (auto-detects VS via vswhere; `profile` target = AVX2 + TETRA_PROFILE timing)
@@ -1207,6 +1270,7 @@ tests/
   test_prototype.py
   test_convergence.py
   test_discrete.py          # 9 tests: rules, accumulators, bit-flips, checkpoint round-trip
+  test_erc.py               # ERC: commit math, forward parity, gradient flow, level-unit commit, output neutrality
   ce_v6_vs_v7.py            # Block-CE under v6 vs v7 interpretation of a binary (torch ref of C++ forward)
   eval_ternary_ablation.py  # Cut-the-tail: learned vs random ternary with frozen embedding
   bench_avx.py              # Benchmark AVX2 vs AVX-512 for ternary ops

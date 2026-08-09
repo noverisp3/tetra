@@ -184,6 +184,22 @@ class TrainingConfig:
     block_size: int = 128
     val_split: float = 0.05
 
+    # ERC (Echo Residual Committer): two-timescale memory for the ternary core.
+    # W_eff = Ternary(W_core) + R: the fast residual R absorbs new-domain
+    # surprise at a high LR; periodic threshold commits (|R| >= Delta/2) carry
+    # its energy into the slow latent core without overwriting it directly.
+    erc: bool = False
+    erc_lr: float = 0.01          # fast residual LR (core keeps --lr)
+    erc_decay: float = 1.0        # leaky EMA on R per step (<1 fades old echoes)
+    erc_commit_interval: int = 10 # commit R -> core every N optimizer steps
+    erc_residual_dtype: str = "fp32"  # "fp32" or "fp16" (short-term memory)
+    erc_freeze_core: bool = False  # freeze the latent core entirely (R-only learning)
+
+    # Held-out slice evals (transfer tests): slice = old domain, domain = new
+    eval_slice_path: str | None = None
+    domain_eval_path: str | None = None
+    eval_positions: int = 20000
+
 
 class CosineScheduler:
     """Cosine learning rate scheduler with linear warmup."""
@@ -267,25 +283,43 @@ class TernaryTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
 
+        # ERC: convert every TernaryLinear into an ERCLinear (state-dict keys
+        # unchanged) so the residual path exists before param groups are split.
+        if config.erc:
+            from .erc import enable_erc
+            n_erc = enable_erc(self.model, residual_dtype=config.erc_residual_dtype)
+            print(f"ERC: enabled on {n_erc:,} layers (residual dtype {config.erc_residual_dtype})")
+            if n_erc == 0:
+                print("WARNING: --erc set but no TernaryLinear found in the model")
+
+        # ERC: split params into (slow core | fast residual) groups.
+        # The residual gets its own LR and zero weight decay so it can move
+        # fast without being dragged to 0 by decoupled decay.
+        param_groups = self._build_param_groups()
+        if config.erc and config.erc_freeze_core:
+            for p in param_groups[0]["params"]:
+                p.requires_grad_(False)
+            print(f"ERC: latent core FROZEN (residual-only learning, R at lr {config.erc_lr})")
+
         # Hybrid optimizer: model on GPU, optimizer states on CPU
         self.hybrid = False
         if config.hybrid_optimizer and self.device != torch.device("cpu"):
             self.hybrid = True
             # Create CPU parameter clones for optimizer (deduplicate tied weights)
-            seen = set()
             self.cpu_params = []
-            for p in model.parameters():
-                if id(p) in seen:
-                    continue
-                seen.add(id(p))
-                cp = nn.Parameter(p.data.cpu().clone(), requires_grad=p.requires_grad)
-                self.cpu_params.append(cp)
+            self._cpu_clone_of: dict[int, nn.Parameter] = {}
+            for group in param_groups:
+                cp_group = []
+                for p in group["params"]:
+                    cp = nn.Parameter(p.data.cpu().clone(), requires_grad=p.requires_grad)
+                    cp_group.append(cp)
+                    self._cpu_clone_of[id(p)] = cp
+                self.cpu_params.append(cp_group)
             self.optimizer = torch.optim.AdamW(
-                self.cpu_params,
+                [dict(g, params=cp_group) for g, cp_group in zip(param_groups, self.cpu_params)],
                 lr=config.learning_rate,
                 betas=(config.beta1, config.beta2),
                 eps=config.eps,
-                weight_decay=config.weight_decay,
                 foreach=False,
             )
             print(f"Hybrid mode: model on {self.device}, optimizer on CPU")
@@ -294,12 +328,17 @@ class TernaryTrainer:
             is_dml = self.device.type == "privateuseone"
             opt_cls = DMLAdamW if is_dml else torch.optim.AdamW
             self.optimizer = opt_cls(
-                model.parameters(),
+                [dict(g, params=list(g["params"])) for g in param_groups],
                 lr=config.learning_rate,
                 betas=(config.beta1, config.beta2),
                 eps=config.eps,
-                weight_decay=config.weight_decay,
             )
+
+        # ERC bookkeeping
+        self.erc_total_commits = 0
+        self.erc_committed_frac = 0.0
+        self.slice_ces = []
+        self.domain_ces = []
 
         # LR Scheduler
         self.scheduler = CosineScheduler(
@@ -404,6 +443,40 @@ class TernaryTrainer:
 
         return raw_loss
 
+    def _build_param_groups(self) -> list[dict]:
+        """Split model params into (core | ERC residual) optimizer groups.
+
+        Core group: all params except residual tensors (lr = base, wd).
+        Residual group: every ERCLinear.residual (lr = erc_lr, wd = 0).
+        """
+        from .erc import ERCLinear
+
+        residual_ids = set()
+        residual_params = []
+        for m in self.model.modules():
+            if isinstance(m, ERCLinear):
+                residual_ids.add(id(m.residual))
+                residual_params.append(m.residual)
+        core_params = []
+        seen = set()
+        for p in self.model.parameters():
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            if id(p) not in residual_ids:
+                core_params.append(p)
+        if self.config.erc:
+            if not residual_params:
+                print("WARNING: --erc set but no ERCLinear found in the model")
+            return [
+                {"params": core_params, "lr": self.config.learning_rate,
+                 "weight_decay": self.config.weight_decay},
+                {"params": residual_params, "lr": self.config.erc_lr,
+                 "weight_decay": 0.0},
+            ]
+        return [{"params": core_params, "lr": self.config.learning_rate,
+                 "weight_decay": self.config.weight_decay}]
+
     def _unique_params(self):
         """Yield unique model parameters (skip tied weight duplicates)."""
         seen = set()
@@ -479,7 +552,10 @@ class TernaryTrainer:
 
     def _hybrid_sync_gradients(self):
         """Copy gradients from GPU model to CPU params."""
-        for gp, cp in zip(self._unique_params(), self.cpu_params):
+        for gp in self._unique_params():
+            cp = self._cpu_clone_of.get(id(gp))
+            if cp is None:
+                continue
             if gp.grad is not None:
                 cp.grad = gp.grad.cpu()
             else:
@@ -487,7 +563,10 @@ class TernaryTrainer:
 
     def _hybrid_sync_weights(self):
         """Copy updated weights from CPU params back to GPU model."""
-        for gp, cp in zip(self._unique_params(), self.cpu_params):
+        for gp in self._unique_params():
+            cp = self._cpu_clone_of.get(id(gp))
+            if cp is None:
+                continue
             gp.data.copy_(cp.data.to(gp.device))
 
     def train_epoch(self, step_start: int) -> int:
@@ -563,6 +642,22 @@ class TernaryTrainer:
                     # Free cached allocator memory after optimizer step
                     self._clear_cache()
 
+                # ERC two-timescale loop: leaky decay of the fast residual +
+                # periodic threshold commits into the slow ternary core.
+                if self.config.erc and step > 0:
+                    from .erc import commit_erc, decay_erc
+                    if self.config.erc_decay < 1.0:
+                        decay_erc(self.model, self.config.erc_decay)
+                    if step % self.config.erc_commit_interval == 0:
+                        n_committed, n_positions = commit_erc(self.model)
+                        self.erc_total_commits += n_committed
+                        self.erc_committed_frac = n_committed / max(1, n_positions)
+                        if self.config.debug:
+                            tqdm.write(
+                                f"  ERC commit: {n_committed:,}/{n_positions:,} "
+                                f"positions ({self.erc_committed_frac*100:.3f}%) "
+                                f"carried into core")
+
                 # Stochastic Bit-Flip: apply accumulated flips every N steps
                 if (self.config.mode == "stochastic"
                     and step > 0
@@ -629,6 +724,10 @@ class TernaryTrainer:
                         self.best_val_loss = val_loss
                         self.best_step = step
                         self.save_checkpoint(step, best=True)
+                    # Held-out slice evals (transfer tests: old-domain slice +
+                    # new-domain slice, mirroring train_baseline_backprop.py)
+                    if self.config.eval_slice_path:
+                        self.eval_slices(step)
 
                 # Rank monitor (unique ternary rows per matrix)
                 if (self.config.rank_monitor_interval > 0
@@ -666,6 +765,60 @@ class TernaryTrainer:
         avg_val_loss = total_loss / max(num_batches, 1)
         print(f"Validation: step {self.scheduler.step_count}  loss={avg_val_loss:.4f}")
         return avg_val_loss
+
+    @torch.no_grad()
+    def eval_slices(self, step: int) -> None:
+        """Held-out slice CE on the old domain (slice) and new domain (domain).
+
+        Mirrors train_baseline_backprop.py: raw uint16 .bin token slices,
+        causal full-context within block_size chunks. Writes eval_history.json.
+        """
+        import numpy as np
+
+        def _ce(path: str) -> float:
+            data = np.fromfile(path, dtype=np.uint16)
+            limit = min(len(data) - 1, self.config.eval_positions)
+            total = 0.0
+            n = 0
+            bs = self.config.block_size
+            for start in range(0, limit, bs):
+                end = min(limit, start + bs)
+                x = torch.tensor(data[start:end].astype(np.int64)[None], dtype=torch.long,
+                                 device=self.device)
+                y = torch.tensor(data[start + 1:end + 1].astype(np.int64)[None], dtype=torch.long,
+                                 device=self.device)
+                logits, _, _ = self.model(x, None)
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)), y.reshape(-1), reduction="mean")
+                total += loss.item() * (end - start)
+                n += end - start
+            return total / max(n, 1)
+
+        self.model.eval()
+        line = f"[step {step}]"
+        if self.config.eval_slice_path:
+            ce_slice = _ce(self.config.eval_slice_path)
+            self.slice_ces.append([int(step), float(ce_slice)])
+            line += f" sliceCE(old)={ce_slice:.4f}"
+        if self.config.domain_eval_path:
+            ce_dom = _ce(self.config.domain_eval_path)
+            self.domain_ces.append([int(step), float(ce_dom)])
+            line += f" domainCE(new)={ce_dom:.4f}"
+        if line != f"[step {step}]":
+            print(line)
+            self._write_eval_history()
+
+    def _write_eval_history(self) -> None:
+        if not (self.slice_ces or self.domain_ces):
+            return
+        history = {
+            "slice_ces": self.slice_ces,
+            "domain_ces": self.domain_ces,
+        }
+        path = Path(self.config.save_dir) / "eval_history.json"
+        with open(path, "w") as f:
+            json.dump(history, f)
+
 
     def _quantize_optimizer_to_fp16(self, opt_state: dict) -> dict:
         """Convert optimizer state tensors from FP32 to FP16 for smaller checkpoints."""
@@ -768,6 +921,8 @@ class TernaryTrainer:
         with open(history_path, "w") as f:
             json.dump(history, f)
 
+        self._write_eval_history()
+
     def load_checkpoint(self, path: str):
         """Load model checkpoint.
 
@@ -818,14 +973,24 @@ class TernaryTrainer:
 
         if self.hybrid:
             # Reconstruct cpu_params from model weights (avoids saving duplicate)
-            for gp, cp in zip(self.model.parameters(), self.cpu_params):
-                cp.data.copy_(gp.data.cpu())
-            # Load optimizer state into cpu_params
-            self.optimizer.load_state_dict(opt_state)
+            for gp in self._unique_params():
+                cp = self._cpu_clone_of.get(id(gp))
+                if cp is not None:
+                    cp.data.copy_(gp.data.cpu())
+            # Load optimizer state into cpu_params (group mismatch = fresh restart)
+            try:
+                self.optimizer.load_state_dict(opt_state)
+            except (RuntimeError, ValueError) as e:
+                print(f"WARNING: optimizer state not loaded ({e}); restarting optimizer")
             # Sync to GPU model
             self._hybrid_sync_weights()
         else:
-            self.optimizer.load_state_dict(opt_state)
+            # Group mismatch (ERC on/off across resume, e.g. Phase-1 checkpoint
+            # trained without residuals into an ERC model): restart optimizer.
+            try:
+                self.optimizer.load_state_dict(opt_state)
+            except (RuntimeError, ValueError) as e:
+                print(f"WARNING: optimizer state not loaded ({e}); restarting optimizer")
             # Move optimizer state to device
             for state in self.optimizer.state.values():
                 for k, v in state.items():

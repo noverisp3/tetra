@@ -185,6 +185,30 @@ def main():
                         help="MLA KV latent dimension (default: 2 * head_dim)")
     parser.add_argument("--rope-per-head", type=int, default=None,
                         help="MLA RoPE dimension per head (default: max(4, head_dim//4))")
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                        help="Linear warmup steps (overrides preset)")
+    parser.add_argument("--min-lr", type=float, default=None,
+                        help="Floor for the cosine LR schedule (default: 1e-4)")
+    parser.add_argument("--eval-interval", type=int, default=None,
+                        help="Validation cadence (default: 500)")
+    parser.add_argument("--eval-positions", type=int, default=None,
+                        help="Tokens to score per held-out eval slice (default: 20000)")
+    parser.add_argument("--eval-slice", type=str, default=None,
+                        help="Held-out old-domain eval file (path to .bin) for slice CE")
+    parser.add_argument("--domain-eval", type=str, default=None,
+                        help="Held-out new-domain eval file (path to .bin) for domain CE")
+    parser.add_argument("--erc", action="store_true",
+                        help="Enable ERC: residual R (high LR) + periodic commits into the latent core")
+    parser.add_argument("--erc-lr", type=float, default=None,
+                        help="ERC fast residual learning rate (default: 0.01)")
+    parser.add_argument("--erc-decay", type=float, default=None,
+                        help="Leaky EMA factor applied to R each step (<1 fades old echoes)")
+    parser.add_argument("--erc-commit-interval", type=int, default=None,
+                        help="Commit R -> latent core every N optimizer steps (default: 10)")
+    parser.add_argument("--erc-fp16", action="store_true",
+                        help="Store/learn the residual in FP16 (short-term memory)")
+    parser.add_argument("--erc-freeze-core", action="store_true",
+                        help="Freeze latent cores entirely (residual-only learning)")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -291,6 +315,34 @@ def main():
         config.debug = True
     if args.dtype:
         config.dtype = args.dtype
+    if args.warmup_steps is not None:
+        config.warmup_steps = args.warmup_steps
+    if args.min_lr is not None:
+        config.min_lr = args.min_lr
+    if args.eval_interval is not None:
+        config.eval_interval = args.eval_interval
+    if args.eval_positions is not None:
+        config.eval_positions = args.eval_positions
+    if args.eval_slice:
+        config.eval_slice_path = args.eval_slice
+    if args.domain_eval:
+        config.domain_eval_path = args.domain_eval
+    if args.erc:
+        config.erc = True
+        if args.erc_lr is not None:
+            config.erc_lr = args.erc_lr
+        if args.erc_decay is not None:
+            config.erc_decay = args.erc_decay
+        if args.erc_commit_interval is not None:
+            config.erc_commit_interval = args.erc_commit_interval
+        if args.erc_fp16:
+            config.erc_residual_dtype = "fp16"
+        if args.erc_freeze_core:
+            config.erc_freeze_core = True
+        print(f"ERC: residual at lr {config.erc_lr} (decay {config.erc_decay}, "
+              f"commit every {config.erc_commit_interval} steps, "
+              f"dtype {config.erc_residual_dtype}"
+              f"{', core FROZEN' if config.erc_freeze_core else ''})")
 
     # Step 1: Prepare data
     if args.data_cache:
