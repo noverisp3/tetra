@@ -1092,6 +1092,27 @@ Readings (honest):
   from step ~200) would dominate. The mechanism is correctly implemented (gradcheck-clean,
   exact Δ-gradient, no deployment change); its value proposition is a longer-horizon question.
 
+**Post-mortem diagnostic (final answer):** the surrogate changes *nothing* about the final
+weight distribution. Loading both step-300 checkpoints and binning every latent weight by
+quantization region (`scripts/diagnose_soft_quant.py`):
+
+| Region | Baseline (hard STE) | Hybrid (γ 2→25, 30 steps) |
+|---|---|---|
+| Dead zone (\|x_n\| < 0.5) | 17.9% | 17.9% |
+| Plateau ±1 (0.5–1.5) | 35.7% | 35.9% |
+| Outlier ±2 (≥1.5) | 46.4% | 46.2% |
+
+Identical within noise, zero near-zero rows in both. The dead-zone-escape hypothesis is
+falsified: STE's pass-through gradient is *not* zero inside the dead zone, so weights leave
+it on their own — there was nothing for the surrogate to rescue. Every cost it paid (highest-LR
+phase, plateau starvation, boundary slope spikes, Δ-gradient noise) was pure loss with no
+measurable benefit. **Exp 8 verdict: null result — hard round + STE is not improved by a
+smooth-surrogate warmup, and the code is retained only as a documented dead end.**
+
+(Aside: 46% of weights land in the ±2 outlier band at `--ternary-scale 0.7`, i.e. the v7
+side-channel sign blob covers ~half the matrix — a scale >0.9 would push the distribution
+back toward ±1 and shrink the side channel; untested.)
+
 ## Project Structure
 
 ```
