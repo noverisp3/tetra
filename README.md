@@ -1122,33 +1122,38 @@ should shift the distribution back toward {-1, 0, +1} — while also changing wh
 can represent. Sweep (300 steps, preset tiny, tinydata, STE, `scripts/diagnose_soft_quant.py`
 for occupancy):
 
-| Scale | Final train CE @300 | Dead zone | Plateau ±1 | Outlier ±2 |
+| Scale | Final train CE @300 (2 seeds) | Dead zone | Plateau ±1 | Outlier ±2 |
 |---|---|---|---|---|
-| 0.7 (default) | 5.8817 | 17.9% | 35.7% | 46.4% |
-| 0.9 | 5.8184 | 23.0% | 45.7% | 31.3% |
-| **1.0** | **5.7844** | 25.5% | 50.4% | 24.1% |
-| 1.3 | 5.8671 | 33.1% | 61.8% | 5.2% |
+| 0.7 (default) | 5.8817 / 5.7939 (mean 5.838) | 17.9% | 35.7% | 46.4% |
+| 0.9 | 5.8184 / — | 23.0% | 45.7% | 31.3% |
+| **1.0** | 5.7844 / 5.8138 (mean 5.799) | 25.5% | 50.4% | 24.1% |
+| 1.3 | 5.8671 / — | 33.1% | 61.8% | 5.2% |
 
 Readings (honest):
 
-- **Scale 1.0 is a free win on both axes**: lower CE (−0.097 vs default) *and* outlier share
-  halved (46.4% → 24.1%), shrinking the deployment side-channel blob by ~half. The plateau
-  becomes the majority bin (50.4%) — the distribution moves from outlier-dominant bimodal to
-  a balanced {-1, 0, +1} profile.
+- **The occupancy shift is deterministic, not seed luck**: re-running with `--seed 1` gives
+  byte-identical occupancy (0.7: 17.9/35.7/46.4; 1.0: 25.5/50.4/24.1). The scale→distribution
+  mapping is structural: Δ = scale·mean|W| pins the region boundaries to a fixed equilibrium.
+- **The CE win is real but smaller than the first seed suggested**: two-seed means are 5.838
+  (0.7) vs 5.799 (1.0), a −0.039 delta that sits inside per-seed spread (±0.05). At the
+  300-step budget the CE comparison is not conclusive; the structural side-channel win
+  (46.4% → 24.1% outlier share, ~half the side blob) is the solid result.
 - **There is a real optimum, not a monotone direction**: 1.3 overturns the trend (5.8671) as
   the dead zone grows to 33% (scale 1.3: 33.1% dead / 61.8% plateau / 5.2% outlier) — too many
   weights quantize to 0 and the model loses representational capacity. Optimum ≈ 1.0–1.1.
-- The CE deltas (~0.1) are single-seed; the occupancy shift is structural and robust. Worth
-  re-benchmarking the 0.7 vs 1.0 comparison on the production 15k-step budget and with the
-  C++ runtime before promoting 1.0 to the default.
+- The decisive test is the production 15k-step budget (variance shrinks relative to the CE
+  scale) and/or the C++ runtime benchmark before promoting 1.0 to the default.
 
 Reproduce:
 
 ```bash
 python train.py --preset tiny --steps 300 --data-cache tinydata --mode ste --ternary-scale 1.0 \
-    --save-dir checkpoints_exp9_s10
-python scripts/diagnose_soft_quant.py checkpoints_exp9_s10/checkpoint_000300.pt "SCALE 1.0"
+    --seed 1 --save-dir checkpoints_exp9_s10_seed1
+python scripts/diagnose_soft_quant.py checkpoints_exp9_s10_seed1/checkpoint_000300.pt "SCALE 1.0"
 ```
+
+(Note: `train.py` gained a `--seed` flag during Exp 9 — earlier runs used unseeded RNG, so
+their CE values carry unknown but bounded seed variance; occupancy is seed-invariant.)
 
 ## Project Structure
 

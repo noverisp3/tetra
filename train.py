@@ -126,6 +126,8 @@ def main():
                         help="[Hybrid] SSM expansion factor (default: 2)")
     parser.add_argument("--ternary-scale", type=float, default=0.7,
                         help="[STE] Dynamic threshold scale: delta = scale x mean(|W|) (default: 0.7)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="RNG seed for model init / data order (default: unseeded)")
     parser.add_argument("--per-channel", action="store_true",
                         help="[STE] Per-channel quantization threshold (instead of per-tensor)")
     parser.add_argument("--group-size", type=int, default=0,
@@ -183,6 +185,13 @@ def main():
     parser.add_argument("--rope-per-head", type=int, default=None,
                         help="MLA RoPE dimension per head (default: max(4, head_dim//4))")
     args = parser.parse_args()
+
+    if args.seed is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        print(f"Seed: {args.seed}")
 
     # Input validation
     if args.steps is not None and args.steps < 1:
