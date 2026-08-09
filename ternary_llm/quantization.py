@@ -134,7 +134,8 @@ _has_cpp = _load_cpp_extension()
 class TernaryQuantizer(torch.autograd.Function):
     """Ternary quantization {-1, 0, +1} with Straight-Through Estimator.
 
-    Dynamic threshold: Δ = scale x mean(|W|), default scale=0.7.
+    Dynamic threshold: Δ = scale x mean(|W|), default scale=1.0 (Exp 9 tuning:
+    scale 1.0 lowers CE and halves ±2 outlier share vs the old 0.7 default).
     Lower scale increases entropy (fewer zeros in ternary matrix),
     preventing model collapse (all weights -> 0).
 
@@ -146,7 +147,7 @@ class TernaryQuantizer(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, input: torch.Tensor, scale: float = 0.7) -> torch.Tensor:
+    def forward(ctx, input: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
         ctx.scale = scale
         delta = input.abs().mean().clamp(min=1e-6) * scale
         # |W| > 1.5Δ promotes to an outlier (±2, code 11 in the 2-bit format)
@@ -162,7 +163,7 @@ class TernaryQuantizer(torch.autograd.Function):
 class FusedTernaryLinear(torch.autograd.Function):
     """Fused ternary quantization + linear matmul.
 
-    Dynamic threshold: Δ = scale x mean(|W|), default scale=0.7.
+    Dynamic threshold: Δ = scale x mean(|W|), default scale=1.0 (Exp 9 tuning).
     Per-channel: Δ_i = scale x mean(|W[i,:]|).
 
     Forward:  clamp(W/Δ, -1, 1) -> round -> matmul(x, W_ternary)
@@ -184,7 +185,7 @@ class FusedTernaryLinear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, latent_weights: torch.Tensor,
-                scale: float = 0.7, per_channel: bool = False,
+                scale: float = 1.0, per_channel: bool = False,
                 alphas: Optional[torch.Tensor] = None,
                 group_size: int = 0,
                 gamma: Optional[float] = None) -> torch.Tensor:

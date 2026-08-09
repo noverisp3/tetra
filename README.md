@@ -1155,6 +1155,11 @@ python scripts/diagnose_soft_quant.py checkpoints_exp9_s10_seed1/checkpoint_0003
 (Note: `train.py` gained a `--seed` flag during Exp 9 — earlier runs used unseeded RNG, so
 their CE values carry unknown but bounded seed variance; occupancy is seed-invariant.)
 
+**Verdict: default `--ternary-scale` promoted 0.7 → 1.0** — the CE comparison is neutral-to-
+slightly-better (mean −0.039) and the side-channel shrink is deterministic, so the new
+default is strictly safer than the old one. To reproduce the old behavior pass
+`--ternary-scale 0.7`.
+
 ## Project Structure
 
 ```

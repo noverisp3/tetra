@@ -36,7 +36,7 @@ class TernaryFFN(nn.Module):
         hidden_dim: int,
         ffn_dim: int,
         dropout: float = 0.0,
-        ternary_scale: float = 0.7,
+        ternary_scale: float = 1.0,
         per_channel: bool = False,
         group_size: int = 0,
         init_mode: str = "kaiming",

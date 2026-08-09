@@ -162,7 +162,8 @@ class TrainingConfig:
     threshold_decay_to: float | None = None  # Decay threshold from initial to this by end (None = constant)
 
     # Quantization (STE)
-    ternary_scale: float = 0.7  # Δ = scale x mean(|W|), lower -> more {-1,+1}, higher -> more 0
+    ternary_scale: float = 1.0  # Δ = scale x mean(|W|), lower -> more {-1,+1}, higher -> more 0
+    # (default 1.0 since Exp 9: lower CE + fewer ±2 outliers vs old 0.7)
     per_channel: bool = False    # Per-channel vs per-tensor threshold
 
     # Exp 8: soft-to-hard quantization schedule (STE mode)
@@ -457,7 +458,7 @@ class TernaryTrainer:
             if hasattr(mod, "latent_weights"):
                 if getattr(mod, "per_channel", False):
                     delta = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) \
-                        * getattr(mod, "ternary_scale", 0.7)
+                        * getattr(mod, "ternary_scale", 1.0)
                     wt = (w / delta).clamp(-1, 1).round()
                 else:
                     wt = TernaryQuantizer.apply(w.data)

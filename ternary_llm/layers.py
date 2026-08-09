@@ -58,7 +58,7 @@ class TernaryLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = False,
-        ternary_scale: float = 0.7,
+        ternary_scale: float = 1.0,
         per_channel: bool = False,
         group_size: int = 0,
         init_mode: str = "kaiming",

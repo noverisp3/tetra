@@ -124,8 +124,9 @@ def main():
                         help="[Hybrid] Place attention every N blocks (default: 5 -> 80%% SSM, 20%% attention)")
     parser.add_argument("--expand-factor", type=int, default=2,
                         help="[Hybrid] SSM expansion factor (default: 2)")
-    parser.add_argument("--ternary-scale", type=float, default=0.7,
-                        help="[STE] Dynamic threshold scale: delta = scale x mean(|W|) (default: 0.7)")
+    parser.add_argument("--ternary-scale", type=float, default=1.0,
+                        help="[STE] Dynamic threshold scale: delta = scale x mean(|W|) (default: 1.0, "
+                             "tuned in Exp 9: lower CE + fewer +-2 outliers)")
     parser.add_argument("--seed", type=int, default=None,
                         help="RNG seed for model init / data order (default: unseeded)")
     parser.add_argument("--per-channel", action="store_true",
