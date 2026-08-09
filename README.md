@@ -119,7 +119,7 @@ python run_inference.py tetra_model.bin "Once upon a time" --max-tokens 100
 
 ### Binary Format (v4–v8)
 
-Base binary layout, shared by all versions (v5+ adds extended header fields; v6/v7/v8 deltas below):
+Base binary layout, shared by all versions (v5+ adds extended header fields; v6/v7 deltas documented under Discrete Learning, v8 delta next section):
 
 | Section | Encoding |
 |---------|----------|
@@ -129,7 +129,7 @@ Base binary layout, shared by all versions (v5+ adds extended header fields; v6/
 | Embeddings | INT8 (token 8K×256→2.0 MB, pos 512×256→0.13 MB) |
 | Norms | FP32 (tiny, ~12 KB) |
 
-Version deltas: **v6** = +FP32 accumulator per ternary entry + SL metadata (below). **v7** = +outlier side-channel blobs (code 11 = ±2, below). **v8** = +true-value outlier blobs (code 11 = ±2 with top-k latent values, below).
+Version deltas: **v6** = +FP32 accumulator per ternary entry + SL metadata (below). **v7** = +outlier side-channel blobs (code 11 = ±2, below). **v8** = +true-value outlier blobs (code 11 = ±2 with top-k latent values, next section).
 
 Three alpha modes controlled by `group_size` and `num_alphas`:
 
@@ -140,6 +140,25 @@ Three alpha modes controlled by `group_size` and `num_alphas`:
 | Per-group | >0 | rows × ceil(cols/group_size) | `rows × ceil(cols/group_size) × 4B` |
 
 Per-group (`--group-size N`): each output row is split into blocks of N dims, each block having its own FP32 alpha. Overhead: with `group_size=64` (tiny 256-dim) adds ~770 KB.
+
+### Binary Format v8 (Top-k True-Value Outliers)
+
+v8 upgrades the v7 side channel: instead of a dense **sign bit** per outlier, the blob stores the outlier's **true latent value** as a fixed-point int8 magnitude at 1/32 level granularity (true value = byte/32, i.e. the model's `round(W/Δ)` residue beyond the ±2 saturation instead of clamping at ±2):
+
+- **Layout** (per ternary entry, header version ≥ 8): packed 2-bit codes + FP32 accumulator (`rows×cols`) + trailing `u32 n_outliers` + `n_outliers` int8 bytes, each = `round(W/Δ·32)` clamped to int8, in the same dense row-major scan order as v7 (running index of code-11 weights addresses the blob). Header bytes 56–57 carry `v8_k` (uint16 LE): **0 = keep all outliers** (default), N = top-N per row by |W/Δ|.
+- **Export**: `export_model.py ... --v8 [--v8-k N]` (**STE checkpoints only** — v8 captures the STE latent distribution; discrete SBF exports keep v7's sign-only blob). Core weights quantize to `round(W/Δ) ∈ {-1, 0, +1}`; entries with `|W/Δ| > 1.5` become code 11 with their true value in the blob.
+- **C++**: dequant adds `blob_value/32.0` for code-11 weights; v8 outliers are **frozen** in `apply_bit_flips` (true values are outside the ±1 flip dynamics); `save_model` rebuilds the blob from floats (`llroundf(v·32)`), so save→reload round-trips.
+- **Verified**: `verify_export` 51/51 tensors bit-exact within fixed-point tolerance (0.05); C++ forward matches a Python replica of the same dequant to 6.2e-5 max diff (argmax 2442/2442). Torch-vs-C++ logits differ up to ~23.8 max diff — torch STE still clamps outliers to ±2 while v8 carries the true values — but **argmax predictions are identical** (1629/1629).
+
+**v7 vs v8 CE comparison** (`tests/ce_v6_vs_v7.py`, STE smoke checkpoint `checkpoints/smoke_v8.bin`, 256 positions):
+
+| Reading | CE |
+|---------|-----|
+| v7 (sign-only blob) | 9.3627 |
+| **v8, k=0 (true values)** | **9.3458** |
+| v8, k=32 (capped) | 9.3754 |
+
+`--v8-k 0` is the default: keeping the full outlier tail beats v7 (−0.017 nats), while capping the blob at k=32 loses the tail signal and falls *behind* v7 (+0.013) — so the cap exists only for blob-size control.
 
 ## Vulkan Compute Engine (`inference/vulkan/`)
 
@@ -408,25 +427,6 @@ v7 adds a fourth ternary magnitude: **code `11` = ±2 outlier weights**, whose s
 | `examples/v7/tetra_v7_smoke.bin` (outlier-bearing) | **8.8049** | 11.0732 |
 
 The side-channel recovers **2.27 nats** of CE on the same weights; a fresh `--v7` export of a 0-outlier checkpoint is bit-identical in CE to its v6 twin (+4 B/entry for the empty blob count).
-
-### Binary format v8 (Top-k True-Value Outliers)
-
-v8 upgrades the v7 side channel: instead of a dense **sign bit** per outlier, the blob stores the outlier's **true latent value** as a fixed-point int8 magnitude at 1/32 level granularity (true value = byte/32, i.e. the model's `round(W/Δ)` residue beyond the ±2 saturation instead of clamping at ±2):
-
-- **Layout** (per ternary entry, header version ≥ 8): packed 2-bit codes + FP32 accumulator (`rows×cols`) + trailing `u32 n_outliers` + `n_outliers` int8 bytes, each = `round(W/Δ·32)` clamped to int8, in the same dense row-major scan order as v7 (running index of code-11 weights addresses the blob). Header bytes 56–57 carry `v8_k` (uint16 LE): **0 = keep all outliers** (default), N = top-N per row by |W/Δ|.
-- **Export**: `export_model.py ... --v8 [--v8-k N]` (**STE checkpoints only** — v8 captures the STE latent distribution; discrete SBF exports keep v7's sign-only blob). Core weights quantize to `round(W/Δ) ∈ {-1, 0, +1}`; entries with `|W/Δ| > 1.5` become code 11 with their true value in the blob.
-- **C++**: dequant adds `blob_value/32.0` for code-11 weights; v8 outliers are **frozen** in `apply_bit_flips` (true values are outside the ±1 flip dynamics); `save_model` rebuilds the blob from floats (`llroundf(v·32)`), so save→reload round-trips.
-- **Verified**: `verify_export` 51/51 tensors bit-exact within fixed-point tolerance (0.05); C++ forward matches a Python replica of the same dequant to 6.2e-5 max diff (argmax 2442/2442). Torch-vs-C++ logits differ up to ~23.8 max diff — torch STE still clamps outliers to ±2 while v8 carries the true values — but **argmax predictions are identical** (1629/1629).
-
-**v7 vs v8 CE comparison** (`tests/ce_v6_vs_v7.py`, STE smoke checkpoint `checkpoints/smoke_v8.bin`, 256 positions):
-
-| Reading | CE |
-|---------|-----|
-| v7 (sign-only blob) | 9.3627 |
-| **v8, k=0 (true values)** | **9.3458** |
-| v8, k=32 (capped) | 9.3754 |
-
-`--v8-k 0` is the default: keeping the full outlier tail beats v7 (−0.017 nats), while capping the blob at k=32 loses the tail signal and falls *behind* v7 (+0.013) — so the cap exists only for blob-size control.
 
 ### Lossless zero-padding expansion (`scripts/pad_model.py`)
 
