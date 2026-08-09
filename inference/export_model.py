@@ -16,8 +16,14 @@ Header v5 layout (64 bytes):
   48-49: flags (bit0=is_mla, bit1=int8_embeddings)
   50-51: kv_latent_dim (uint16, MLA only)
   52-53: rope_per_head (uint16, MLA only)
-  54-55: group_size (uint16, default quantization group size)
-  56-63: reserved (zeroes)
+   54-55: group_size (uint16, default quantization group size)
+   56-57: v8_k (uint16, v8 only: per-row top-k outlier budget, 0 = keep all)
+   58-63: reserved (zeroes)
+
+Version deltas: v6 = +FP32 accumulator per ternary entry + META section;
+v7 = +outlier side-channel blobs (code 11 = ±2, 1 bit/outlier);
+v8 = +true-value outlier blobs (code 11 = ±2, int8 fixed-point W/Δ at 1/32
+granularity, 1 byte/outlier, top-k per row when v8_k > 0, STE checkpoints only).
 
 Metadata section (optional, after all weights):
   4 bytes: "META" magic
@@ -899,6 +905,9 @@ Examples:
                         help="ERC checkpoints: bake the residual (R, level units) into the "
                              "latent core, drop R, then export a plain 2-bit ternary binary")
     args = parser.parse_args()
+
+    if not 0 <= args.v8_k <= 65535:
+        parser.error(f"--v8-k must be in [0, 65535] (u16 header field), got {args.v8_k}")
 
     print(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
