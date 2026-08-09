@@ -339,6 +339,8 @@ class TernaryTrainer:
         self.erc_committed_frac = 0.0
         self.slice_ces = []
         self.domain_ces = []
+        self.slice_core_ces = []   # ERC: same slice with R zeroed (core-only)
+        self.domain_core_ces = []
 
         # LR Scheduler
         self.scheduler = CosineScheduler(
@@ -648,7 +650,7 @@ class TernaryTrainer:
                     from .erc import commit_erc, decay_erc
                     if self.config.erc_decay < 1.0:
                         decay_erc(self.model, self.config.erc_decay)
-                    if step % self.config.erc_commit_interval == 0:
+                    if self.config.erc_commit_interval > 0 and step % self.config.erc_commit_interval == 0:
                         n_committed, n_positions = commit_erc(self.model)
                         self.erc_total_commits += n_committed
                         self.erc_committed_frac = n_committed / max(1, n_positions)
@@ -772,27 +774,45 @@ class TernaryTrainer:
 
         Mirrors train_baseline_backprop.py: raw uint16 .bin token slices,
         causal full-context within block_size chunks. Writes eval_history.json.
+
+        Under ERC each metric is measured twice: with the residual R active
+        (behavior) and with R temporarily zeroed (core-only). Core-only CE
+        isolates genuine forgetting of the ternary core from the residual's
+        fast behavioral shift.
         """
         import numpy as np
 
-        def _ce(path: str) -> float:
+        def _ce(path: str, zero_r: bool = False) -> float:
             data = np.fromfile(path, dtype=np.uint16)
             limit = min(len(data) - 1, self.config.eval_positions)
             total = 0.0
             n = 0
             bs = self.config.block_size
-            for start in range(0, limit, bs):
-                end = min(limit, start + bs)
-                x = torch.tensor(data[start:end].astype(np.int64)[None], dtype=torch.long,
-                                 device=self.device)
-                y = torch.tensor(data[start + 1:end + 1].astype(np.int64)[None], dtype=torch.long,
-                                 device=self.device)
-                logits, _, _ = self.model(x, None)
-                loss = torch.nn.functional.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)), y.reshape(-1), reduction="mean")
-                total += loss.item() * (end - start)
-                n += end - start
-            return total / max(n, 1)
+            saved = []
+            if zero_r:
+                from .erc import ERCLinear
+                for m in self.model.modules():
+                    if isinstance(m, ERCLinear):
+                        saved.append((m, m.residual.detach().clone()))
+                        with torch.no_grad():
+                            m.residual.mul_(0.0)
+            try:
+                for start in range(0, limit, bs):
+                    end = min(limit, start + bs)
+                    x = torch.tensor(data[start:end].astype(np.int64)[None], dtype=torch.long,
+                                     device=self.device)
+                    y = torch.tensor(data[start + 1:end + 1].astype(np.int64)[None], dtype=torch.long,
+                                     device=self.device)
+                    logits, _, _ = self.model(x, None)
+                    loss = torch.nn.functional.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)), y.reshape(-1), reduction="mean")
+                    total += loss.item() * (end - start)
+                    n += end - start
+                return total / max(n, 1)
+            finally:
+                for m, r in saved:
+                    with torch.no_grad():
+                        m.residual.copy_(r)
 
         self.model.eval()
         line = f"[step {step}]"
@@ -800,10 +820,18 @@ class TernaryTrainer:
             ce_slice = _ce(self.config.eval_slice_path)
             self.slice_ces.append([int(step), float(ce_slice)])
             line += f" sliceCE(old)={ce_slice:.4f}"
+            if self.config.erc:
+                ce_core = _ce(self.config.eval_slice_path, zero_r=True)
+                self.slice_core_ces.append([int(step), float(ce_core)])
+                line += f" sliceCEcore={ce_core:.4f}"
         if self.config.domain_eval_path:
             ce_dom = _ce(self.config.domain_eval_path)
             self.domain_ces.append([int(step), float(ce_dom)])
             line += f" domainCE(new)={ce_dom:.4f}"
+            if self.config.erc:
+                ce_core = _ce(self.config.domain_eval_path, zero_r=True)
+                self.domain_core_ces.append([int(step), float(ce_core)])
+                line += f" domainCEcore={ce_core:.4f}"
         if line != f"[step {step}]":
             print(line)
             self._write_eval_history()
@@ -814,6 +842,8 @@ class TernaryTrainer:
         history = {
             "slice_ces": self.slice_ces,
             "domain_ces": self.domain_ces,
+            "slice_core_ces": self.slice_core_ces,
+            "domain_core_ces": self.domain_core_ces,
         }
         path = Path(self.config.save_dir) / "eval_history.json"
         with open(path, "w") as f:

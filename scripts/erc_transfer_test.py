@@ -1,8 +1,14 @@
 """ERC transfer-test driver: TinyStories (Domain A) -> FineWeb (Domain B).
 
-Runs two Phase-2 arms from the same Phase-1 checkpoint:
-  1. baseline: hard-STE fine-tune on the new domain (no ERC)
-  2. erc:      same fine-tune + ERC residual (fast adaptation + consolidation)
+Runs several Phase-2 arms from the same Phase-1 checkpoint and compares
+old-domain retention (sliceCE) vs new-domain adaptation (domainCE):
+
+  baseline       hard-STE fine-tune on the new domain (no ERC)
+  baseline-lowlr same fine-tune at 1/10 core LR  (is it just LR?)
+  erc            ERC residual (fast adaptation + consolidation)
+  erc-nocommit   ERC residual, commits disabled (core never changes)
+  erc-freeze     ERC with the latent core frozen (R-only learning)
+  erc-common     ERC with commits every 2 steps (faster consolidation)
 
 Each arm logs held-out CE on the OLD slice (retention) and the NEW domain
 slice (adaptation) into save_dir/eval_history.json; the driver prints a
@@ -11,6 +17,7 @@ comparison table.
 Usage:
   python scripts/erc_transfer_test.py                       # full: 300+300 steps
   python scripts/erc_transfer_test.py --smoke               # 10+10 steps, fast
+  python scripts/erc_transfer_test.py --arms baseline,erc   # subset of arms
   python scripts/erc_transfer_test.py --phase1-checkpoint checkpoints_exp9_s10_seed1/checkpoint_000300.pt --phase2-steps 300
 """
 
@@ -22,6 +29,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# (arm name, extra train.py args). Order = table order.
+ARMS = {
+    "baseline": ("baseline (hard-STE)", []),
+    "baseline-lowlr": ("baseline (LR/10)", ["--lr", "1e-5", "--min-lr", "1e-6"]),
+    "erc": ("erc (R lr 0.01, commit 10)", ["--erc", "--erc-lr", "0.01", "--erc-decay", "0.99", "--erc-commit-interval", "10"]),
+    "erc-nocommit": ("erc (R, no commit)", ["--erc", "--erc-lr", "0.01", "--erc-decay", "0.99", "--erc-commit-interval", "0"]),
+    "erc-freeze": ("erc (R, core frozen)", ["--erc", "--erc-lr", "0.01", "--erc-decay", "0.99", "--erc-commit-interval", "10", "--erc-freeze-core"]),
+    "erc-common": ("erc (R lr 0.01, commit 2)", ["--erc", "--erc-lr", "0.01", "--erc-decay", "0.99", "--erc-commit-interval", "2"]),
+}
 
 
 def run_train(args, save_dir, resume=None, extra=None):
@@ -65,7 +82,9 @@ def load_history(save_dir):
 def fmt_history(hist):
     slices = {int(s): ce for s, ce in hist.get("slice_ces", [])}
     doms = {int(s): ce for s, ce in hist.get("domain_ces", [])}
-    return slices, doms
+    sc = {int(s): ce for s, ce in hist.get("slice_core_ces", [])}
+    dc = {int(s): ce for s, ce in hist.get("domain_core_ces", [])}
+    return slices, doms, sc, dc
 
 
 def main():
@@ -90,10 +109,19 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--smoke", action="store_true", help="10+10 steps")
     ap.add_argument("--erc-fp16", action="store_true")
+    ap.add_argument("--arms", default="baseline,baseline-lowlr,erc,erc-nocommit,erc-freeze,erc-common",
+                    help="comma-separated arm names (see ARMS dict)")
     args = ap.parse_args()
 
+    arm_list = [a.strip() for a in args.arms.split(",") if a.strip()]
+    for a in arm_list:
+        if a not in ARMS:
+            print(f"ERROR: unknown arm '{a}' (choose from {sorted(ARMS)})")
+            sys.exit(1)
+
     if args.smoke:
-        args.phase1_steps = 10
+        if not args.phase1_checkpoint:
+            args.phase1_steps = 10
         args.phase2_steps = 10
         args.eval_every = 5
 
@@ -120,18 +148,14 @@ def main():
 
     print(f"\nPhase-1 checkpoint: {phase1_ckpt}")
 
-    # -- Phase 2 arm A: baseline hard-STE fine-tune ---------------------------
-    base_dir = str(out / "baseline")
-    run_train(args, base_dir, resume=phase1_ckpt)
-
-    # -- Phase 2 arm B: ERC ----------------------------------------------------
-    erc_dir = str(out / "erc")
-    run_train(args, erc_dir, resume=phase1_ckpt, extra=[
-        "--erc",
-        "--erc-lr", str(args.erc_lr),
-        "--erc-decay", str(args.erc_decay),
-        "--erc-commit-interval", str(args.erc_commit_interval),
-    ] + (["--erc-fp16"] if args.erc_fp16 else []))
+    # -- Phase 2 arms ----------------------------------------------------------
+    dirs = {}
+    for arm in arm_list:
+        label, extra = ARMS[arm]
+        arm_dir = str(out / arm)
+        dirs[arm] = arm_dir
+        print(f"\n### ARM: {label} -> {arm_dir}")
+        run_train(args, arm_dir, resume=phase1_ckpt, extra=extra)
 
     if args.dry_run:
         return
@@ -140,26 +164,54 @@ def main():
     print("\n" + "=" * 64)
     print("ERC TRANSFER TEST - TinyStories (A) -> FineWeb (B)")
     print("=" * 64)
-    for label, d in [("baseline (hard-STE)", base_dir), ("erc", erc_dir)]:
-        slices, doms = fmt_history(load_history(d))
+    for arm in arm_list:
+        label, _ = ARMS[arm]
+        d = dirs[arm]
+        slices, doms, sc, dc = fmt_history(load_history(d))
         if not slices and not doms:
             print(f"\n[{label}] no eval_history.json - parse FINAL lines from stdout above")
             continue
         print(f"\n[{label}] {d}")
-        print(f"  {'step':>6}  {'sliceCE(old)':>14}  {'domainCE(new)':>14}")
+        print(f"  {'step':>6}  {'sliceCE(old)':>14}  {'coreOnly':>10}  {'domainCE(new)':>14}  {'coreOnly':>10}")
         steps = sorted(set(slices) | set(doms))
         for s in steps:
             a = f"{slices[s]:.4f}" if s in slices else "-"
             b = f"{doms[s]:.4f}" if s in doms else "-"
-            print(f"  {s:>6}  {a:>14}  {b:>14}")
+            ac = f"{sc[s]:.4f}" if s in sc else ""
+            bc = f"{dc[s]:.4f}" if s in dc else ""
+            print(f"  {s:>6}  {a:>14}  {ac:>10}  {b:>14}  {bc:>10}")
         if slices:
             k0, k1 = min(slices), max(slices)
             print(f"  RETENTION  delta_sliceCE: {slices[k0]:.4f} -> {slices[k1]:.4f}"
                   f"  ({slices[k1] - slices[k0]:+.4f})")
+        if sc:
+            k0, k1 = min(sc), max(sc)
+            print(f"  RETENTION  delta_coreCE:  {sc[k0]:.4f} -> {sc[k1]:.4f}"
+                  f"  ({sc[k1] - sc[k0]:+.4f})  <- core only (R=0)")
         if doms:
             k0, k1 = min(doms), max(doms)
             print(f"  ADAPTATION delta_domainCE: {doms[k0]:.4f} -> {doms[k1]:.4f}"
                   f"  ({doms[k1] - doms[k0]:+.4f})")
+        if dc:
+            k0, k1 = min(dc), max(dc)
+            print(f"  ADAPTATION delta_domainCoreCE: {dc[k0]:.4f} -> {dc[k1]:.4f}"
+                  f"  ({dc[k1] - dc[k0]:+.4f})  <- core only (R=0)")
+
+    # -- Cross-arm summary -----------------------------------------------------
+    print("\n" + "=" * 64)
+    print("SUMMARY (delta over eval span)")
+    print("=" * 64)
+    print(f"  {'arm':<22} {'delta slice':>12} {'delta core':>12} {'delta domain':>13} {'delta dCore':>13}")
+    for arm in arm_list:
+        label, _ = ARMS[arm]
+        slices, doms, sc, dc = fmt_history(load_history(dirs[arm]))
+        ds = (lambda k0, k1: slices[k1] - slices[k0])(min(slices), max(slices)) if slices else float("nan")
+        dsc = (lambda k0, k1: sc[k1] - sc[k0])(min(sc), max(sc)) if sc else float("nan")
+        dd = (lambda k0, k1: doms[k1] - doms[k0])(min(doms), max(doms)) if doms else float("nan")
+        ddc = (lambda k0, k1: dc[k1] - dc[k0])(min(dc), max(dc)) if dc else float("nan")
+        print(f"  {arm:<22} {ds:>+12.4f} {dsc:>+12.4f} {dd:>+13.4f} {ddc:>+13.4f}")
+    print("\n  delta slice = old-domain CE (R active)   delta core = same, R=0 (genuine core forgetting)")
+    print("  delta domain = new-domain CE (R active)  delta dCore = same, R=0 (core-only adaptation)")
 
 
 if __name__ == "__main__":

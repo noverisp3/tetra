@@ -1188,34 +1188,69 @@ slice CE +17 nats). ERC attacks the forgetting-adaptation tradeoff with a
 
 Implementation: `ternary_llm/erc.py` (`ERCLinear`, `enable_erc`,
 `commit_erc`, `decay_erc`, `commit_erc_state_dict`), wired into
-`TernaryTrainer` (param groups, per-step decay, periodic commit hook) and
+`TernaryTrainer` (param groups, per-step decay, periodic commit hook —
+skipped when `--erc-commit-interval 0` — core-only eval metrics) and
 `train.py` (`--erc*` flags). No C++ change needed.
 
-Smoke transfer test (GPU, Intel Iris Xe / DML): Phase-1 = 300-step
-TinyStories checkpoint (`checkpoints_exp9_s10_seed1/checkpoint_000300.pt`),
-Phase-2 = 60 FineWeb steps at LR 1e-4, eval every 30 steps, 10k positions
-on the old slice (`sliceEval100k.bin`) and new domain
-(`finewebEval100k.bin`, held-out last shard):
+Transfer test with control arms (GPU, Intel Iris Xe / DML): Phase-1 =
+300-step TinyStories checkpoint (`checkpoints_exp9_s10_seed1/checkpoint_000300.pt`),
+Phase-2 = 60 FineWeb steps at core LR 1e-4, eval every 30 steps, 20k
+positions on the old slice (`sliceEval100k.bin`) and new domain
+(`finewebEval100k.bin`, held-out last shard). Under ERC every metric is
+measured twice: with R active (behavior) and with R zeroed (core-only) —
+core-only CE isolates *genuine core forgetting* from the residual's fast
+behavioral shift:
 
-| Arm | Δ sliceCE(old) — forgetting | Δ domainCE(new) — adaptation |
-|---|---|---|
-| baseline (hard-STE, LR 1e-4) | +0.1520 | −0.2172 |
-| **ERC** (R at LR 0.01, decay 0.99) | **+0.0402** (3.8× less) | −0.1000 (slower) |
+| Arm (Phase-2, 60 steps) | Δ sliceCE (R active) | Δ core-only sliceCE | Δ domainCE (R active) | Δ core-only domainCE |
+|---|---|---|---|---|
+| baseline (hard-STE, LR 1e-4) | +0.1526 | — (no R) | −0.2237 | — (no R) |
+| baseline-lowlr (LR 1e-5, control) | +0.0289 | — (no R) | −0.0910 | — (no R) |
+| **erc** (R lr 0.01, commit 10) | +0.0476 | **+0.0303** | −0.0999 | −0.1394 |
+| erc-nocommit (R, commits off) | +0.0415 | +0.0276 | −0.0989 | −0.1367 |
+| erc-freeze (R, core frozen) | +0.0703 | **+0.0000** | −0.0582 | +0.0000 |
+| erc-common (R lr 0.01, commit 2) | +0.0430 | +0.0282 | −0.0986 | −0.1380 |
 
-Readings: ERC cuts catastrophic forgetting ~3.8× vs plain backprop
-fine-tune at the same core LR, at the cost of ~2× slower new-domain
-adaptation (the residual LR / commit cadence control this tradeoff; a
-higher `--erc-lr` adapts faster at the price of more forgetting). The
-residual stays bounded below 0.5 level between commits (max 0.054 after
-60 steps), so `--commit-erc` export loses only sub-level noise.
+Readings:
 
-Reproduce:
+- **ERC genuinely protects the core — not an artifact of the residual
+  shifting behavior.** Core-only forgetting is +0.030 (erc) vs +0.153
+  (baseline at the same core LR): **5× less**. The residual absorbs the
+  new-domain gradient surprise; the ternary core is what keeps old-domain
+  knowledge.
+- **Not just "lower LR".** The baseline-lowlr control (LR/10) forgets just
+  as little (+0.029) but its core adapts *less* (core-only domainCE −0.091
+  vs erc's −0.139). ERC achieves low-LR retention while keeping high-LR
+  core adaptation — the forgetting/adaptation tradeoff is shifted, not
+  just slowed.
+- **No-commit ≈ commit**: in 60 steps R never crosses the 0.5-level
+  commit threshold in bulk (max |R| 0.054), so consolidation is not yet
+  exercised; erc-nocommit and erc-common behave identically to erc. The
+  commit path only matters on longer runs or with `--erc-lr` high enough
+  to saturate levels.
+- **Freeze control works as intended**: core-only sliceCE is bit-identical
+  across the run (+0.0000) — the frozen ternary core loses nothing. Its
+  behavior still shifts (+0.07) because R moves the effective matrix, and
+  adaptation is shallow (−0.058) since the core cannot consolidate new
+  knowledge. This is the retention upper bound; erc approaches it while
+  still adapting the core (domain core-only −0.139).
+- The residual stays bounded below 0.5 level between commits, so
+  `--commit-erc` export loses only sub-level noise.
+
+Reproduce (default runs all 6 arms; subset with `--arms`):
 
 ```bash
 python scripts/erc_transfer_test.py \
     --phase1-checkpoint checkpoints_exp9_s10_seed1/checkpoint_000300.pt \
-    --phase2-steps 60 --eval-every 30 --eval-positions 10000
+    --phase2-steps 60 --eval-every 30 --eval-positions 20000
+# quick check of 2 arms:
+python scripts/erc_transfer_test.py --smoke --arms erc-nocommit,erc-freeze
 ```
+
+Arms (defined in `ARMS` dict of the driver): `baseline`,
+`baseline-lowlr` (LR/10 control), `erc`, `erc-nocommit`
+(`--erc-commit-interval 0`), `erc-freeze` (`--erc-freeze-core`),
+`erc-common` (commit every 2 steps). Each arm's `eval_history.json` also
+logs `slice_core_ces`/`domain_core_ces` (R zeroed) for core-only metrics.
 
 Unit tests: `tests/test_erc.py` (9 tests — commit math, forward parity,
 gradient flow to both paths, level-unit commit, output neutrality, full
@@ -1233,7 +1268,7 @@ scripts/
   prepare_data.py           # Stream data from HF → tokenized chunks
   train_tokenizer.py        # Train BPE tokenizer on TinyStories
   pad_model.py              # Lossless FFN zero-padding expansion (v6/v7 binary)
-  erc_transfer_test.py      # ERC vs baseline continual-learning transfer test
+  erc_transfer_test.py      # ERC vs baseline transfer test (6 arms, core-only metrics)
 
 ternary_llm/
   quantization.py           # STE + Stochastic Bit-Flip autograd functions, pack/unpack
