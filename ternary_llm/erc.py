@@ -97,6 +97,7 @@ class ERCLinear(TernaryLinear):
         if linear.bias is not None:
             erc.bias.data.copy_(linear.bias.data)
         erc.soft_gamma = getattr(linear, "soft_gamma", None)
+        erc.v8_forward = getattr(linear, "v8_forward", False)
         return erc
 
     def _residual_for(self, dtype: torch.dtype) -> torch.Tensor:
@@ -112,7 +113,7 @@ class ERCLinear(TernaryLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = FusedTernaryLinear.apply(
             x, self.latent_weights, self.ternary_scale, self.per_channel,
-            self.alphas, self.group_size, self.soft_gamma,
+            self.alphas, self.group_size, self.soft_gamma, self.v8_forward,
         )
         output = output + F.linear(x, self._residual_for(x.dtype))
         if self.bias is not None:

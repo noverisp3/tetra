@@ -181,6 +181,12 @@ class FusedTernaryLinear(torch.autograd.Function):
 
     Saves ternary weights to avoid recomputing abs()
     in backward - avoids OOM on memory-constrained devices.
+
+    v8-forward (``v8_forward=True``, Exp 10): outliers (|x| >= 1.5) dequantize
+    to their true latent value at 1/32 level resolution —
+    round((W/Delta)*32)/32, exactly the format-v8 int8 blob — instead of the
+    clamp at +-2. Makes training consistent with the v8 inference
+    representation (the model can exploit real outlier magnitude).
     """
 
     @staticmethod
@@ -188,7 +194,8 @@ class FusedTernaryLinear(torch.autograd.Function):
                 scale: float = 1.0, per_channel: bool = False,
                 alphas: Optional[torch.Tensor] = None,
                 group_size: int = 0,
-                gamma: Optional[float] = None) -> torch.Tensor:
+                gamma: Optional[float] = None,
+                v8_forward: bool = False) -> torch.Tensor:
         if per_channel:
             delta = latent_weights.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * scale
         else:
@@ -205,6 +212,14 @@ class FusedTernaryLinear(torch.autograd.Function):
                          + torch.sigmoid(gx + 0.5 * gamma)
                          + torch.sigmoid(gx - 0.5 * gamma)
                          + torch.sigmoid(gx - 1.5 * gamma))
+        elif v8_forward:
+            # Exp 10: true-value outliers — code 11 positions keep their
+            # latent magnitude quantized at 1/32 level (exactly the v8 blob
+            # encoding: byte = round((W/Δ)·32), dequant = byte/32).
+            mask = x_n.abs() > 1.5
+            core = x_n.round().clamp(-1, 1)
+            true_vals = (x_n * 32.0).round().clamp(-127.0, 127.0) / 32.0
+            w_ternary = torch.where(mask, true_vals, core)
         else:
             w_ternary = x_n.round().clamp(-2, 2)
         w_ternary = w_ternary.to(x.dtype)
@@ -292,7 +307,7 @@ class FusedTernaryLinear(torch.autograd.Function):
             else:
                 grad_delta = -((d_xn * x_n).sum() / ctx.delta)
                 grad_w = d_xn / ctx.delta + grad_delta * (ctx.scale / x_n.numel()) * torch.sign(x_n)
-        return grad_x, grad_w.float(), None, None, grad_alpha, None, None
+        return grad_x, grad_w.float(), None, None, grad_alpha, None, None, None
 
 
 def ternary_quantize(weights: torch.Tensor) -> torch.Tensor:

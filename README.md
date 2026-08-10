@@ -163,7 +163,7 @@ v8 upgrades the v7 side channel: instead of a dense **sign bit** per outlier, th
 
 Torch reference confirms the same direction (tinydata window, logit scale 1.0): v7 6.1760 vs v8 6.2894 (+0.113).
 
-**Verdict: v8 is a regression on trained models.** Every k is worse than v7 (+0.13…+0.36 nats at 10K positions; gap stable at +0.15 over 40K). The earlier 256-position smoke reading (9.3458 vs 9.3627, −0.017) was sampling noise on a 30-step checkpoint. Trained weights are calibrated to the ±2 clamp they saw during STE training — mean true outlier value is 1.83 < 2.0 — so replacing ±2 at inference is a distribution shift. v8 can only win with true-value-consistent training (STE forward dequantizing to the same blob values); as a pure export-time representation it hurts, and the code is retained for that follow-up.
+**Verdict: as a pure export-time representation, v8 regresses trained models.** Every k is worse than v7 (+0.13…+0.36 nats at 10K positions; gap stable at +0.15 over 40K). The earlier 256-position smoke reading (9.3458 vs 9.3627, −0.017) was sampling noise on a 30-step checkpoint. Trained weights are calibrated to the ±2 clamp they saw during STE training — mean true outlier value is 1.83 < 2.0 — so replacing ±2 at inference is a distribution shift. **Exp 10 closes the gap**: training with the v8 dequant (`--v8-forward`) then exporting v8 beats the v7 baseline by −0.017/−0.020 nats on two independent 40K windows, and the same model read as v7 (clamp ±2) loses +0.10 — each representation is only as good as the training it was calibrated for.
 
 ## Vulkan Compute Engine (`inference/vulkan/`)
 
@@ -1183,6 +1183,52 @@ their CE values carry unknown but bounded seed variance; occupancy is seed-invar
 slightly-better (mean −0.039) and the side-channel shrink is deterministic, so the new
 default is strictly safer than the old one. To reproduce the old behavior pass
 `--ternary-scale 0.7`.
+
+## Experiment: True-Value Outlier Training (v8-forward, Exp 10)
+
+The v8 format section measured a **regression** when true-value outliers are applied at
+export time only (+0.15 nats): STE training clamps outliers at ±2, so replacing ±2 with the
+latent true value at inference is a distribution shift. This experiment closes the gap the
+other way — **train with the exact v8 dequant**, so the model can genuinely use real outlier
+magnitude: `--v8-forward` makes the STE forward dequantize outliers to
+`round((W/Δ)·32)/32` (the v8 blob encoding) instead of clamping at ±2. Backward is
+unchanged (plain STE).
+
+Setup: same as Exp 9 (tiny, 300 steps, tinydata, ternary-scale 1.0, seed 1) + `--v8-forward`.
+Three arms, measured with the C++ runtime (`selflearn --eval`, 40K positions, logit scale 1.0):
+
+| Arm | sliceEval100k @40K | tinydata @1M window @40K |
+|---|---|---|
+| baseline (clamp ±2) → v7 export | 5.7604 | 5.8748 |
+| v8-forward → v7 export (clamp ±2) | 5.8556 (+0.095) | 5.9816 (+0.107) |
+| **v8-forward → v8 export (true values)** | **5.7404 (−0.020)** | **5.8578 (−0.017)** |
+
+Readings (honest):
+
+- **The train/infer gap is real and bidirectional.** A clamp-±2-trained model read with true
+  values loses +0.15 (v8 section); a true-value-trained model read with clamp-±2 loses
+  +0.10. Each representation is only as good as the training it was calibrated for.
+- **v8-forward + v8 export beats the v7 baseline — consistently but by a small margin.**
+  −0.017/−0.020 nats on two independent 40K windows; the direction agrees in both, so it
+  is beyond sampling noise at this size, yet far below the ±3.97 headroom the true-value
+  channel theoretically offers.
+- **Training dynamics are unaffected**: final train loss 5.7995 vs baseline seeds
+  5.784/5.814 — v8-forward costs nothing during training.
+
+Code: `FusedTernaryLinear` `v8_forward` flag, `TernaryLinear.set_v8_forward()`,
+`train.py --v8-forward` (STE only), `export_model.py` requires `--v8` for v8-forward
+checkpoints (header/body version mismatch would corrupt the format otherwise).
+
+Reproduce:
+
+```bash
+python train.py --mode ste --preset tiny --steps 300 --data-cache tinydata \
+    --ternary-scale 1.0 --seed 1 --v8-forward --save-dir checkpoints_exp10_v8f
+python inference/export_model.py checkpoints_exp10_v8f/checkpoint_000300.pt -o exp10_v8.bin --v8
+python inference/export_model.py checkpoints_exp10_v8f/checkpoint_000300.pt -o exp10_v7.bin --v7
+cd inference && build.bat avx2 && cd ..
+inference/selflearn_avx2.exe --eval exp10_v8.bin examples/discrete/sliceEval100k.bin 40000
+```
 
 ## Experiment: ERC — Echo Residual Committer (STE continual learning)
 

@@ -73,6 +73,10 @@ class TernaryLinear(nn.Module):
         # Exp 8 soft-to-hard surrogate: None = hard round + STE (default).
         # A float value = smooth sigmoid-surrogate quantizer with this gamma.
         self.soft_gamma: float | None = None
+        # Exp 10 v8-forward: outliers dequantize to their true value
+        # (round((W/Δ)·32)/32) instead of the clamp at ±2, matching the v8
+        # inference representation during training.
+        self.v8_forward: bool = False
 
         # Latent weights (FP32) - shadow weights for gradient updates
         self.latent_weights = nn.Parameter(
@@ -116,7 +120,7 @@ class TernaryLinear(nn.Module):
         """
         output = FusedTernaryLinear.apply(
             x, self.latent_weights, self.ternary_scale, self.per_channel,
-            self.alphas, self.group_size, self.soft_gamma,
+            self.alphas, self.group_size, self.soft_gamma, self.v8_forward,
         )
         if self.bias is not None:
             output = output + self.bias
@@ -128,6 +132,10 @@ class TernaryLinear(nn.Module):
         None -> hard round(W/Δ) with STE (standard path).
         """
         self.soft_gamma = gamma
+
+    def set_v8_forward(self, enabled: bool) -> None:
+        """Exp 10: toggle true-value outlier dequant in the forward pass."""
+        self.v8_forward = enabled
 
     def get_ternary_weights(self) -> torch.Tensor:
         """Get quantized ternary weights for deployment."""

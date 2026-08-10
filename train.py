@@ -142,6 +142,10 @@ def main():
                         help="[STE] Exp 8: starting surrogate temperature (default: 2.0)")
     parser.add_argument("--soft-quant-gamma-max", type=float, default=50.0, metavar="G",
                         help="[STE] Exp 8: final temperature at end of warmup, then hard STE (default: 50.0)")
+    parser.add_argument("--v8-forward", action="store_true",
+                        help="[STE] Exp 10: dequantize outliers to their true latent value "
+                             "(round((W/Δ)·32)/32, exactly the v8 blob encoding) during training "
+                             "instead of clamping at ±2 — makes training consistent with v8 inference")
     parser.add_argument("--init", type=str, default="kaiming", choices=["kaiming", "balanced"],
                         help="[STE] Latent init: kaiming (default) or balanced 33/33/33 ternary (anti rank-collapse)")
     parser.add_argument("--ortho-reg", type=float, default=0.0, metavar="LAMBDA",
@@ -303,6 +307,7 @@ def main():
         print(f"Exp 8 soft-to-hard quant: gamma {config.soft_quant_gamma_init} -> "
               f"{config.soft_quant_gamma_max} over {config.soft_quant_steps or '25% of steps'} steps")
     config.init_mode = args.init
+    config.v8_forward = args.v8_forward
     config.ortho_reg = args.ortho_reg
     config.rank_monitor_interval = args.rank_monitor_interval
     config.rank_halt = args.rank_halt
@@ -476,6 +481,11 @@ def main():
         )
 
     total_params = sum(p.numel() for p in model.parameters())
+    if args.v8_forward:
+        for m in model.modules():
+            if hasattr(m, "set_v8_forward"):
+                m.set_v8_forward(True)
+        print("Exp 10 v8-forward: outliers dequantize to true latent values during training")
     if is_stochastic and args.flip_ungated:
         from ternary_llm.layers import StochasticTernaryLinear
         n_gated = 0
