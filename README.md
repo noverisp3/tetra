@@ -150,15 +150,20 @@ v8 upgrades the v7 side channel: instead of a dense **sign bit** per outlier, th
 - **C++**: dequant adds `blob_value/32.0` for code-11 weights; v8 outliers are **frozen** in `apply_bit_flips` (true values are outside the ±1 flip dynamics); `save_model` rebuilds the blob from floats (`llroundf(v·32)`), so save→reload round-trips.
 - **Verified**: `verify_export` 51/51 tensors bit-exact within fixed-point tolerance (0.05); C++ forward matches a Python replica of the same dequant to 6.2e-5 max diff (argmax 2442/2442). Torch-vs-C++ logits differ up to ~23.8 max diff — torch STE still clamps outliers to ±2 while v8 carries the true values — but **argmax predictions are identical** (1629/1629).
 
-**v7 vs v8 CE comparison** (`tests/ce_v6_vs_v7.py`, STE smoke checkpoint `checkpoints/smoke_v8.bin`, 256 positions):
+**v7 vs v8 CE comparison** — real-scale measurement on a trained STE checkpoint (`checkpoints_exp9_s10_seed1/checkpoint_000300.pt`, 300 steps, ternary-scale 1.0; C++ `selflearn --eval` on `sliceEval100k.bin`, correct logit scale 1.0):
 
-| Reading | CE |
-|---------|-----|
-| v7 (sign-only blob) | 9.3627 |
-| **v8, k=0 (true values)** | **9.3458** |
-| v8, k=32 (capped) | 9.3754 |
+| Reading | CE @10K pos | CE @40K pos | Size |
+|---------|-------------|-------------|------|
+| v7 (sign-only blob) | **5.8029** | **5.7604** | 35,018 KB |
+| v8 k=64 | 6.1592 (+0.356) | — | 36,013 KB |
+| v8 k=128 | 6.0008 (+0.198) | — | 36,145 KB |
+| v8 k=256 | 5.9350 (+0.132) | — | 36,310 KB |
+| v8 k=512 | 5.9549 (+0.152) | — | 36,314 KB |
+| v8 k=0 (all) | 5.9549 (+0.152) | 5.9068 (+0.146) | 36,314 KB |
 
-`--v8-k 0` is the default: keeping the full outlier tail beats v7 (−0.017 nats), while capping the blob at k=32 loses the tail signal and falls *behind* v7 (+0.013) — so the cap exists only for blob-size control.
+Torch reference confirms the same direction (tinydata window, logit scale 1.0): v7 6.1760 vs v8 6.2894 (+0.113).
+
+**Verdict: v8 is a regression on trained models.** Every k is worse than v7 (+0.13…+0.36 nats at 10K positions; gap stable at +0.15 over 40K). The earlier 256-position smoke reading (9.3458 vs 9.3627, −0.017) was sampling noise on a 30-step checkpoint. Trained weights are calibrated to the ±2 clamp they saw during STE training — mean true outlier value is 1.83 < 2.0 — so replacing ±2 at inference is a distribution shift. v8 can only win with true-value-consistent training (STE forward dequantizing to the same blob values); as a pure export-time representation it hurts, and the code is retained for that follow-up.
 
 ## Vulkan Compute Engine (`inference/vulkan/`)
 
