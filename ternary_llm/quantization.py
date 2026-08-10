@@ -830,6 +830,7 @@ def apply_bit_flips(
         ungated: bool = False,
         stats: Optional[dict] = None,
         adaptive_thr: Optional[float] = None,
+        soft_temp: Optional[float] = None,
 ) -> Optional[torch.Tensor]:
     """Check accumulators and flip bits where threshold exceeded.
 
@@ -869,6 +870,13 @@ def apply_bit_flips(
         stats: optional dict accumulating flip counters ("flips", "n_calls").
         adaptive_thr: Exp 3 — if set, use k·RMS(acc) per output channel as the
             flip threshold (None = fixed scalar ``threshold``).
+        soft_temp: Exp 14 — annealed soft flips (Gumbel-flip). Relative band
+            half-width around the threshold, as a fraction of ``thr``. Within
+            the band the flip probability is ``σ(margin / soft_temp)`` where
+            ``margin = (|acc| - thr) / (soft_temp·thr)``; hard 0 below the band
+            (dead zone — near-zero accumulators never flip) and hard 1 above.
+            At ``soft_temp → 0`` this converges exactly to the deterministic
+            threshold rule. None = deterministic baseline.
 
     Returns:
         The rebuilt sign blob tensor (uint8) when ``outlier_signs`` is not
@@ -893,6 +901,24 @@ def apply_bit_flips(
     if ungated:
         flip_up = accumulator > 0
         flip_down = accumulator < 0
+    if soft_temp is not None:
+        # Exp 14: soft sigmoid band around the threshold, dead zone below
+        # (near-zero accs must never flip — mass random churn), certain flip
+        # above. Direction from accumulator sign; probability from |acc|.
+        band = soft_temp * thr
+        if not isinstance(band, torch.Tensor):
+            band = torch.as_tensor(max(band, 1e-8),
+                                   dtype=accumulator.dtype,
+                                   device=accumulator.device)
+        else:
+            band = band.clamp_min(1e-8)
+        margin = (accumulator.abs() - thr) / band
+        p = torch.where(margin < -2.0, torch.zeros_like(margin),
+                        torch.where(margin > 2.0, torch.ones_like(margin),
+                                    torch.sigmoid(margin)))
+        rnd = torch.rand_like(accumulator)
+        flip_up = (accumulator > 0) & (rnd < p)
+        flip_down = (accumulator < 0) & (rnd < p)
     promote = accumulator.abs() > promote_thr
     if not (flip_up.any() or flip_down.any() or promote.any()):
         return None

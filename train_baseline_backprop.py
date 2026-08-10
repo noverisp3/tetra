@@ -83,6 +83,12 @@ def main():
     parser.add_argument("--adaptive-thr", type=float, default=None,
                         help="Exp 3: adaptive flip threshold k (tau = k*RMS(acc) per channel). "
                              "None = fixed scalar threshold")
+    parser.add_argument("--soft-flip-temp", type=float, default=None,
+                        help="Exp 14: annealed soft flips — initial relative band "
+                             "half-width s (fraction of tau). Flip probability "
+                             "sigma(margin/s) inside the band, hard 0/1 outside. "
+                             "Cosine-annealed s -> 0.08*s over training (converges "
+                             "to the deterministic rule). None = deterministic")
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--save-dir", type=str, default="checkpoints_bp")
@@ -158,11 +164,15 @@ def main():
         if name.endswith(".packed_weights"):
             n_ternary += buf.numel() * 4
     print(f"Model: 6L/256/8H/1024FFN, ternary bits: {n_ternary:,}")
-    if args.acc_energy or args.adaptive_thr is not None:
+    if args.acc_energy or args.adaptive_thr is not None or args.soft_flip_temp is not None:
         model.set_flip_config(acc_decay=args.acc_decay, energy=args.acc_energy,
-                              adaptive_thr=args.adaptive_thr)
+                              adaptive_thr=args.adaptive_thr,
+                              soft_temp=args.soft_flip_temp)
         print(f"Exp 3 flip mechanics: energy acc={args.acc_energy} "
-              f"(decay {args.acc_decay}) | adaptive thr k={args.adaptive_thr}")
+              f"(decay {args.acc_decay}) | adaptive thr k={args.adaptive_thr}"
+              + (f" | Exp 14 soft flips T0={args.soft_flip_temp} "
+                 f"(anneal -> {0.08 * args.soft_flip_temp:.4f})"
+                 if args.soft_flip_temp is not None else ""))
 
     eval_tokens = load_eval_tokens(args.eval_slice, args.eval_positions)
     print(f"Eval slice: {args.eval_slice} ({len(eval_tokens)} tokens, "
@@ -222,6 +232,12 @@ def main():
         sched.step()
         # SBF: flip ternary bits where the accumulated gradient exceeds threshold.
         if not args.no_flips:
+            if args.soft_flip_temp is not None:
+                # Exp 14: cosine-anneal the soft band down to 8% of T0
+                # (nearly deterministic) over the run.
+                frac = 0.5 * (1.0 + np.cos(np.pi * step / args.steps))
+                model.set_flip_config(
+                    soft_temp=args.soft_flip_temp * (0.08 + 0.92 * frac))
             model.apply_bit_flips()
         losses.append(loss.item())
 

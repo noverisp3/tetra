@@ -271,10 +271,14 @@ class StochasticTernaryLinear(nn.Module):
         self.acc_decay = 1.0
         self.energy = False
         self.adaptive_thr = None
+        # Exp 14: annealed soft flips — relative band half-width (fraction of
+        # threshold). None = deterministic threshold rule.
+        self.soft_temp = None
 
     def set_flip_config(self, *, acc_decay: float | None = None,
                         energy: bool | None = None,
-                        adaptive_thr: float | None = None) -> None:
+                        adaptive_thr: float | None = None,
+                        soft_temp: float | None = None) -> None:
         """Configure Exp 3 flip mechanics (energy acc + adaptive threshold)."""
         if acc_decay is not None:
             self.acc_decay = float(acc_decay)
@@ -282,6 +286,8 @@ class StochasticTernaryLinear(nn.Module):
             self.energy = bool(energy)
         if adaptive_thr is not None:
             self.adaptive_thr = float(adaptive_thr)
+        if soft_temp is not None:
+            self.soft_temp = float(soft_temp)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with stochastic ternary matmul.
@@ -336,6 +342,7 @@ class StochasticTernaryLinear(nn.Module):
             ungated=self.ungated,
             stats=stats,
             adaptive_thr=self.adaptive_thr,
+            soft_temp=self.soft_temp,
         )
         if blob is not None:
             self.outlier_signs[:blob.numel()].copy_(blob)

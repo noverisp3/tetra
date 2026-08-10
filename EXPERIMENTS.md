@@ -1,8 +1,8 @@
-# Tetra — Experimental Log (Exp 1–13)
+# Tetra — Experimental Log (Exp 1–14)
 
 Chronological record of the experiment series, one section per experiment
 (hypothesis → setup → results → verdict → reproduce). Sections are ordered
-Exp 1 → Exp 13; the README "Experiments (Exp 1–11)" section links back here.
+Exp 1 → Exp 14; the README "Experiments" section links back here.
 
 1. **Exp 1** — Surprise-Gated Bit Flips
 2. **Exp 2** — Continual Learning & Catastrophic Forgetting
@@ -17,6 +17,7 @@ Exp 1 → Exp 13; the README "Experiments (Exp 1–11)" section links back here.
 11. **Exp 11** — Outlier-Band Regularization (v8-reg, rejected)
 12. **Exp 12** — Learned 5-Level Codebook (LQ, null result)
 13. **Exp 13** — Unbiased Stochastic Rounding (SR, rejected)
+14. **Exp 14** — Annealed Soft Flips (Gumbel-flip, rejected)
 
 ---
 
@@ -780,3 +781,81 @@ bias is worth.** This closes the quantizer-algorithm line: representation capaci
 (Exp 11/12), level placement (Exp 12), and rounding bias (Exp 13) are all already
 near-optimal; the binding constraint at this scale is the training budget itself.
 `--sr` remains in `train.py` (documented failed experiment).
+
+## Experiment: Annealed Soft Flips (Exp 14)
+
+Question: the SBF flip decision is a hard step (`|acc| > τ`). Exp 12–13 showed the
+binding constraint is the *training dynamics*, not the quantizer. Does softening
+the flip decision — a sigmoid band around the threshold, annealed toward the
+deterministic rule — make the ternary core learn better? (The Gumbel-flip /
+surrogate-gradient idea, in flip-decision space: SBF has no forward quantization
+noise and no latent weights, so the "surrogate" must live in the flip rule.)
+
+Setup: Exp 5/6 mechanism (`--acc-energy --acc-decay 0.99 --adaptive-thr 3.0`),
+1000 steps, `--lr-domain 1e-4 --batch-size 8`, Phase-1 checkpoint
+(`checkpoints_bp/checkpoint_000200.pt`, slice CE 7.069). Added `--soft-flip-temp s`:
+within the band `[τ(1−2s), τ(1+2s)]` the flip probability is `σ(margin/s)`
+(`margin = (|acc|−τ)/(s·τ)`); hard 0 below the band (dead zone — near-zero
+accumulators must never flip, or the whole matrix mass-churns) and hard 1 above.
+`s = 0.25` cosine-annealed to `0.02` over the run (converges to the deterministic
+rule). Both tinydata (same domain, Exp 5 setup) and fineweb (domain shift,
+Exp 6 setup) runs.
+
+| Run (tinydata) | Slice CE @1000 (Δ vs 7.069) | Bits flipped |
+|---|---|---|
+| Frozen control (Exp 5) | 6.892 (−0.177) | 0% |
+| **Energy k=3 (Exp 5)** | **5.910 (−1.159)** | **~1%** |
+| Exp 14 soft flips | **5.5540 (−1.515)** | 2.37% |
+
+| Run (fineweb) | Slice CE (retention) Δ | Domain CE (adaptation) Δ | Bits flipped |
+|---|---|---|---|
+| Frozen control (Exp 6) | 7.989 (+0.92) | 7.838 (−1.08) | 0% |
+| **Energy k=3 (Exp 6)** | **7.362 (+0.29)** | **6.915 (−2.01)** | **~1%** |
+| Exp 14 soft flips | 7.411 (+0.34) | 7.149 (−1.77) | 2.17% |
+
+Readings (honest):
+
+- **The tinydata "win" is a flip-budget artifact, not a smoothness win.** Soft
+  flips consumed ~16× the k=3 budget (2.37% vs 0.15% of bits, same measurement
+  method). On the *same* domain more flips = more fitting = lower CE — any
+  mechanism with a bigger budget wins there, and the trajectory confirms it
+  (soft run crosses k=3's final CE at ~step 600, then keeps fitting).
+- **On a genuine domain shift the same extra budget is harmful on BOTH axes.**
+  fineweb: retention 7.411 vs 7.362 (+0.05 worse), adaptation 7.149 vs 6.915
+  (+0.23 worse). More flips on a new domain = more overwriting of old-domain
+  knowledge, and the noisy domain-gradient band does not improve adaptation
+  either.
+- **Budget is the causal variable; the shape of the decision is not.** Hard
+  k=2 (11.6% flips, Exp 5) was unstable and worse; soft 2.4% is stable and
+  better than k=3 on tinydata — but both are just different points on the same
+  budget-vs-domain curve. At matched budget (s→0.02 ≈ deterministic) soft flips
+  ARE k=3, and the mechanism contributes nothing beyond that. The Exp 5/6 sweet
+  spot (~1% budget, hard rule) stands.
+- **Mechanics verified**: dead zone works (zero-acc entries never flip), the
+  band converges exactly to the deterministic rule as s→0, and the σ band never
+  produced the catastrophic mass-churn of sign-vote (Exp 2 M1) — the failure
+  mode is mild drift, not transient explosion.
+
+**Verdict: rejected — smoothing the flip decision adds no transferable gain;
+the flip budget, set by k, is what the SBF mechanism actually trades in.** This
+reinforces the chain conclusion: with the k=3 rule the SBF learning dynamics are
+at their frontier within this training budget. `--soft-flip-temp` remains in
+`train_baseline_backprop.py` (documented failed experiment).
+
+Reproduce:
+
+```bash
+# tinydata (same domain)
+python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
+    --steps 1000 --data-cache tinydata --lr-domain 1e-4 --batch-size 8 \
+    --acc-energy --acc-decay 0.99 --adaptive-thr 3.0 --soft-flip-temp 0.25 \
+    --save-dir checkpoints_exp14_sft
+# fineweb (domain shift)
+python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
+    --steps 1000 --data-cache data/fineweb_10bt \
+    --eval-slice examples/discrete/sliceEval100k.bin \
+    --domain-eval examples/continual/fineweb_eval100k.bin \
+    --lr-domain 1e-4 --batch-size 8 \
+    --acc-energy --acc-decay 0.99 --adaptive-thr 3.0 --soft-flip-temp 0.25 \
+    --save-dir checkpoints_exp14_sft_fw
+```

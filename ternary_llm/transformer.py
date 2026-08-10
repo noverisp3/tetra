@@ -539,24 +539,28 @@ class StochasticTransformerModel(nn.Module):
     @torch.no_grad()
     def set_flip_config(self, *, acc_decay: float | None = None,
                         energy: bool | None = None,
-                        adaptive_thr: float | None = None) -> None:
+                        adaptive_thr: float | None = None,
+                        soft_temp: float | None = None) -> None:
         """Propagate Exp 3 flip mechanics config to all ternary layers."""
         from .layers import StochasticTernaryLinear
         for m in self.modules():
             if isinstance(m, StochasticTernaryLinear):
                 m.set_flip_config(acc_decay=acc_decay, energy=energy,
-                                  adaptive_thr=adaptive_thr)
+                                  adaptive_thr=adaptive_thr,
+                                  soft_temp=soft_temp)
 
     @torch.no_grad()
     def set_flip_config(self, *, acc_decay: float | None = None,
                         energy: bool | None = None,
-                        adaptive_thr: float | None = None) -> None:
+                        adaptive_thr: float | None = None,
+                        soft_temp: float | None = None) -> None:
         """Propagate Exp 3 flip mechanics config to all ternary layers."""
         from .layers import StochasticTernaryLinear
         for m in self.modules():
             if isinstance(m, StochasticTernaryLinear):
                 m.set_flip_config(acc_decay=acc_decay, energy=energy,
-                                  adaptive_thr=adaptive_thr)
+                                  adaptive_thr=adaptive_thr,
+                                  soft_temp=soft_temp)
 
 
 # ──────────────────────────────────────────────────────────────
