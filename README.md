@@ -1400,6 +1400,7 @@ scripts/
   train_tokenizer.py        # Train BPE tokenizer on TinyStories
   pad_model.py              # Lossless FFN zero-padding expansion (v6/v7 binary)
   erc_transfer_test.py      # ERC vs baseline transfer test (6 arms, core-only metrics)
+  diagnose_v8_reg.py        # Outlier magnitude distribution of a checkpoint (Exp 11)
 
 ternary_llm/
   quantization.py           # STE + Stochastic Bit-Flip autograd functions, pack/unpack
