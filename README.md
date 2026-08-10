@@ -163,7 +163,7 @@ v8 upgrades the v7 side channel: instead of a dense **sign bit** per outlier, th
 
 Torch reference confirms the same direction (tinydata window, logit scale 1.0): v7 6.1760 vs v8 6.2894 (+0.113).
 
-**Verdict: as a pure export-time representation, v8 regresses trained models.** Every k is worse than v7 (+0.13…+0.36 nats at 10K positions; gap stable at +0.15 over 40K). The earlier 256-position smoke reading (9.3458 vs 9.3627, −0.017) was sampling noise on a 30-step checkpoint. Trained weights are calibrated to the ±2 clamp they saw during STE training — mean true outlier value is 1.83 < 2.0 — so replacing ±2 at inference is a distribution shift. **Exp 10 closes the gap**: training with the v8 dequant (`--v8-forward`) then exporting v8 beats the v7 baseline by −0.017/−0.020 nats on two independent 40K windows, and the same model read as v7 (clamp ±2) loses +0.10 — each representation is only as good as the training it was calibrated for.
+**Verdict: as a pure export-time representation, v8 regresses trained models.** Every k is worse than v7 (+0.13…+0.36 nats at 10K positions; gap stable at +0.15 over 40K). The earlier 256-position smoke reading (9.3458 vs 9.3627, −0.017) was sampling noise on a 30-step checkpoint. Trained weights are calibrated to the ±2 clamp they saw during STE training — mean true outlier value is 1.83 < 2.0 — so replacing ±2 at inference is a distribution shift. **Exp 10 closes the gap**: training with the v8 dequant (`--v8-forward`) then exporting v8 beats the v7 baseline by −0.017/−0.020 nats on two independent 40K windows, and the same model read as v7 (clamp ±2) loses +0.10 — each representation is only as good as the training it was calibrated for. (Exp 11 tried to amplify the channel by forcing outlier magnitudes to ≥2.0; it regressed the model monotonically in strength — the ~1.8 mean outlier magnitude is the learned optimum, not wasted resolution.)
 
 ## Vulkan Compute Engine (`inference/vulkan/`)
 
@@ -1229,6 +1229,46 @@ python inference/export_model.py checkpoints_exp10_v8f/checkpoint_000300.pt -o e
 cd inference && build.bat avx2 && cd ..
 inference/selflearn_avx2.exe --eval exp10_v8.bin examples/discrete/sliceEval100k.bin 40000
 ```
+
+## Experiment: Outlier-Band Regularization (v8-reg, Exp 11) — rejected
+
+Exp 10 left the true-value channel exploited only slightly (−0.02 nats), and the
+measured outlier magnitudes sat mostly in the 1.5–2.0 "linger band" right above the
+threshold — 83.8% of outliers, mean |W/Δ| = 1.80. Hypothesis: those values waste the
+1/32-resolution blob, so forcing them to a target magnitude should let the channel
+carry more information. Implemented as a penalty (mean over outliers of
+`max(0, target − |W/Δ|)²`, Δ detached, same v8 mask; `train.py --v8-reg LAMBDA
+--v8-reg-target T`, STE only). Two strengths run at 300 steps, seed 1:
+
+| Run | final train CE | sliceEval100k @40K (v8) | tinydata @1M @40K (v8) |
+|---|---|---|---|
+| exp10 v8-forward (no reg) | 5.7995 | 5.7404 | 5.8578 |
+| exp11 reg λ=10, target 2.0 | 5.9127 | 5.8454 (+0.105) | 5.9533 (+0.096) |
+| exp11 reg λ=40, target 2.0 | 6.0401 | 5.9549 (+0.215) | 6.0757 (+0.218) |
+
+The penalty did exactly what it was designed to do — measured outlier distribution at
+step 300 (`scripts/diagnose_v8_reg.py`):
+
+| Checkpoint | outlier % | mean \|W/Δ\| | in (1.5, 2.0) | ≥ 2.0 | max |
+|---|---|---|---|---|---|
+| exp9 / exp10 (unregularized) | 24.1% | 1.80 | 83.8% | 16.2% | 4.3 |
+| exp11 λ=10 | 26.5% | 2.05 | 20.7% | 79.3% | 3.6 |
+| exp11 λ=40 | 26.7% | 2.05 | 9.4% | 90.6% | 3.3 |
+
+And every forced shift made the model worse, monotonically in λ, at both train time
+(+0.11/+0.24 CE) and inference (+0.10/+0.21 nats on both windows; the gap to the v7
+reading also grows — the model leans even harder on true values, yet the absolute CE
+degrades).
+
+**Verdict: rejected.** The 1.5–2.0 band is the model's *learned optimum*, not wasted
+headroom: at |W/Δ| ≈ 1.8 the blob's ±1/32 step is already ±0.9% relative error, and the
+CE loss had 300 steps of free choice over magnitudes — the unregularized exp10 model
+already picked its favorite scale. Forcing magnitudes up constrains the weight space
+and costs capacity. The true-value channel gains its small win not from bigger
+outliers but from the model being allowed to use whatever magnitude it wants; the
+flags `--v8-reg` / `--v8-reg-target` remain in `train.py` for completeness but are
+documented as a failed experiment. `scripts/diagnose_v8_reg.py` reports the outlier
+magnitude distribution of any checkpoint.
 
 ## Experiment: ERC — Echo Residual Committer (STE continual learning)
 

@@ -15,6 +15,7 @@ import os
 import json
 import time
 import math
+from typing import Optional
 
 _HAS_PSUTIL = False
 try:
@@ -424,9 +425,11 @@ class TernaryTrainer:
         _, loss, _ = self.model(x, y, activation_dtype=self.activation_dtype)
         t1 = time.perf_counter()
 
+        raw_loss = loss.item()
         if self.config.ortho_reg > 0:
             loss = loss + self.config.ortho_reg * self._ortho_penalty()
-        raw_loss = loss.item()
+        if getattr(self.config, "v8_reg", 0.0) > 0:
+            loss = loss + self.config.v8_reg * self._v8_reg_penalty()
         if not math.isfinite(raw_loss):
             self.model.zero_grad(set_to_none=True)
             return raw_loss
@@ -506,6 +509,43 @@ class TernaryTrainer:
             g = rows @ rows.T
             off = torch.triu(g, diagonal=1)
             term = (off.abs().clamp_min(margin) - margin).mean()
+            total = term if total is None else total + term
+            count += 1
+        return total / max(count, 1) if total is not None else torch.zeros((), device=self.device)
+
+    def _v8_reg_penalty(self, target: Optional[float] = None) -> torch.Tensor:
+        """Pull v8 outlier magnitudes out of the 1.5-2.0 linger band (Exp 11).
+
+        Penalty, mean over outliers across all ternary matrices:
+            max(0, target - |W/Delta|)^2
+        with Delta computed exactly like the quantizer (scale x mean|W|, or
+        rowmean under per-channel) and detached — same STE convention as the
+        FusedTernaryLinear backward, which ignores d(Delta)/dW. Outliers are
+        |W/Delta| > 1.5, matching the v8 mask; the penalty is nonzero only
+        while an outlier sits between the threshold and the target, so values
+        already above target (or in the ternary core) cost nothing. Net
+        effect: the 1/32-resolution true-value channel carries real magnitude
+        instead of barely-outlier values that round to ~1.6-1.9.
+        """
+        if target is None:
+            target = getattr(self.config, "v8_reg_target", 2.0)
+        total = None
+        count = 0
+        for name, p in self.model.named_parameters():
+            if "latent_weights" not in name or p.ndim != 2:
+                continue
+            if getattr(self.config, "per_channel", False):
+                delta = (p.abs().mean(dim=1, keepdim=True).clamp(min=1e-6)
+                         * self.config.ternary_scale).detach()
+            else:
+                delta = (p.abs().mean().clamp(min=1e-6)
+                         * self.config.ternary_scale).detach()
+            x_n = p / delta
+            mag = x_n.abs()
+            mask = mag > 1.5
+            n_out = mask.to(x_n.dtype).sum().clamp_min(1.0)
+            pull = (torch.tensor(target, dtype=x_n.dtype, device=x_n.device) - mag).clamp_min(0)
+            term = ((pull * mask.to(x_n.dtype)).pow(2)).sum() / n_out
             total = term if total is None else total + term
             count += 1
         return total / max(count, 1) if total is not None else torch.zeros((), device=self.device)
