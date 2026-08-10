@@ -205,7 +205,8 @@ class FusedTernaryLinear(torch.autograd.Function):
                 group_size: int = 0,
                 gamma: Optional[float] = None,
                 v8_forward: bool = False,
-                lq_levels: Optional[torch.Tensor] = None) -> torch.Tensor:
+                lq_levels: Optional[torch.Tensor] = None,
+                stochastic_round: bool = False) -> torch.Tensor:
         if per_channel:
             delta = latent_weights.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * scale
         else:
@@ -242,6 +243,17 @@ class FusedTernaryLinear(torch.autograd.Function):
             core = x_n.round().clamp(-1, 1)
             true_vals = (x_n * 32.0).round().clamp(-127.0, 127.0) / 32.0
             w_ternary = torch.where(mask, true_vals, core)
+        elif stochastic_round:
+            # Exp 13 SR: unbiased stochastic rounding — each weight rounds up
+            # with probability equal to its fractional part, so
+            # E[Q(x)] = clamp(x, -2, 2) exactly. The STE gradient is unbiased
+            # by construction (derivative of the expectation is 1), and eval /
+            # export switch to deterministic round (this branch only fires
+            # while training — TernaryLinear gates it on self.training).
+            xc = x_n.clamp(-2.0, 2.0)
+            lo = xc.floor()
+            up = torch.rand_like(xc) < (xc - lo)
+            w_ternary = torch.where(up, lo + 1.0, lo)
         else:
             w_ternary = x_n.round().clamp(-2, 2)
         w_ternary = w_ternary.to(x.dtype)
@@ -341,7 +353,7 @@ class FusedTernaryLinear(torch.autograd.Function):
             idx = lq_idx.reshape(-1)
             grad_l = torch.stack([(g * (idx == k).to(g.dtype)).sum() for k in range(5)])
             grad_lq = torch.stack([grad_l[3] - grad_l[1], grad_l[4] - grad_l[0]])
-        return grad_x, grad_w.float(), None, None, grad_alpha, None, None, None, grad_lq
+        return grad_x, grad_w.float(), None, None, grad_alpha, None, None, None, grad_lq, None
 
 
 def ternary_quantize(weights: torch.Tensor) -> torch.Tensor:

@@ -82,6 +82,9 @@ class TernaryLinear(nn.Module):
         # parameter only exists for LQ runs.
         self.lq_enabled: bool = False
         self.lq_levels: nn.Parameter | None = None
+        # Exp 13 SR: unbiased stochastic rounding during training only
+        # (eval/export stay deterministic). Set via set_sr().
+        self.sr_enabled: bool = False
 
         # Latent weights (FP32) - shadow weights for gradient updates
         self.latent_weights = nn.Parameter(
@@ -127,6 +130,7 @@ class TernaryLinear(nn.Module):
             x, self.latent_weights, self.ternary_scale, self.per_channel,
             self.alphas, self.group_size, self.soft_gamma, self.v8_forward,
             self.lq_levels if self.lq_enabled else None,
+            self.sr_enabled and self.training,
         )
         if self.bias is not None:
             output = output + self.bias
@@ -156,6 +160,15 @@ class TernaryLinear(nn.Module):
         else:
             self.lq_enabled = False
             self.lq_levels = None
+
+    def set_sr(self, enabled: bool) -> None:
+        """Exp 13 SR: unbiased stochastic rounding during training only.
+
+        Forward rounds up with probability = fractional part of clamp(W/Δ),
+        so E[Q] = clamp(W/Δ, ±2) exactly. Eval/export are deterministic
+        (gated on self.training in forward).
+        """
+        self.sr_enabled = enabled
 
     def get_ternary_weights(self) -> torch.Tensor:
         """Get quantized ternary weights for deployment."""

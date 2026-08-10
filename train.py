@@ -157,6 +157,10 @@ def main():
                         help="[STE] Exp 12: learned symmetric 5-level codebook per matrix "
                              "{-b, -a, 0, a, b} instead of fixed {-2,-1,0,1,2} (a,b trainable, "
                              "init 1.0/2.0; 2-bit packing unchanged)")
+    parser.add_argument("--sr", action="store_true",
+                        help="[STE] Exp 13: unbiased stochastic rounding during training "
+                             "(round up with prob = fractional part of clamp(W/Δ), E[Q]=clamp; "
+                             "eval/export stay deterministic)")
     parser.add_argument("--init", type=str, default="kaiming", choices=["kaiming", "balanced"],
                         help="[STE] Latent init: kaiming (default) or balanced 33/33/33 ternary (anti rank-collapse)")
     parser.add_argument("--ortho-reg", type=float, default=0.0, metavar="LAMBDA",
@@ -333,6 +337,12 @@ def main():
                      "fixed-level quantizer)")
     if args.lq and args.erc:
         parser.error("--lq and --erc are mutually exclusive (ERCLinear has no LQ path yet)")
+    config.sr = args.sr
+    if args.sr and (args.lq or args.v8_forward or args.soft_quant_gamma):
+        parser.error("--sr is exclusive with --lq / --v8-forward / --soft-quant-gamma "
+                     "(isolate the quantizer variable)")
+    if args.sr and args.erc:
+        parser.error("--sr and --erc are mutually exclusive (ERCLinear has no SR path yet)")
     config.ortho_reg = args.ortho_reg
     config.rank_monitor_interval = args.rank_monitor_interval
     config.rank_halt = args.rank_halt
@@ -520,6 +530,13 @@ def main():
                 m.set_lq(True)
                 n_lq += 1
         print(f"Exp 12 LQ: learned 5-level codebook on {n_lq:,} linear layers (levels trainable)")
+    if args.sr:
+        n_sr = 0
+        for m in model.modules():
+            if hasattr(m, "set_sr"):
+                m.set_sr(True)
+                n_sr += 1
+        print(f"Exp 13 SR: unbiased stochastic rounding on {n_sr:,} linear layers (train only)")
     if is_stochastic and args.flip_ungated:
         from ternary_llm.layers import StochasticTernaryLinear
         n_gated = 0

@@ -1,8 +1,8 @@
-# Tetra — Experimental Log (Exp 1–12)
+# Tetra — Experimental Log (Exp 1–13)
 
 Chronological record of the experiment series, one section per experiment
 (hypothesis → setup → results → verdict → reproduce). Sections are ordered
-Exp 1 → Exp 12; the README "Experiments (Exp 1–11)" section links back here.
+Exp 1 → Exp 13; the README "Experiments (Exp 1–11)" section links back here.
 
 1. **Exp 1** — Surprise-Gated Bit Flips
 2. **Exp 2** — Continual Learning & Catastrophic Forgetting
@@ -16,6 +16,7 @@ Exp 1 → Exp 12; the README "Experiments (Exp 1–11)" section links back here.
 10. **Exp 10** — True-Value Outlier Training (v8-forward)
 11. **Exp 11** — Outlier-Band Regularization (v8-reg, rejected)
 12. **Exp 12** — Learned 5-Level Codebook (LQ, null result)
+13. **Exp 13** — Unbiased Stochastic Rounding (SR, rejected)
 
 ---
 
@@ -741,3 +742,41 @@ Readings (honest):
 optimal.** `--lq` remains in `train.py` (documented failed experiment, export guard
 stays). `tests/eval_ckpt_ce.py` (added here) evaluates any STE checkpoint on a token
 window directly, without export — the tool used for the LQ numbers.
+
+## Experiment: Unbiased Stochastic Rounding (SR, Exp 13) — rejected
+
+Question: deterministic `round(W/Δ)` has a per-element bias (a weight at 1.4 always
+quantizes to 1), and STE keeps that bias in the gradient. Standard low-precision
+training (FP8) removes it with **stochastic rounding**: round up with probability equal
+to the fractional part, so E[Q(x)] = clamp(x, −2, 2) exactly and the STE gradient is
+unbiased by construction. Tested as the last training-side quantizer algorithm
+(`--sr`, train-only — eval/export stay deterministic; verified: E[Q] = clamp(x) within
+0.007 over 2000 samples, eval forward bit-identical to the fixed path).
+
+Setup: same as Exp 9–12 (tiny, 300 steps, tinydata, ternary-scale 1.0, seed 1) + `--sr`.
+
+| Run | final train CE | sliceEval100k @39.6K (torch) | tinydata @1M @39.6K (torch) |
+|---|---|---|---|
+| exp9 baseline (deterministic round) | 5.8138 | 5.8421 | 5.9766 |
+| exp13 SR (unbiased stochastic) | 6.2098 (+0.396) | 6.1788 (+0.337) | 6.3166 (+0.340) |
+
+Readings (honest):
+
+- **Unbiasedness is not free: single-sample variance.** Q(x) has variance p(1−p) with
+  p = fractional part — up to 0.25, i.e. a *quarter of a level* in the 1.0-spaced ternary
+  grid. The optimizer sees one noisy forward per step, and 300 steps cannot amortize
+  that noise: the model converges to a worse point (train +0.40, eval +0.34, both
+  windows agree).
+- **Why FP8 SR works but 2-bit SR does not**: SR's variance is fixed in *absolute* units
+  (≤0.25) while its benefit (bias removal) scales with resolution — at 8-bit the step is
+  1/256 of the range, so the variance-to-signal ratio is tiny; at 2-bit the step is 25%
+  of the range, so the bias the deterministic quantizer carries is *smaller* than the
+  variance SR would inject to remove it. The deterministic bias is also what the
+  STE-trained weights are calibrated against (Exp 10–12: magnitudes and levels are
+  already at their learned optimum).
+
+**Verdict: rejected — at 2-bit resolution, unbiasedness costs more variance than the
+bias is worth.** This closes the quantizer-algorithm line: representation capacity
+(Exp 11/12), level placement (Exp 12), and rounding bias (Exp 13) are all already
+near-optimal; the binding constraint at this scale is the training budget itself.
+`--sr` remains in `train.py` (documented failed experiment).
