@@ -153,6 +153,10 @@ def main():
     parser.add_argument("--v8-reg-target", type=float, default=2.0, metavar="T",
                         help="[STE] Exp 11: magnitude target for the v8 outlier regularization "
                              "(default: 2.0 — just above the 1.5 outlier threshold)")
+    parser.add_argument("--lq", action="store_true",
+                        help="[STE] Exp 12: learned symmetric 5-level codebook per matrix "
+                             "{-b, -a, 0, a, b} instead of fixed {-2,-1,0,1,2} (a,b trainable, "
+                             "init 1.0/2.0; 2-bit packing unchanged)")
     parser.add_argument("--init", type=str, default="kaiming", choices=["kaiming", "balanced"],
                         help="[STE] Latent init: kaiming (default) or balanced 33/33/33 ternary (anti rank-collapse)")
     parser.add_argument("--ortho-reg", type=float, default=0.0, metavar="LAMBDA",
@@ -320,6 +324,15 @@ def main():
     if args.v8_reg > 0 and not args.v8_forward:
         parser.error("--v8-reg requires --v8-forward (the outlier band only exists in "
                      "true-value dequant training)")
+    config.lq = args.lq
+    if args.lq and args.v8_forward:
+        parser.error("--lq and --v8-forward are mutually exclusive (LQ replaces the "
+                     "fixed-level quantizer)")
+    if args.lq and args.soft_quant_gamma:
+        parser.error("--lq and --soft-quant-gamma are mutually exclusive (LQ replaces the "
+                     "fixed-level quantizer)")
+    if args.lq and args.erc:
+        parser.error("--lq and --erc are mutually exclusive (ERCLinear has no LQ path yet)")
     config.ortho_reg = args.ortho_reg
     config.rank_monitor_interval = args.rank_monitor_interval
     config.rank_halt = args.rank_halt
@@ -500,6 +513,13 @@ def main():
         print("Exp 10 v8-forward: outliers dequantize to true latent values during training")
     if config.v8_reg > 0:
         print(f"Exp 11 v8 outlier-band reg: lambda={config.v8_reg} target=|W/delta|>={config.v8_reg_target}")
+    if args.lq:
+        n_lq = 0
+        for m in model.modules():
+            if hasattr(m, "set_lq"):
+                m.set_lq(True)
+                n_lq += 1
+        print(f"Exp 12 LQ: learned 5-level codebook on {n_lq:,} linear layers (levels trainable)")
     if is_stochastic and args.flip_ungated:
         from ternary_llm.layers import StochasticTernaryLinear
         n_gated = 0

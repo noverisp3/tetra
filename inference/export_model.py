@@ -919,6 +919,10 @@ Examples:
         parser.error("--v8 is STE-only (true-value outliers come from the STE latent "
                      f"distribution; this checkpoint is mode={mode})")
 
+    if config.get("lq", False):
+        parser.error("LQ checkpoints (Exp 12: learned 5-level codebooks) are not exportable "
+                     "yet — the binary format has no per-matrix level table")
+
     # ERC: full-carry the residual into the latent core before export so the
     # binary is a plain 2-bit ternary model (no residual side path).
     if args.commit_erc or any(k.endswith(".residual") for k in sd):

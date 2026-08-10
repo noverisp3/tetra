@@ -77,6 +77,11 @@ class TernaryLinear(nn.Module):
         # (round((W/Δ)·32)/32) instead of the clamp at ±2, matching the v8
         # inference representation during training.
         self.v8_forward: bool = False
+        # Exp 12 LQ: learned symmetric 5-level codebook {-b, -a, 0, a, b} per
+        # matrix (a, b trainable, init 1.0/2.0). Set via set_lq() so the
+        # parameter only exists for LQ runs.
+        self.lq_enabled: bool = False
+        self.lq_levels: nn.Parameter | None = None
 
         # Latent weights (FP32) - shadow weights for gradient updates
         self.latent_weights = nn.Parameter(
@@ -121,6 +126,7 @@ class TernaryLinear(nn.Module):
         output = FusedTernaryLinear.apply(
             x, self.latent_weights, self.ternary_scale, self.per_channel,
             self.alphas, self.group_size, self.soft_gamma, self.v8_forward,
+            self.lq_levels if self.lq_enabled else None,
         )
         if self.bias is not None:
             output = output + self.bias
@@ -136,6 +142,20 @@ class TernaryLinear(nn.Module):
     def set_v8_forward(self, enabled: bool) -> None:
         """Exp 10: toggle true-value outlier dequant in the forward pass."""
         self.v8_forward = enabled
+
+    def set_lq(self, enabled: bool) -> None:
+        """Exp 12 LQ: learned symmetric 5-level codebook per matrix.
+
+        Init a=1.0, b=2.0 (Δ units) so the first forward is identical to the
+        fixed-level path; the levels then train freely.
+        """
+        if enabled:
+            if not self.lq_enabled or self.lq_levels is None:
+                self.lq_levels = nn.Parameter(torch.tensor([1.0, 2.0]))
+            self.lq_enabled = True
+        else:
+            self.lq_enabled = False
+            self.lq_levels = None
 
     def get_ternary_weights(self) -> torch.Tensor:
         """Get quantized ternary weights for deployment."""

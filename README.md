@@ -16,7 +16,7 @@ Plus **Multi-head Latent Attention (MLA)** — DeepSeek-V2-style KV compression 
 
 ## Experiments
 
-Experiments Series (Exp 1–11) — see [`EXPERIMENTS.md`](EXPERIMENTS.md).
+Experiments Series (Exp 1–12) — see [`EXPERIMENTS.md`](EXPERIMENTS.md).
 
 ## Architecture
 

@@ -1,8 +1,8 @@
-# Tetra — Experimental Log (Exp 1–11)
+# Tetra — Experimental Log (Exp 1–12)
 
 Chronological record of the experiment series, one section per experiment
 (hypothesis → setup → results → verdict → reproduce). Sections are ordered
-Exp 1 → Exp 11; the README "Experiments (Exp 1–11)" section links back here.
+Exp 1 → Exp 12; the README "Experiments (Exp 1–11)" section links back here.
 
 1. **Exp 1** — Surprise-Gated Bit Flips
 2. **Exp 2** — Continual Learning & Catastrophic Forgetting
@@ -15,6 +15,7 @@ Exp 1 → Exp 11; the README "Experiments (Exp 1–11)" section links back here.
 9. **Exp 9** — Ternary-Scale Tuning
 10. **Exp 10** — True-Value Outlier Training (v8-forward)
 11. **Exp 11** — Outlier-Band Regularization (v8-reg, rejected)
+12. **Exp 12** — Learned 5-Level Codebook (LQ, null result)
 
 ---
 
@@ -699,3 +700,44 @@ outliers but from the model being allowed to use whatever magnitude it wants; th
 flags `--v8-reg` / `--v8-reg-target` remain in `train.py` for completeness but are
 documented as a failed experiment. `scripts/diagnose_v8_reg.py` reports the outlier
 magnitude distribution of any checkpoint.
+
+## Experiment: Learned 5-Level Codebook (LQ, Exp 12) — null result
+
+Question: the 2-bit format is fixed to levels {-2, -1, 0, +1, +2}·Δ. Exp 10/11 showed the
+outlier *magnitudes* are a learned optimum, but the *code values themselves* are the
+last non-learnable part of the representation. If each matrix could choose its own
+levels, the model should fit better with zero extra binary cost (5 floats per matrix vs
+6.3M packed weights). Implemented as a symmetric codebook {−b, −a, 0, a, b} per matrix
+(`--lq`, STE only; a, b trainable, init 1.0/2.0 — bit-exact parity with the fixed path
+at step 0). Assignment = nearest code with detached index (STE on the latent weights
+unchanged); code values train in backward by accumulating the STE gradient per code
+(finite-difference verified). Export is refused (`export_model.py` guard — the binary
+format has no per-matrix level table yet).
+
+Setup: same as Exp 9/10 (tiny, 300 steps, tinydata, ternary-scale 1.0, seed 1) + `--lq`.
+
+| Run | final train CE | sliceEval100k @39.6K (torch) | tinydata @1M @39.6K (torch) |
+|---|---|---|---|
+| exp9 baseline (fixed levels) | 5.8138 | 5.8421 | 5.9766 |
+| exp12 LQ (learned levels) | 5.8671 (+0.053) | 5.8749 (+0.033) | 6.0195 (+0.043) |
+
+Converged code values (all 36 matrices): a ∈ [0.886, 1.006] (mean 0.983), b ∈ [1.938,
+2.066] (mean 1.976).
+
+Readings (honest):
+
+- **The learnable levels do not move.** After 300 steps of free access to level
+  positions, every matrix keeps them within 2–6% of the fixed values. The fixed
+  {-2,-1,0,1,2} placement was already the optimum of the STE-trained weight
+  distribution — the same conclusion as Exp 11 from the other side: the 5-level
+  representation itself is well-tuned, and it is the *training* that is the binding
+  constraint, not the code values.
+- **The small drift that does occur costs CE** (+0.03/+0.04 eval, +0.05 train): free
+  capacity here is noise, not signal, at this scale.
+- Cost: the per-code backward (5 masked sums per matrix) roughly **doubles training
+  time on DML** (23 min vs ~12 min for 300 steps).
+
+**Verdict: null result — learned code values do not help; the fixed levels were already
+optimal.** `--lq` remains in `train.py` (documented failed experiment, export guard
+stays). `tests/eval_ckpt_ce.py` (added here) evaluates any STE checkpoint on a token
+window directly, without export — the tool used for the LQ numbers.

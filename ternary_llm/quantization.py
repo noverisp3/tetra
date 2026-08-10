@@ -187,6 +187,15 @@ class FusedTernaryLinear(torch.autograd.Function):
     round((W/Delta)*32)/32, exactly the format-v8 int8 blob — instead of the
     clamp at +-2. Makes training consistent with the v8 inference
     representation (the model can exploit real outlier magnitude).
+
+    LQ (``lq_levels`` not None, Exp 12): instead of fixed levels {-2,-1,0,1,2}
+    the matrix owns a learned symmetric codebook {-b, -a, 0, a, b} in
+    x_n = W/Delta units (a, b trainable, init 1.0/2.0 = the fixed path).
+    Assignment is nearest code with a detached index (STE on the latent
+    weights, as usual); the code values train through the backward
+    per-code accumulation of the STE gradient. The 2-bit packing / v7-v8
+    format is untouched — only the code VALUES move. Export of LQ
+    checkpoints is not implemented yet (export_model.py refuses them).
     """
 
     @staticmethod
@@ -195,7 +204,8 @@ class FusedTernaryLinear(torch.autograd.Function):
                 alphas: Optional[torch.Tensor] = None,
                 group_size: int = 0,
                 gamma: Optional[float] = None,
-                v8_forward: bool = False) -> torch.Tensor:
+                v8_forward: bool = False,
+                lq_levels: Optional[torch.Tensor] = None) -> torch.Tensor:
         if per_channel:
             delta = latent_weights.abs().mean(dim=1, keepdim=True).clamp(min=1e-6) * scale
         else:
@@ -203,6 +213,7 @@ class FusedTernaryLinear(torch.autograd.Function):
         # |W| > 1.5Δ promotes to an outlier (±2, code 11 in the 2-bit format);
         # the learned per-group alpha scales it to ±2α at inference time.
         x_n = latent_weights / delta
+        lq_idx = None
         if gamma is not None and gamma > 0:
             # Sum of shifted sigmoids: dead zone around 0, 5-level boundaries
             # at ±0.5 and ±1.5, converges to round(x) as γ -> ∞.
@@ -212,6 +223,17 @@ class FusedTernaryLinear(torch.autograd.Function):
                          + torch.sigmoid(gx + 0.5 * gamma)
                          + torch.sigmoid(gx - 0.5 * gamma)
                          + torch.sigmoid(gx - 1.5 * gamma))
+        elif lq_levels is not None:
+            # Exp 12 LQ: learned symmetric codebook {-b, -a, 0, a, b}.
+            # Nearest-code assignment with detached index (STE on latent
+            # weights); code values train in backward via per-code sums.
+            with torch.no_grad():
+                l = torch.stack([-lq_levels[1], -lq_levels[0],
+                                 torch.zeros_like(lq_levels[0]),
+                                 lq_levels[0], lq_levels[1]])
+                dist = (x_n.unsqueeze(-1) - l).abs()
+                lq_idx = dist.argmin(-1)
+                w_ternary = l[lq_idx]
         elif v8_forward:
             # Exp 10: true-value outliers — code 11 positions keep their
             # latent magnitude quantized at 1/32 level (exactly the v8 blob
@@ -225,12 +247,14 @@ class FusedTernaryLinear(torch.autograd.Function):
         w_ternary = w_ternary.to(x.dtype)
         ctx.save_for_backward(x, w_ternary.detach(),
                               alphas.detach() if alphas is not None else alphas,
-                              x_n.detach() if gamma is not None and gamma > 0 else x_n)
+                              x_n.detach() if gamma is not None and gamma > 0 else x_n,
+                              lq_idx)
         ctx.group_size = group_size
         ctx.gamma = gamma
         ctx.delta = delta.detach()
         ctx.per_channel = per_channel
         ctx.scale = scale
+        ctx.lq = lq_levels is not None
         if alphas is not None and group_size > 0:
             in_features = x.size(-1)
             num_groups = (in_features + group_size - 1) // group_size
@@ -246,7 +270,7 @@ class FusedTernaryLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x, w_ternary, alphas, x_n = ctx.saved_tensors
+        x, w_ternary, alphas, x_n, lq_idx = ctx.saved_tensors
         w_ternary = w_ternary.to(grad_output.dtype)
         x = x.to(grad_output.dtype)
         in_features = x.size(-1)
@@ -307,7 +331,17 @@ class FusedTernaryLinear(torch.autograd.Function):
             else:
                 grad_delta = -((d_xn * x_n).sum() / ctx.delta)
                 grad_w = d_xn / ctx.delta + grad_delta * (ctx.scale / x_n.numel()) * torch.sign(x_n)
-        return grad_x, grad_w.float(), None, None, grad_alpha, None, None, None
+        grad_lq = None
+        if ctx.lq and lq_idx is not None:
+            # Exp 12 LQ: code values train from the STE weight gradient
+            # accumulated per code. l = [-b, -a, 0, a, b], so
+            # grad_a = grad_l[3] - grad_l[1], grad_b = grad_l[4] - grad_l[0].
+            # Masked sums (elementwise only — DML lacks int64 scatter_add).
+            g = grad_w.reshape(-1)
+            idx = lq_idx.reshape(-1)
+            grad_l = torch.stack([(g * (idx == k).to(g.dtype)).sum() for k in range(5)])
+            grad_lq = torch.stack([grad_l[3] - grad_l[1], grad_l[4] - grad_l[0]])
+        return grad_x, grad_w.float(), None, None, grad_alpha, None, None, None, grad_lq
 
 
 def ternary_quantize(weights: torch.Tensor) -> torch.Tensor:
