@@ -27,9 +27,10 @@ static std::vector<int> parse_tokens(const char* str) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <model.bin> <token_ids> [max_new_tokens] [temperature] [top_k] [top_p] [repeat_penalty]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.bin> <token_ids> [max_new_tokens] [temperature] [top_k] [top_p] [repeat_penalty] [--kv-int8]\n", argv[0]);
         fprintf(stderr, "  max_new_tokens=0: dump logits (no generation)\n");
         fprintf(stderr, "  repeat_penalty: >1.0 penalizes repeated tokens (default: 1.0 = disabled)\n");
+        fprintf(stderr, "  --kv-int8 (9th arg): int8 KV cache (half RAM, small accuracy cost)\n");
         fprintf(stderr, "  Special tokens: 1=BOS, 2=EOS (auto-stops on EOS)\n");
         return 1;
     }
@@ -41,6 +42,7 @@ int main(int argc, char** argv) {
     int top_k = (argc > 5) ? atoi(argv[5]) : 50;
     float top_p = (argc > 6) ? atof(argv[6]) : 0.9f;
     float repeat_penalty = (argc > 7) ? atof(argv[7]) : 1.0f;
+    bool kv_int8 = (argc > 8 && strcmp(argv[8], "--kv-int8") == 0);
 
     auto t0 = std::chrono::high_resolution_clock::now();
     tetra::Model model = tetra::load_model(model_path);
@@ -50,7 +52,8 @@ int main(int argc, char** argv) {
 
     tetra::KVCache cache;
     cache.init(model.header.num_layers, model.header.max_seq_len, model.header.hidden_dim,
-               model.is_mla, model.kv_latent_dim, model.rope_dim);
+               model.header.num_heads, model.is_mla, model.kv_latent_dim,
+               model.rope_dim, kv_int8);
 
     fprintf(stderr, "Prompt tokens: ");
     for (int t : tokens) fprintf(stderr, "%d ", t);

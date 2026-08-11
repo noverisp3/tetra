@@ -165,10 +165,12 @@ int main(int argc, char** argv) {
     // --compare-lmhead to measure the Top-1/Top-5 prediction divergence.
     if (argc >= 4 && strcmp(argv[1], "--eval") == 0) {
         bool fast_lmhead = false;
+        bool kv_int8 = false;
         float scale_override = 0.0f;
         int pos_arg = 4;
         for (int i = 4; i < argc; i++) {
             if (strcmp(argv[i], "--fast-lmhead") == 0) fast_lmhead = true;
+            else if (strcmp(argv[i], "--kv-int8") == 0) kv_int8 = true;
             else if (strcmp(argv[i], "--sl-logit-scale") == 0 && i + 1 < argc) {
                 scale_override = (float)atof(argv[i + 1]);
                 i++;
@@ -194,7 +196,8 @@ int main(int argc, char** argv) {
         const float scale = scale_override > 0.0f ? scale_override : model.sl_logit_scale;
         KVCache cache;
         cache.init(model.header.num_layers, model.header.max_seq_len, H,
-                   model.is_mla, model.kv_latent_dim, model.rope_dim);
+                   model.header.num_heads, model.is_mla, model.kv_latent_dim,
+                   model.rope_dim, kv_int8);
 
         std::vector<float> softmax_buf(V);
         double loss = 0.0;
@@ -242,6 +245,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Compare lm_head FP32 vs INT8: %zu positions\n", limit);
         if (limit == 0) { fprintf(stderr, "No tokens\n"); return 1; }
 
+        bool kv_int8 = false;
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "--kv-int8") == 0) kv_int8 = true;
+        }
+
         const int H = model.header.hidden_dim;
         const int V = model.header.vocab_size;
         const float scale = model.sl_logit_scale;
@@ -265,7 +273,8 @@ int main(int argc, char** argv) {
                             std::vector<float>* ce_out) {
             KVCache cache;
             cache.init(model.header.num_layers, model.header.max_seq_len, H,
-                       model.is_mla, model.kv_latent_dim, model.rope_dim);
+                       model.header.num_heads, model.is_mla, model.kv_latent_dim,
+                       model.rope_dim, kv_int8);
             for (size_t t = 0; t < limit; t++) {
                 if (t > 0 && t % (size_t)model.header.max_seq_len == 0) cache.clear();
                 std::vector<float> logits = forward(model, {tokens[t]}, cache, nullptr);
@@ -478,6 +487,12 @@ int main(int argc, char** argv) {
             scale_override = (float)atof(argv[i + 1]);
         }
     }
+    // --kv-int8: store the KV cache as int8 (symmetric per-row scale),
+    // halving cache RAM at a small accuracy cost.
+    bool kv_int8 = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--kv-int8") == 0) kv_int8 = true;
+    }
 
     auto t0 = std::chrono::high_resolution_clock::now();
     Model model = load_model(model_path);
@@ -548,7 +563,8 @@ int main(int argc, char** argv) {
         auto ts = std::chrono::high_resolution_clock::now();
         KVCache cache;
         cache.init(model.header.num_layers, model.header.max_seq_len, H,
-                   model.is_mla, model.kv_latent_dim, model.rope_dim);
+                   model.header.num_heads, model.is_mla, model.kv_latent_dim,
+                   model.rope_dim, kv_int8);
 
         // Reset per-block gradients.
         names.clear();
