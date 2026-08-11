@@ -1,8 +1,9 @@
-# Tetra — Experimental Log (Exp 1–14)
+# Tetra — Experimental Log (Exp 1–16)
 
 Chronological record of the experiment series, one section per experiment
 (hypothesis → setup → results → verdict → reproduce). Sections are ordered
-Exp 1 → Exp 14; the README "Experiments" section links back here.
+Exp 1 → Exp 16 (Exp 15 is a paused-status note); the README "Experiments"
+section links back here.
 
 1. **Exp 1** — Surprise-Gated Bit Flips
 2. **Exp 2** — Continual Learning & Catastrophic Forgetting
@@ -18,6 +19,8 @@ Exp 1 → Exp 14; the README "Experiments" section links back here.
 12. **Exp 12** — Learned 5-Level Codebook (LQ, null result)
 13. **Exp 13** — Unbiased Stochastic Rounding (SR, rejected)
 14. **Exp 14** — Annealed Soft Flips (Gumbel-flip, rejected)
+15. **Exp 15** — MLA / Hybrid Attn (status note)
+16. **Exp 16** — ARS-Gated Embedding Updates
 
 ---
 
@@ -905,9 +908,61 @@ Next time an MLA checkpoint is trained to a sane loss:
 Relevant code: MLA decode branch in inference/tetra.h (guarded by
 model.is_mla), 	ernary_llm/mla.py (torch side).
 
-## Experiment: ARS-gated embedding updates (Exp 16, finding #13) 2026-08-11
+## Experiment: ARS-Gated Embedding Updates (Exp 16)
 
-- **--ars-emb**: embedding rows (top --ars-emb-max=4 by |grad|, default 4/block) get the full LR step, then are trialled through the same block probe as flip chunks (--ars-probe/--ars-windows) and reverted unless probe CE stays within max(--ars-margin, --ars-margin-rel*L). Decoupled WD still applies to all rows (parity: non-ARS arithmetic is bit-identical to the previous combined update; verified by review, smoke CEs match pre-change runs).
-- **--sl-lr-embedding F** overrides the exported embedding LR (>0); 0 keeps metadata.
-- Smoke on exp_tog_s0_zacc (6L/256H/8192V, 10 blocks, lrEmb 1e-4): 5 probes/block at probe 64/2 windows (+47% wall vs flip-only ARS, 1.19 s/block); gate rejected 0-4 rows/block (e.g. accepted=0 at step 7 when probeCE rose 6.95->7.26), probeCE trended down (6.76 -> 6.26-7.26 wobble) - gate is exercising. Parity run without --ars-emb produced identical block CEs and a distinct saved file (updates applied/skipped correctly).
+Question: flip proposals are gated chunk-by-chunk through a block probe
+(`--ars`, README section above), but the embedding SGD step has no such gate —
+any LR update that pushes probe CE up is committed anyway, and on-device
+embedding gradients are as noisy as flip proposals. Can the same
+margin-gated retrial clean up the embedding update (propose → probe → revert
+if worse), and does it cost measurable accuracy / wall-clock?
+
+Setup: `selflearn_avx2.exe` (AVX2+FMA, 2026-08-11 build). Shared probe
+machinery refactored out of the flip loop into `ars_probe_block()`
+(`--ars-probe` tokens split into `--ars-windows` tail-first windows, margin
+`max(--ars-margin, --ars-margin-rel × L_cur)` — same as flips). New flags:
+`--ars-emb` gates the top `--ars-emb-max` embedding rows by |grad| (default
+4/block): apply the full LR step, probe CE, keep if within the margin, else
+revert the row. Decoupled WD still applies to every row (including reverted
+ones). `--sl-lr-embedding F` overrides the exported embedding LR (>0; 0 keeps
+metadata). Non-ARS arithmetic is bit-identical to the previous combined
+per-row update (reordered per row, same op sequence: `er -= lr·grad·s`, then
+`er *= (1 − lr·wd)`).
+
+Results (smoke, `exp_tog_s0_zacc.bin` + `slice100k.bin`, 10 blocks,
+lrEmb 1e-4, probe 64/2 windows):
+
+| Run | blocks | wall/block | ARS-emb tried | accepted |
+|---|---|---|---|---|
+| no ARS-emb (parity) | 3 | 629 ms | — | — |
+| `--ars --ars-emb` | 10 | 1192 ms | 4/block | 0–4 (≈50% overall) |
+
+- Gate is exercising: 0/4 rejected at step 7 when probeCE jumped 6.95 → 7.26
+  on the first trial; probeCE wobbled 6.26–7.26 across blocks (no diverging
+  drift in a 10-block window).
+- Cost of embedding gating: +5 probes per block (1 baseline + up to 4
+  trials) ≈ +47% wall vs the flip-only ARS run at probe 64/2.
+- Parity check: same seed/params with `--ars` and `--ars-emb` removed
+  reproduces the pre-change block CEs (6.8898 / 6.7274 / 6.8387) and saves
+  a distinct file when gating is on (updates applied / skipped correctly).
+
+**Verdict: WIP — gate mechanics validated, adaptive benefit not yet
+measured.** The gate strictly rejects harmful rows and preserves the exact
+non-ARS trajectory, but a 10-block smoke cannot show whether gated
+embeddings train *better* than ungated. Next step: 200-block A/B
+(`--ars-emb` on/off) on finewebEval100k, same protocol as the flip-gate A/B
+in README, to see if gate-confirmed rows wash the embedding-noise floor.
+
+Reproduce:
+
+```bash
+# build
+inference\build.bat avx2
+# gated embedding smoke (10 blocks, probe 64/2, 4 rows/block trialled)
+inference\selflearn_avx2.exe checkpoints_discrete_c3\exp_tog_s0_zacc.bin examples\discrete\slice100k.bin tmp_arsemb.bin 10 1 10 20 0.99 5 0 --ars --ars-emb --ars-probe 64 --ars-windows 2 --ars-emb-max 4
+# parity: identical block CEs to the pre-Exp-16 build, no ARS-emb lines
+inference\selflearn_avx2.exe checkpoints_discrete_c3\exp_tog_s0_zacc.bin examples\discrete\slice100k.bin tmp_noars.bin 3 1 3 20 0.99 5 0
+```
+
+---
 

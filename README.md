@@ -16,7 +16,7 @@ Plus **Multi-head Latent Attention (MLA)** — DeepSeek-V2-style KV compression 
 
 ## Experiments
 
-Experiments Series (Exp 1–14) — see [`EXPERIMENTS.md`](EXPERIMENTS.md).
+Experiments Series (Exp 1–16) — see [`EXPERIMENTS.md`](EXPERIMENTS.md).
 
 ## Architecture
 
@@ -338,7 +338,7 @@ The exported model **continues learning in C++** on raw token streams, implement
 
 - Per-layer local delta `-sign((y_t − y_{t-1})^T x_{t-1})` fed into a **leaky accumulator** (`acc *= 0.99`)
 - **Bit-flip kernel**: weight flips ±1 when `|acc| > threshold` (default 20), applied every 5 blocks
-- Tied embedding updated with local SGD: per-row gradient clip (norm<1 → normalize) + decoupled weight decay (`lr=1e-5`, `wd=0.1` — `lr=1e-4` was tuned for the compressed 1/sqrt(H) logit scale and catastrophically destroys a natural-scale backprop checkpoint, see Exp 7 correction)
+- Tied embedding updated with local SGD: per-row gradient clip (norm<1 → normalize) + decoupled weight decay (`lr=1e-5`, `wd=0.1` — `lr=1e-4` was tuned for the compressed 1/sqrt(H) logit scale and catastrophically destroys a natural-scale backprop checkpoint, see Exp 7 correction; `--ars-emb` gates the top rows per block through the ARS probe, and `--sl-lr-embedding F` overrides the exported LR — see Accept-Reject Search below)
 - **Atomic write-back**: `.tmp` file + `MoveFileEx` rename (crash-safe save)
 
 **Exp 3 flip mechanics (ported from the Python `DiscreteTrainer`, default off)** — the exact
@@ -773,6 +773,14 @@ accepted wholesale (199 rejected vs 0), and the model lands **+0.005 of
 its pre-training eval** (ungated +0.028, v1 gate +0.024). Cost: ~10–12%
 wall-clock (~65 ms/block at this scale; the 4-window probe adds ~+0.2 s
 per trial).
+
+Embedding updates can use the same gate: `--ars-emb` trials the top
+`--ars-emb-max` embedding rows by |grad| (default 4/block) through the
+block probe and reverts any row whose probe CE exceeds the margin (same
+`--ars-margin` / `--ars-margin-rel`); `--sl-lr-embedding F` overrides the
+exported embedding LR (>0; 0 keeps the metadata value). Weight decay
+still applies to every row (reverted ones included), and non-ARS runs
+keep the exact previous arithmetic (bit-identical — Exp 16).
 
 ## Project Structure
 
