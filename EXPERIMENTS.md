@@ -1004,3 +1004,17 @@ inference\selflearn_avx2.exe checkpoints_discrete_c3\exp_tog_s0_zacc.bin example
 
 ---
 
+
+## Experiment: KV-Cache Quantization (Exp 17) — FP32 baseline 2026-08-11
+
+Goal: cut the FP32 KV cache 4x. Baseline measured BEFORE any change (selflearn_prof.exe, /DTETRA_PROFILE AVX2, exp7_v6_lr5.bin tiny 6L/256H/8hd/32, sliceEval100k.bin, FP32 lm_head):
+
+| run | positions | tokens/s | ms/token |
+|---|---|---|---|
+| single window (ramp 1->2048, no roll) | 2048 | 235.6-239.0 | ~4.2 |
+| steady decode (10 rolls at 2048) | 20480 | 244.4 | 4.09 |
+
+Stage breakdown (82.2 s / 20480 positions): attn_scores 43.2% | gate_up 27.2% | down_proj 9.8% | qkv_matmul 9.1% | lm_head 7.2% | o_proj 3.2% | norm 0.4%.
+
+KV cache footprint (FP32): 6 x 2 x 2048 x 256 x 4 B = 25.2 MB; decode reads ~24 MB of K/V per token (4 MB/layer), i.e. ~6 GB/s of the ~4 ms token budget is KV traffic alone — attn_scores (43%) is the KV-bound stage to attack. Reference at 500m preset: 251 MB FP32 (6L x 2560).
+
