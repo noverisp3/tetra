@@ -904,3 +904,10 @@ Next time an MLA checkpoint is trained to a sane loss:
 
 Relevant code: MLA decode branch in inference/tetra.h (guarded by
 model.is_mla), 	ernary_llm/mla.py (torch side).
+
+## Experiment: ARS-gated embedding updates (Exp 16, finding #13) 2026-08-11
+
+- **--ars-emb**: embedding rows (top --ars-emb-max=4 by |grad|, default 4/block) get the full LR step, then are trialled through the same block probe as flip chunks (--ars-probe/--ars-windows) and reverted unless probe CE stays within max(--ars-margin, --ars-margin-rel*L). Decoupled WD still applies to all rows (parity: non-ARS arithmetic is bit-identical to the previous combined update; verified by review, smoke CEs match pre-change runs).
+- **--sl-lr-embedding F** overrides the exported embedding LR (>0); 0 keeps metadata.
+- Smoke on exp_tog_s0_zacc (6L/256H/8192V, 10 blocks, lrEmb 1e-4): 5 probes/block at probe 64/2 windows (+47% wall vs flip-only ARS, 1.19 s/block); gate rejected 0-4 rows/block (e.g. accepted=0 at step 7 when probeCE rose 6.95->7.26), probeCE trended down (6.76 -> 6.26-7.26 wobble) - gate is exercising. Parity run without --ars-emb produced identical block CEs and a distinct saved file (updates applied/skipped correctly).
+

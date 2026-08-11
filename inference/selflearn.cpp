@@ -99,6 +99,36 @@ static double ars_probe_ce(Model& model, const std::vector<uint16_t>& tokens,
     return cnt > 0 ? loss / (double)cnt : 0.0;
 }
 
+// Probe CE over the block: --ars-probe tokens split into --ars-windows
+// tail-first windows replayed in place. Shared by flip and embedding trials.
+static double ars_probe_block(Model& model, const std::vector<uint16_t>& tokens,
+                              size_t start, size_t blk, int ars_probe_total,
+                              int ars_windows, float scale,
+                              std::vector<float>& softmax_buf, KVCache& cache,
+                              int V) {
+    const size_t wl = (std::max)((size_t)1,
+                        (size_t)ars_probe_total / (size_t)((std::max)(1, ars_windows)));
+    const size_t K = (size_t)((std::max)(1, ars_windows));
+    double tot = 0.0;
+    size_t wsum = 0;
+    for (size_t i = 0; i < K; i++) {
+        size_t off = blk - (i + 1) * wl;
+        if ((long long)off < 0 || off + wl > blk) break;
+        cache.pos = (int)(off + wl);
+        double ce = ars_probe_ce(model, tokens, start + off, wl, scale,
+                                 softmax_buf, cache, V);
+        tot += ce * (double)wl;
+        wsum += wl;
+    }
+    return wsum > 0 ? tot / (double)wsum : 0.0;
+}
+
+// Accept margin: max of the absolute floor and a fraction of the best CE,
+// so the gate widens proportionally in the high-CE (noisy) regime.
+static float ars_margin_eff(float ars_margin, float ars_margin_rel, double L_cur) {
+    return (std::max)(ars_margin, ars_margin_rel * (float)L_cur);
+}
+
 // Rebuild the 2-bit packed codes from the staged float weights after
 // Accept-Reject Search rollbacks (save_model writes w.packed verbatim,
 // so it must match floats).
@@ -302,7 +332,10 @@ int main(int argc, char** argv) {
             "         windows replayed from the live cache; keep chunks whose probe CE\n"
             "         stays within the margin of the running best (--ars-chunk,\n"
             "         --ars-trials, --ars-probe, --ars-windows, --ars-margin,\n"
-            "         --ars-margin-rel; defaults 64 / 16 / 128 / 4 / 0.02 / 0.005)\n");
+            "         --ars-margin-rel; defaults 64 / 16 / 128 / 4 / 0.02 / 0.005)\n"
+            "  --ars-emb: also gate embedding row updates through the block probe\n"
+            "         (top --ars-emb-max rows by |grad| per block; default 4)\n"
+            "  --sl-lr-embedding F: override the exported embedding LR (>0; 0 = keep)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -395,6 +428,20 @@ int main(int argc, char** argv) {
     }
     if (ars_windows < 1) ars_windows = 1;
     if (ars_probe < ars_windows) ars_probe = ars_windows;
+    // --ars-emb: gate embedding row updates through the block probe (top
+    // --ars-emb-max rows per block). --sl-lr-embedding overrides the exported
+    // embedding LR (>0; 0 keeps the metadata value).
+    bool ars_emb = false;
+    int ars_emb_max = 4;
+    float lr_emb_override = 0.0f;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ars-emb") == 0) ars_emb = true;
+    }
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--ars-emb-max") == 0) ars_emb_max = atoi(argv[i + 1]);
+        if (strcmp(argv[i], "--sl-lr-embedding") == 0) lr_emb_override = (float)atof(argv[i + 1]);
+    }
+    if (ars_emb_max < 1) ars_emb_max = 1;
     // Exp 3 flip mechanics: "--energy" switches the accumulator feed from
     // -sign(grad) votes to -grad magnitude; "--adaptive-thr K" sets the
     // per-channel flip threshold tau = K * RMS(acc); "--sparsity S" keeps only
@@ -447,7 +494,7 @@ int main(int argc, char** argv) {
     const int flip_every = every_override > 0 ? every_override : model.sl_flip_every_n;
     const bool toggle = toggle_override >= 0 ? (toggle_override != 0) : (model.sl_toggle != 0);
     const float scale = scale_override > 0.0f ? scale_override : model.sl_logit_scale;
-    const float lr_emb = model.sl_lr_embedding;
+    const float lr_emb = lr_emb_override > 0.0f ? lr_emb_override : model.sl_lr_embedding;
     const float wd_emb = model.sl_wd_embedding;
     const bool energy = energy_override ? true : (model.sl_energy != 0);
     const float adaptive_thr = adaptive_override >= 0.0f ? adaptive_override : model.sl_adaptive_thr;
@@ -577,21 +624,58 @@ int main(int argc, char** argv) {
         }
 
         // Embedding local SGD: per-row clip (norm<1 -> normalize) + decoupled WD.
+        // With --ars-emb, the top --ars-emb-max rows by |grad| are trialled
+        // through the block probe like flip chunks: apply the full LR step,
+        // probe CE and keep it only if CE stays within the margin, else
+        // revert the row. WD applies to every row regardless.
         if (!flip_only) {
-        for (int v = 0; v < V; v++) {
-            float* ge = gradE.data() + (size_t)v * H;
-            float norm = 0.0f;
-            for (int i = 0; i < H; i++) norm += ge[i] * ge[i];
-            norm = sqrtf(norm);
-            float s = 1.0f;
-            if (norm > 0.0f && norm < 1.0f) s = 1.0f / norm;
-            float* er = emb + (size_t)v * H;
-            for (int i = 0; i < H; i++) {
-                float upd = lr_emb * (ge[i] * s);
-                er[i] -= upd;
-                er[i] *= (1.0f - lr_emb * wd_emb);
+            std::vector<int> emb_rows;
+            std::vector<float> emb_norm;
+            for (int v = 0; v < V; v++) {
+                const float* ge = gradE.data() + (size_t)v * H;
+                float norm = 0.0f;
+                for (int i = 0; i < H; i++) norm += ge[i] * ge[i];
+                norm = sqrtf(norm);
+                if (norm > 0.0f) { emb_rows.push_back(v); emb_norm.push_back(norm); }
             }
-        }
+            std::vector<int> emb_order(emb_rows.size());
+            for (size_t i = 0; i < emb_order.size(); i++) emb_order[i] = (int)i;
+            std::sort(emb_order.begin(), emb_order.end(),
+                      [&](int a, int b) { return emb_norm[(size_t)a] > emb_norm[(size_t)b]; });
+            std::vector<float> emb_old((size_t)V * H);
+            memcpy(emb_old.data(), emb, (size_t)V * H * sizeof(float));
+            long long emb_tried = 0, emb_accepted = 0;
+            double L_emb = 0.0;
+            for (size_t oi = 0; oi < emb_order.size(); oi++) {
+                int v = emb_rows[(size_t)emb_order[oi]];
+                float* ge = gradE.data() + (size_t)v * H;
+                float* er = emb + (size_t)v * H;
+                float s = (emb_norm[(size_t)emb_order[oi]] < 1.0f)
+                              ? 1.0f / emb_norm[(size_t)emb_order[oi]] : 1.0f;
+                for (int i = 0; i < H; i++) er[i] -= lr_emb * (ge[i] * s);
+                if (ars_emb && emb_tried < (long long)ars_emb_max) {
+                    if (emb_tried == 0)
+                        L_emb = ars_probe_block(model, tokens, start, (size_t)cache.pos,
+                                                ars_probe, ars_windows, scale,
+                                                softmax_buf, cache, V);
+                    double L_new = ars_probe_block(model, tokens, start, (size_t)cache.pos,
+                                                   ars_probe, ars_windows, scale,
+                                                   softmax_buf, cache, V);
+                    if (L_new <= L_emb + ars_margin_eff(ars_margin, ars_margin_rel, L_emb)) {
+                        L_emb = L_new;
+                        emb_accepted++;
+                    } else {
+                        memcpy(er, emb_old.data() + (size_t)v * H, H * sizeof(float));
+                    }
+                    emb_tried++;
+                }
+            }
+            if (ars_emb && emb_tried > 0)
+                fprintf(stderr, "  ARS-emb: tried=%lld accepted=%lld probeCE=%.4f win=%d/%d (margin=%.4f)\n",
+                        emb_tried, emb_accepted, L_emb, ars_windows, ars_probe,
+                        (double)ars_margin_eff(ars_margin, ars_margin_rel, L_emb));
+            // Decoupled weight decay over all rows (incl. reverted ones).
+            for (int i = 0; i < V * H; i++) emb[i] *= (1.0f - lr_emb * wd_emb);
         }
 
         // Bit flips every N steps.
@@ -637,35 +721,12 @@ int main(int argc, char** argv) {
                     && (size_t)cache.pos + (size_t)ars_probe <= (size_t)model.header.max_seq_len) {
                 // Roll every proposal back, then re-trial chunk by chunk on
                 // probe windows replayed from the live cache.
-                const size_t blk = (size_t)cache.pos;
-                auto ars_probe_all = [&](size_t w_start) -> double {
-                    // --ars-probe tokens split into --ars-windows windows
-                    // spread evenly across the block; each window is replayed
-                    // in place (cache rewound to its own start).
-const size_t wl = (std::max)((size_t)1,
-                        (size_t)ars_probe / (size_t)((std::max)(1, ars_windows)));
-                const size_t K = (size_t)((std::max)(1, ars_windows));
-                double tot = 0.0;
-                size_t wsum = 0;
-                // Tail-first: window 0 is the block tail, the rest spread
-                // backward — with --ars-windows 1 the single window is
-                // exactly the old tail window ([end-32, end)).
-                for (size_t i = 0; i < K; i++) {
-                    size_t off = blk - (i + 1) * wl;
-                    if ((long long)off < 0 || off + wl > blk) break;
-                    size_t ws = w_start + off;
-                        cache.pos = (int)(off + wl);
-                        double ce = ars_probe_ce(model, tokens, ws, wl, scale,
-                                                 softmax_buf, cache, V);
-                        tot += ce * (double)wl;
-                        wsum += wl;
-                    }
-                    return wsum > 0 ? tot / (double)wsum : 0.0;
-                };
+const size_t blk = (size_t)cache.pos;
                 for (size_t wi = 0; wi < wlist.size(); wi++)
                     for (size_t i : changed[wi]) wlist[wi]->floats[i] = all_before[wi][i];
                 ars_repack(model);
-                double L_cur = ars_probe_all(start);
+                double L_cur = ars_probe_block(model, tokens, start, blk, ars_probe,
+                                               ars_windows, scale, softmax_buf, cache, V);
                 std::vector<std::pair<size_t, size_t>> flat;
                 for (size_t wi = 0; wi < wlist.size(); wi++)
                     for (size_t i : changed[wi]) flat.emplace_back(wi, i);
@@ -681,9 +742,9 @@ const size_t wl = (std::max)((size_t)1,
                         for (size_t k = 0; k < nc; k++)
                             wlist[flat[p + k].first]->floats[flat[p + k].second] =
                                 all_after[flat[p + k].first][flat[p + k].second];
-                        double L_new = ars_probe_all(start);
-                        float margin_eff = (std::max)(ars_margin,
-                                                      ars_margin_rel * (float)L_cur);
+                        double L_new = ars_probe_block(model, tokens, start, blk, ars_probe,
+                                                    ars_windows, scale, softmax_buf, cache, V);
+                        float margin_eff = ars_margin_eff(ars_margin, ars_margin_rel, L_cur);
                         if (L_new <= L_cur + margin_eff) {
                             L_cur = L_new;
                             ok_chunks++;
@@ -707,8 +768,7 @@ const size_t wl = (std::max)((size_t)1,
                 fprintf(stderr, "  ARS: trials=%zu accepted_chunks=%zu accepted_weights=%lld "
                                 "probeCE=%.4f win=%d/%d (margin=%.4f)\n",
                         tried, ok_chunks, real_changes, L_cur, ars_windows,
-                        ars_probe, (double)(std::max)(ars_margin,
-                                                      ars_margin_rel * (float)L_cur));
+                        ars_probe, (double)ars_margin_eff(ars_margin, ars_margin_rel, L_cur));
             } else {
                 for (size_t wi = 0; wi < wlist.size(); wi++) {
                     auto& hist = hists[wi];
