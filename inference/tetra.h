@@ -227,16 +227,94 @@ static inline void kvq_row(const float* src, int8_t* dst, float* sc, int n) {
     }
 }
 
+// int16 variant (scale = max/32767). Combined with a per-head int16 query it
+// lets the score loop run as a pure integer SIMD madd, faster than fp32 fma.
+static inline void kvq16_row(const float* src, int16_t* dst, float* sc, int n) {
+    float mx = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(src[i]);
+        if (a > mx) mx = a;
+    }
+    const float s = mx > 1e-9f ? mx / 32767.0f : 1.0f;
+    *sc = s;
+    for (int i = 0; i < n; i++) {
+        float v = src[i] / s;
+        int q = v >= 0.0f ? (int)(v + 0.5f) : (int)(v - 0.5f);
+        if (q > 32767) q = 32767;
+        else if (q < -32767) q = -32767;
+        dst[i] = (int16_t)q;
+    }
+}
+
+// int16 SIMD dot: used for quantized K scores (query and key in int16).
+#if defined(__AVX10_1__) || defined(__AVX10__) || defined(__AVX512F__)
+static inline float dot_simd16(const int16_t* a, const int16_t* b, int n) {
+    __m512i vsum = _mm512_setzero_si512();
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        __m512i va = _mm512_loadu_si512((const __m512i*)(a + i));
+        __m512i vb = _mm512_loadu_si512((const __m512i*)(b + i));
+        vsum = _mm512_add_epi32(vsum, _mm512_madd_epi16(va, vb));
+    }
+    float sum = (float)_mm512_reduce_add_epi32(vsum);
+    for (; i < n; i++) sum += (float)a[i] * (float)b[i];
+    return sum;
+}
+#elif defined(__AVX2__)
+static inline float dot_simd16(const int16_t* a, const int16_t* b, int n) {
+    __m256i vsum = _mm256_setzero_si256();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256i va = _mm256_loadu_si256((const __m256i*)(a + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i*)(b + i));
+        vsum = _mm256_add_epi32(vsum, _mm256_madd_epi16(va, vb));
+    }
+    __m128i lo = _mm256_castsi256_si128(vsum);
+    __m128i hi = _mm256_extracti128_si256(vsum, 1);
+    __m128i s = _mm_add_epi32(lo, hi);
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+    float sum = (float)_mm_cvtsi128_si32(s);
+    for (; i < n; i++) sum += (float)a[i] * (float)b[i];
+    return sum;
+}
+#else
+static inline float dot_simd16(const int16_t* a, const int16_t* b, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += (float)a[i] * (float)b[i];
+    return sum;
+}
+#endif
+
 static inline void attention_weighted_sum_q(
     const float* attn, const int8_t* vbase, const float* vsc,
     int stride, int actual_len, int HD, float* out)
 {
+#if defined(__AVX2__) || defined(__AVX512F__) || defined(__AVX10_1__) || defined(__AVX10__)
+    int d = 0;
+    for (; d + 8 <= HD; d += 8) {
+        __m256 acc = _mm256_setzero_ps();
+        for (int t = 0; t < actual_len; t++) {
+            __m128i b8 = _mm_loadl_epi64((const __m128i*)(vbase + (size_t)t * stride + d));
+            __m256 f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b8));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(attn[t] * vsc[t]), f, acc);
+        }
+        _mm256_storeu_ps(out + d, acc);
+    }
+    for (; d < HD; d++) {
+        float s = 0.0f;
+        for (int t = 0; t < actual_len; t++)
+            s += attn[t] * vsc[t] * (float)vbase[(size_t)t * stride + d];
+        out[d] = s;
+    }
+#else
     for (int d = 0; d < HD; d++) out[d] = 0.0f;
     for (int t = 0; t < actual_len; t++) {
         const float p = attn[t] * vsc[t];
         const int8_t* row = vbase + (size_t)t * stride;
         for (int d = 0; d < HD; d++) out[d] += p * (float)row[d];
     }
+#endif
 }
 
 // Prefetch helper
@@ -917,9 +995,10 @@ struct KVCache {
     // since NH*HD == H and NH*RP == RD.
     std::vector<std::vector<float>> k_cache;
     std::vector<std::vector<float>> v_cache;
-    // int8 KV caches (one row per (head, pos) + one fp32 scale per row);
-    // used when kv_int8 is set. Halves KV cache RAM vs fp32.
-    std::vector<std::vector<int8_t>> kq;
+    // int8/int16 KV caches (one row per (head, pos) + one fp32 scale per row);
+    // used when kv_int8 is set. K is int16 (pure-int SIMD madd scores),
+    // V is int8 (8-lane SIMD accumulate). Halves+ KV cache RAM vs fp32.
+    std::vector<std::vector<int16_t>> kq;
     std::vector<std::vector<int8_t>> vq;
     std::vector<std::vector<float>> ks;
     std::vector<std::vector<float>> vs;
@@ -929,8 +1008,8 @@ struct KVCache {
     // MLA expanded K/V cache (avoids per-step reconstruction from latent)
     std::vector<std::vector<float>> k_full_cache;
     std::vector<std::vector<float>> v_full_cache;
-    // MLA int8 expanded K/V (per-head-row scales)
-    std::vector<std::vector<int8_t>> kfq;
+    // MLA int8/int16 expanded K/V (per-head-row scales)
+    std::vector<std::vector<int16_t>> kfq;
     std::vector<std::vector<int8_t>> vfq;
     std::vector<std::vector<float>> kfs;
     std::vector<std::vector<float>> vfs;
@@ -951,12 +1030,15 @@ struct KVCache {
             v_cache.resize(num_layers, std::vector<float>(max_seq_len * dim, 0.0f));
         }
         if (kv_int8) {
-            std::vector<std::vector<int8_t>>& kq8 = is_mla ? kfq : kq;
-            std::vector<std::vector<int8_t>>& vq8 = is_mla ? vfq : vq;
+            if (is_mla) {
+                kfq.resize(num_layers, std::vector<int16_t>(max_seq_len * dim, 0));
+                vfq.resize(num_layers, std::vector<int8_t>(max_seq_len * dim, 0));
+            } else {
+                kq.resize(num_layers, std::vector<int16_t>(max_seq_len * dim, 0));
+                vq.resize(num_layers, std::vector<int8_t>(max_seq_len * dim, 0));
+            }
             std::vector<std::vector<float>>& ksq = is_mla ? kfs : ks;
             std::vector<std::vector<float>>& vsq = is_mla ? vfs : vs;
-            kq8.resize(num_layers, std::vector<int8_t>(max_seq_len * dim, 0));
-            vq8.resize(num_layers, std::vector<int8_t>(max_seq_len * dim, 0));
             ksq.resize(num_layers, std::vector<float>(max_seq_len * num_heads, 0.0f));
             vsq.resize(num_layers, std::vector<float>(max_seq_len * num_heads, 0.0f));
         }
@@ -1099,7 +1181,7 @@ static std::vector<float> forward(
                 std::vector<float> krow(HD), vrow(HD);
                 for (int head = 0; head < NH; head++) {
                     if (cache.kv_int8) {
-                        int8_t* kcq = cache.kfq[l].data() + (size_t)head * MAXT * HD + pos * HD;
+                        int16_t* kcq = cache.kfq[l].data() + (size_t)head * MAXT * HD + pos * HD;
                         int8_t* vcq = cache.vfq[l].data() + (size_t)head * MAXT * HD + pos * HD;
                         float* kcs = cache.kfs[l].data() + (size_t)head * MAXT + pos;
                         float* vcs = cache.vfs[l].data() + (size_t)head * MAXT + pos;
@@ -1108,7 +1190,7 @@ static std::vector<float> forward(
                             krow[d] = dot_product_simd(kv_latent.data(), kup_d + r * KV, KV);
                             vrow[d] = dot_product_simd(kv_latent.data(), vup_d + r * KV, KV);
                         }
-                        kvq_row(krow.data(), kcq, kcs, HD);
+                        kvq16_row(krow.data(), kcq, kcs, HD);
                         kvq_row(vrow.data(), vcq, vcs, HD);
                     } else {
                         float* kc = cache.k_full_cache[l].data() + (size_t)head * MAXT * HD + pos * HD;
@@ -1143,19 +1225,19 @@ static std::vector<float> forward(
                 // Attention: read from cached K_full/V_full + K_rope
                 int actual_len = pos + 1;
                 float eff_scale = 1.0f / (float)EHD;
+                std::vector<int16_t> q16(HD);
                 for (int head = 0; head < NH; head++) {
                     float* qh = q.data() + head * HD;
                     float* qrh = q_rope.data() + head * RP;
                     const float* krh0 = cache.k_rope_cache[l].data() + (size_t)head * MAXT * RP;
 
                     if (cache.kv_int8) {
-                        const int8_t* khq0 = cache.kfq[l].data() + (size_t)head * MAXT * HD;
+                        const int16_t* khq0 = cache.kfq[l].data() + (size_t)head * MAXT * HD;
                         const float* kfs0 = cache.kfs[l].data() + (size_t)head * MAXT;
+                        float qsc = 0.0f;
+                        kvq16_row(qh, q16.data(), &qsc, HD);
                         for (int t = 0; t < actual_len; t++) {
-                            const int8_t* krow = khq0 + t * HD;
-                            float acc = 0.0f;
-                            for (int d = 0; d < HD; d++) acc += qh[d] * (float)krow[d];
-                            float s = acc * kfs0[t] * eff_scale;
+                            float s = dot_simd16(q16.data(), khq0 + t * HD, HD) * (qsc * kfs0[t]) * eff_scale;
                             s += dot_product_simd(qrh, krh0 + t * RP, RP) * eff_scale;
                             attn_scores[t] = s;
                         }
@@ -1201,11 +1283,11 @@ static std::vector<float> forward(
 
                 if (cache.kv_int8) {
                     for (int head = 0; head < NH; head++) {
-                        int8_t* kcq = cache.kq[l].data() + (size_t)head * MAXT * HD + pos * HD;
+                        int16_t* kcq = cache.kq[l].data() + (size_t)head * MAXT * HD + pos * HD;
                         int8_t* vcq = cache.vq[l].data() + (size_t)head * MAXT * HD + pos * HD;
                         float* kcs = cache.ks[l].data() + (size_t)head * MAXT + pos;
                         float* vcs = cache.vs[l].data() + (size_t)head * MAXT + pos;
-                        kvq_row(k.data() + head * HD, kcq, kcs, HD);
+                        kvq16_row(k.data() + head * HD, kcq, kcs, HD);
                         kvq_row(v.data() + head * HD, vcq, vcs, HD);
                     }
                 } else {
@@ -1219,19 +1301,18 @@ static std::vector<float> forward(
                     }
                 }
 
+                std::vector<int16_t> q16(HD);
                 for (int head = 0; head < NH; head++) {
                     float scale = 1.0f / sqrtf((float)HD);
                     int actual_len = pos + 1;
                     const float* q_head = q.data() + head * HD;
                     if (cache.kv_int8) {
-                        const int8_t* khq0 = cache.kq[l].data() + (size_t)head * MAXT * HD;
+                        const int16_t* khq0 = cache.kq[l].data() + (size_t)head * MAXT * HD;
                         const float* ksc0 = cache.ks[l].data() + (size_t)head * MAXT;
-                        for (int t = 0; t < actual_len; t++) {
-                            const int8_t* krow = khq0 + t * HD;
-                            float acc = 0.0f;
-                            for (int d = 0; d < HD; d++) acc += q_head[d] * (float)krow[d];
-                            attn_scores[t] = acc * ksc0[t] * scale;
-                        }
+                        float qsc = 0.0f;
+                        kvq16_row(q_head, q16.data(), &qsc, HD);
+                        for (int t = 0; t < actual_len; t++)
+                            attn_scores[t] = dot_simd16(q16.data(), khq0 + t * HD, HD) * (qsc * ksc0[t]) * scale;
                         softmax(attn_scores.data(), actual_len);
                         attention_weighted_sum_q(attn_scores.data(),
                             cache.vq[l].data() + (size_t)head * MAXT * HD,
@@ -1389,7 +1470,7 @@ static std::vector<float> forward(
                 std::vector<float> krow(HD), vrow(HD);
                 for (int head = 0; head < NH; head++) {
                     if (cache.kv_int8) {
-                        int8_t* kcq = cache.kfq[l].data() + (size_t)head * MAXT * HD + (pos + j) * HD;
+                        int16_t* kcq = cache.kfq[l].data() + (size_t)head * MAXT * HD + (pos + j) * HD;
                         int8_t* vcq = cache.vfq[l].data() + (size_t)head * MAXT * HD + (pos + j) * HD;
                         float* kcs = cache.kfs[l].data() + (size_t)head * MAXT + (pos + j);
                         float* vcs = cache.vfs[l].data() + (size_t)head * MAXT + (pos + j);
@@ -1398,7 +1479,7 @@ static std::vector<float> forward(
                             krow[d] = dot_product_simd(lt, kup_d + r * KV, KV);
                             vrow[d] = dot_product_simd(lt, vup_d + r * KV, KV);
                         }
-                        kvq_row(krow.data(), kcq, kcs, HD);
+                        kvq16_row(krow.data(), kcq, kcs, HD);
                         kvq_row(vrow.data(), vcq, vcs, HD);
                     } else {
                         float* kc = cache.k_full_cache[l].data() + (size_t)head * MAXT * HD + (pos + j) * HD;
@@ -1428,19 +1509,19 @@ static std::vector<float> forward(
                 std::vector<float> attn_local(model.header.max_seq_len);
                 int actual_len = pos + j + 1;
                 float* out_j = attn_out.data() + j * H;
+                std::vector<int16_t> q16(HD);
 
                 for (int head = 0; head < NH; head++) {
                     float* qh = q.data() + j * H + head * HD;
                     float* qrh = q_rope.data() + j * RD + head * RP;
                     const float* krh0 = cache.k_rope_cache[l].data() + (size_t)head * MAXT * RP;
                     if (cache.kv_int8) {
-                        const int8_t* khq0 = cache.kfq[l].data() + (size_t)head * MAXT * HD;
+                        const int16_t* khq0 = cache.kfq[l].data() + (size_t)head * MAXT * HD;
                         const float* kfs0 = cache.kfs[l].data() + (size_t)head * MAXT;
+                        float qsc = 0.0f;
+                        kvq16_row(qh, q16.data(), &qsc, HD);
                         for (int t = 0; t < actual_len; t++) {
-                            const int8_t* krow = khq0 + t * HD;
-                            float acc = 0.0f;
-                            for (int d = 0; d < HD; d++) acc += qh[d] * (float)krow[d];
-                            float s = acc * kfs0[t] * eff_scale;
+                            float s = dot_simd16(q16.data(), khq0 + t * HD, HD) * (qsc * kfs0[t]) * eff_scale;
                             s += dot_product_simd(qrh, krh0 + t * RP, RP) * eff_scale;
                             attn_local[t] = s;
                         }
@@ -1488,11 +1569,11 @@ static std::vector<float> forward(
             if (cache.kv_int8) {
                 for (int j = 0; j < seq_len; j++)
                     for (int head = 0; head < NH; head++) {
-                        int8_t* kcq = cache.kq[l].data() + (size_t)head * MAXT * HD + (pos + j) * HD;
+                        int16_t* kcq = cache.kq[l].data() + (size_t)head * MAXT * HD + (pos + j) * HD;
                         int8_t* vcq = cache.vq[l].data() + (size_t)head * MAXT * HD + (pos + j) * HD;
                         float* kcs = cache.ks[l].data() + (size_t)head * MAXT + (pos + j);
                         float* vcs = cache.vs[l].data() + (size_t)head * MAXT + (pos + j);
-                        kvq_row(k.data() + j * H + head * HD, kcq, kcs, HD);
+                        kvq16_row(k.data() + j * H + head * HD, kcq, kcs, HD);
                         kvq_row(v.data() + j * H + head * HD, vcq, vcs, HD);
                     }
             } else {
@@ -1511,18 +1592,17 @@ static std::vector<float> forward(
             for (int j = 0; j < seq_len; j++) {
                 std::vector<float> attn_local(model.header.max_seq_len);
                 int actual_len = pos + j + 1;
+                std::vector<int16_t> q16(HD);
                 for (int head = 0; head < NH; head++) {
                     float scale = 1.0f / sqrtf((float)HD);
                     const float* q_head = q.data() + j * H + head * HD;
                     if (cache.kv_int8) {
-                        const int8_t* khq0 = cache.kq[l].data() + (size_t)head * MAXT * HD;
+                        const int16_t* khq0 = cache.kq[l].data() + (size_t)head * MAXT * HD;
                         const float* ksc0 = cache.ks[l].data() + (size_t)head * MAXT;
-                        for (int t = 0; t < actual_len; t++) {
-                            const int8_t* krow = khq0 + t * HD;
-                            float acc = 0.0f;
-                            for (int d = 0; d < HD; d++) acc += q_head[d] * (float)krow[d];
-                            attn_local[t] = acc * ksc0[t] * scale;
-                        }
+                        float qsc = 0.0f;
+                        kvq16_row(q_head, q16.data(), &qsc, HD);
+                        for (int t = 0; t < actual_len; t++)
+                            attn_local[t] = dot_simd16(q16.data(), khq0 + t * HD, HD) * (qsc * ksc0[t]) * scale;
                         softmax(attn_local.data(), actual_len);
                         attention_weighted_sum_q(attn_local.data(),
                             cache.vq[l].data() + (size_t)head * MAXT * HD,

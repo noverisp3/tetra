@@ -1018,3 +1018,10 @@ Stage breakdown (82.2 s / 20480 positions): attn_scores 43.2% | gate_up 27.2% | 
 
 KV cache footprint (FP32): 6 x 2 x 2048 x 256 x 4 B = 25.2 MB; decode reads ~24 MB of K/V per token (4 MB/layer), i.e. ~6 GB/s of the ~4 ms token budget is KV traffic alone — attn_scores (43%) is the KV-bound stage to attack. Reference at 500m preset: 251 MB FP32 (6L x 2560).
 
+
+## Exp 17, Round 2: int8/int16 KV cache implemented + SIMD (2026-08-11)
+
+- K: int16 per-row scale (max/32767) + per-head int16 query once per token -> score loop is a pure integer SIMD madd (AVX2 _mm256_madd_epi16). V: int8 with 8-lane cvtepi8_epi32 accumulate.
+- --kv-int8 flag (selflearn eval/train, tetra.cpp arg 9). Drift vs FP32 (tetra_model.bin, 6L/256/8H, decode 4000 pos): CE 8.5275 -> 8.5278; prefill logits mean 2.9e-4 (max 6.6e-4), MLA 2.4e-4 (max 1.2e-3).
+- Speed (selflearn_avx2.exe, --eval 4000): scalar int8 v1 333.6 tok/s (-14% vs FP32 364.7; earlier FP32 389.7 at session start). int16-SIMD v2: 384.9 / 387.4 tok/s -> +6% vs same-session FP32; RAM for K+V: 4 B -> ~2.5 B/elem + per-row scale.
+- NOTE: intermittent 0xC0000409 / 0xC0000005 crashes on 4000-8000 pos eval this session reproduce on the PRE-CHANGE (7b6b371) binary too; unaffected kv-int8 runs 6/6 clean. Not caused by Exp 17 changes; left for follow-up.
