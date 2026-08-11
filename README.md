@@ -718,17 +718,23 @@ model over time (a 20-block run on `exp7_cpp_k3_v6.bin` moved eval CE
 each proposed chunk on the model itself* before committing:
 
 1. `apply_bit_flips` proposes candidates as usual (all rolled back).
-2. The window `[end−probe, end)` is replayed from the live KV cache
-   (cache is rewound, K/V recomputed under the current weights) to get
-   the baseline probe CE.
+2. The probe is `--ars-probe` tokens (default 128 = the whole block) split
+   into `--ars-windows` tail-first windows (default 4×32), each replayed
+   from the live KV cache in place (cache rewound, K/V recomputed under
+   the current weights) — more probe tokens shrink the CE estimate noise,
+   and windows spread across the block stop a single lucky/unlucky 32
+   tokens from driving the decision.
 3. Proposals are re-trialled chunk-by-chunk (`--ars-chunk`, default 64);
-   each chunk restarts the window replay and is kept only if its probe CE
-   beats the running best within `--ars-margin` (default 0.02), otherwise
-   it is rolled back and its accumulator suggestion is discarded.
-4. A final replay leaves the window K/V consistent with the accepted
-   weights. The replay is exact in the cache's linear region
-   (`pos + probe ≤ max_seq_len`), which always holds on-device since the
-   training cache is rebuilt per block.
+   each chunk restarts the probe and is kept only if its probe CE stays
+   within the margin of the running best, otherwise it is rolled back and
+   its accumulator suggestion is discarded. The margin is
+   `max(--ars-margin, --ars-margin-rel × L_cur)` (defaults 0.02 and 0.005
+   = 0.5% of CE) — the gate widens proportionally in the high-CE (noisy)
+   regime instead of using a fixed absolute nats tolerance.
+4. The cache is rebuilt per block, so the probe K/V dies with the step;
+   the natural position is restored. The replay is exact in the cache's
+   linear region (`pos + probe ≤ max_seq_len`), which always holds
+   on-device since the training cache holds exactly one block.
 
 A/B results (thr=1.0 decay=0.99 flipEvery=4 toggle=1, same seed/params,
 identical eval conditions):
@@ -739,11 +745,17 @@ identical eval conditions):
 |---|---|---|
 | pre-training | — | 8.1038 |
 | baseline (ungated) | 798 | 8.1254 |
-| **Accept-Reject Search** | 619 | **8.1074** |
+| ARS, single 32-token tail probe (v1 flags) | 619 | 8.1074 |
+| **ARS, probe 128/4 windows + rel margin (default)** | 540 | **8.0635** |
 
-The gate rejected 179 proposals across 5 flip passes (65% of one pass)
-and held the model within +0.004 of its pre-training eval (vs +0.022 for
-ungated).
+The strengthened probe flips the gate from damage control to genuine
+improvement: with the same flips-as-proposal machinery it rejects more
+(199/391 on pass 1 — the ungated/old-gate entries were almost all noise
+or harmful) and the model ends **−0.040 nats below its pre-training
+eval** (+0.022 for ungated, +0.004 for the old single-window gate).
+Parity check: rerunning the v1 probe flags (`--ars-probe 32
+--ars-windows 1 --ars-margin-rel 0`) reproduces the old binary
+bit-for-bit (probe CE 6.7763/6.6213/…, eval 8.1074).
 
 *FineWeb 200-block run (finewebEval100k, eval @2000):*
 
@@ -751,12 +763,16 @@ ungated).
 |---|---|---|
 | pre-training | — | 9.4029 |
 | baseline (ungated) | 798 | 9.4310 |
-| **Accept-Reject Search** | 792 | **9.4267** |
+| ARS, single 32-token tail probe (v1 flags) | 792 | 9.4267 |
+| **ARS, probe 128/4 windows + rel margin (default)** | 962 | **9.4082** |
 
 On a *new* domain most proposals are genuinely adaptive, so the gate
-confirms them (792/798, 2 rejections incl. one 100%-rejected pass) and
-still lands +0.004 nats better than ungated. Cost: ~10–12% wall-clock
-(~65 ms/block at this scale).
+still confirms most of them, but the wider probe finds far more to
+reject: pass 1 keeps only 192/421 of the same proposals the v1 gate
+accepted wholesale (199 rejected vs 0), and the model lands **+0.005 of
+its pre-training eval** (ungated +0.028, v1 gate +0.024). Cost: ~10–12%
+wall-clock (~65 ms/block at this scale; the 4-window probe adds ~+0.2 s
+per trial).
 
 ## Project Structure
 

@@ -59,23 +59,30 @@ static void quantize_fp32_to_int8(FP32Weight& w) {
 }
 
 // Accept-Reject Search (--ars): after apply_bit_flips proposes flips, trial
-// them chunk-by-chunk on a short probe window (replayed from the live cache)
-// and keep only the chunks whose probe CE does not exceed the current best by
-// more than the margin. Rejected weights consume their (already zeroed)
+// them chunk-by-chunk on probe windows replayed from the live cache and keep
+// only the chunks whose probe CE does not exceed the current best by more
+// than the margin. Rejected weights consume their (already zeroed)
 // accumulator suggestion and revert to the pre-flip value.
+//
+// Statistical power: the probe is split into --ars-windows windows spread
+// evenly across the block (default 128 tokens in 4x32), and the accept
+// margin is max(--ars-margin, --ars-margin-rel * L_cur) so the gate widens
+// proportionally at high-CE (noisy) regimes instead of using a fixed
+// absolute nats threshold.
 static double ars_probe_ce(Model& model, const std::vector<uint16_t>& tokens,
-                           size_t end, size_t probe_len, float scale,
+                           size_t w_start, size_t w_len, float scale,
                            std::vector<float>& softmax_buf, KVCache& cache,
                            int V) {
-    // Rewind the cache so the window [end-probe_len, end) is replayed in
-    // place: writes land on the same positions and the K/V for the window is
-    // recomputed under the current weights each time. Caller guarantees the
-    // window stays inside the linear cache region (pos + probe_len <= MAXT).
-    const size_t w0 = (size_t)cache.pos - probe_len;
+    // Replay tokens [w_start, w_start+w_len) at cache positions
+    // [cache.pos - w_len, cache.pos). The caller sets cache.pos to the end of
+    // the replay; the rewinds land on the same positions and K/V is recomputed
+    // under the current weights each trial. Callee guarantees the window
+    // stays inside the linear cache region.
+    const size_t w0 = (size_t)cache.pos - w_len;
     cache.pos = (int)w0;
     double loss = 0.0;
     size_t cnt = 0;
-    for (size_t t = end - probe_len; t < end; t++) {
+    for (size_t t = w_start; t < w_start + w_len; t++) {
         std::vector<int> single = {tokens[t]};
         std::vector<float> logits = forward(model, single, cache, nullptr);
         float mx = -1e30f;
@@ -291,9 +298,11 @@ int main(int argc, char** argv) {
             "  --energy: feed -grad magnitude into accumulators (Exp 3, needed with --adaptive-thr)\n"
             "  --adaptive-thr K: per-channel flip threshold tau = K * RMS(acc) (Exp 3, scale-invariant)\n"
             "  --sparsity S: top-k feed — keep only the top fraction S of per-row |grad| (Exp 3, heavy tail)\n"
-            "  --ars (Accept-Reject Search): trial proposed flips chunk-by-chunk on a probe window,\n"
-            "         roll back chunks that do not improve probe CE (--ars-chunk, --ars-trials,\n"
-            "         --ars-probe, --ars-margin; default 64 / 16 / 32 / 0.02)\n");
+            "  --ars (Accept-Reject Search): trial proposed flips chunk-by-chunk on probe\n"
+            "         windows replayed from the live cache; keep chunks whose probe CE\n"
+            "         stays within the margin of the running best (--ars-chunk,\n"
+            "         --ars-trials, --ars-probe, --ars-windows, --ars-margin,\n"
+            "         --ars-margin-rel; defaults 64 / 16 / 128 / 4 / 0.02 / 0.005)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -369,8 +378,10 @@ int main(int argc, char** argv) {
     bool ars = false;
     int ars_chunk = 64;
     int ars_trials = 16;
-    int ars_probe = 32;
+    int ars_probe = 128;
+    int ars_windows = 4;
     float ars_margin = 0.02f;
+    float ars_margin_rel = 0.005f;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ars") == 0) ars = true;
     }
@@ -378,8 +389,12 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--ars-chunk") == 0) ars_chunk = atoi(argv[i + 1]);
         if (strcmp(argv[i], "--ars-trials") == 0) ars_trials = atoi(argv[i + 1]);
         if (strcmp(argv[i], "--ars-probe") == 0) ars_probe = atoi(argv[i + 1]);
+        if (strcmp(argv[i], "--ars-windows") == 0) ars_windows = atoi(argv[i + 1]);
         if (strcmp(argv[i], "--ars-margin") == 0) ars_margin = (float)atof(argv[i + 1]);
+        if (strcmp(argv[i], "--ars-margin-rel") == 0) ars_margin_rel = (float)atof(argv[i + 1]);
     }
+    if (ars_windows < 1) ars_windows = 1;
+    if (ars_probe < ars_windows) ars_probe = ars_windows;
     // Exp 3 flip mechanics: "--energy" switches the accumulator feed from
     // -sign(grad) votes to -grad magnitude; "--adaptive-thr K" sets the
     // per-channel flip threshold tau = K * RMS(acc); "--sparsity S" keeps only
@@ -620,13 +635,37 @@ int main(int argc, char** argv) {
             if (ars && n_changed > 0
                     && (size_t)cache.pos >= (size_t)ars_probe
                     && (size_t)cache.pos + (size_t)ars_probe <= (size_t)model.header.max_seq_len) {
-                // Roll every proposal back, then re-trial chunk by chunk on a
-                // probe window replayed from the live cache.
+                // Roll every proposal back, then re-trial chunk by chunk on
+                // probe windows replayed from the live cache.
+                const size_t blk = (size_t)cache.pos;
+                auto ars_probe_all = [&](size_t w_start) -> double {
+                    // --ars-probe tokens split into --ars-windows windows
+                    // spread evenly across the block; each window is replayed
+                    // in place (cache rewound to its own start).
+const size_t wl = (std::max)((size_t)1,
+                        (size_t)ars_probe / (size_t)((std::max)(1, ars_windows)));
+                const size_t K = (size_t)((std::max)(1, ars_windows));
+                double tot = 0.0;
+                size_t wsum = 0;
+                // Tail-first: window 0 is the block tail, the rest spread
+                // backward — with --ars-windows 1 the single window is
+                // exactly the old tail window ([end-32, end)).
+                for (size_t i = 0; i < K; i++) {
+                    size_t off = blk - (i + 1) * wl;
+                    if ((long long)off < 0 || off + wl > blk) break;
+                    size_t ws = w_start + off;
+                        cache.pos = (int)(off + wl);
+                        double ce = ars_probe_ce(model, tokens, ws, wl, scale,
+                                                 softmax_buf, cache, V);
+                        tot += ce * (double)wl;
+                        wsum += wl;
+                    }
+                    return wsum > 0 ? tot / (double)wsum : 0.0;
+                };
                 for (size_t wi = 0; wi < wlist.size(); wi++)
                     for (size_t i : changed[wi]) wlist[wi]->floats[i] = all_before[wi][i];
                 ars_repack(model);
-                double L_cur = ars_probe_ce(model, tokens, end, (size_t)ars_probe, scale,
-                                            softmax_buf, cache, V);
+                double L_cur = ars_probe_all(start);
                 std::vector<std::pair<size_t, size_t>> flat;
                 for (size_t wi = 0; wi < wlist.size(); wi++)
                     for (size_t i : changed[wi]) flat.emplace_back(wi, i);
@@ -642,9 +681,10 @@ int main(int argc, char** argv) {
                         for (size_t k = 0; k < nc; k++)
                             wlist[flat[p + k].first]->floats[flat[p + k].second] =
                                 all_after[flat[p + k].first][flat[p + k].second];
-                        double L_new = ars_probe_ce(model, tokens, end, (size_t)ars_probe, scale,
-                                                    softmax_buf, cache, V);
-                        if (L_new <= L_cur + ars_margin) {
+                        double L_new = ars_probe_all(start);
+                        float margin_eff = (std::max)(ars_margin,
+                                                      ars_margin_rel * (float)L_cur);
+                        if (L_new <= L_cur + margin_eff) {
                             L_cur = L_new;
                             ok_chunks++;
                             for (size_t k = 0; k < nc; k++) {
@@ -659,14 +699,16 @@ int main(int argc, char** argv) {
                     }
                     tried++;
                 }
-                // One final replay with the accepted floats leaves the window
-                // K/V consistent with the post-search weights.
-                if (!flat.empty())
-                    ars_probe_ce(model, tokens, end, (size_t)ars_probe, scale, softmax_buf, cache, V);
+                // The cache is rebuilt per block, so the K/V left by the last
+                // probe dies with this step; restore the natural position
+                // anyway so nothing depends on where the probe ended.
+                cache.pos = (int)blk;
                 ars_repack(model);
                 fprintf(stderr, "  ARS: trials=%zu accepted_chunks=%zu accepted_weights=%lld "
-                                "probeCE=%.4f (margin=%.4f)\n",
-                        tried, ok_chunks, real_changes, L_cur, (double)ars_margin);
+                                "probeCE=%.4f win=%d/%d (margin=%.4f)\n",
+                        tried, ok_chunks, real_changes, L_cur, ars_windows,
+                        ars_probe, (double)(std::max)(ars_margin,
+                                                      ars_margin_rel * (float)L_cur));
             } else {
                 for (size_t wi = 0; wi < wlist.size(); wi++) {
                     auto& hist = hists[wi];
