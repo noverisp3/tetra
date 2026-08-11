@@ -58,6 +58,64 @@ static void quantize_fp32_to_int8(FP32Weight& w) {
             "token_embedding.weight", scale, w.data.size());
 }
 
+// Accept-Reject Search (--ars): after apply_bit_flips proposes flips, trial
+// them chunk-by-chunk on a short probe window (replayed from the live cache)
+// and keep only the chunks whose probe CE does not exceed the current best by
+// more than the margin. Rejected weights consume their (already zeroed)
+// accumulator suggestion and revert to the pre-flip value.
+static double ars_probe_ce(Model& model, const std::vector<uint16_t>& tokens,
+                           size_t end, size_t probe_len, float scale,
+                           std::vector<float>& softmax_buf, KVCache& cache,
+                           int V) {
+    // Rewind the cache so the window [end-probe_len, end) is replayed in
+    // place: writes land on the same positions and the K/V for the window is
+    // recomputed under the current weights each time. Caller guarantees the
+    // window stays inside the linear cache region (pos + probe_len <= MAXT).
+    const size_t w0 = (size_t)cache.pos - probe_len;
+    cache.pos = (int)w0;
+    double loss = 0.0;
+    size_t cnt = 0;
+    for (size_t t = end - probe_len; t < end; t++) {
+        std::vector<int> single = {tokens[t]};
+        std::vector<float> logits = forward(model, single, cache, nullptr);
+        float mx = -1e30f;
+        for (int i = 0; i < V; i++) { float s = logits[i] * scale; if (s > mx) mx = s; }
+        double sum = 0.0;
+        for (int i = 0; i < V; i++) {
+            softmax_buf[i] = (float)std::exp((double)logits[i] * scale - mx);
+            sum += softmax_buf[i];
+        }
+        int tgt = tokens[t + 1];
+        loss += -std::log((double)(softmax_buf[tgt] / (float)(sum + 1e-12)) + 1e-12);
+        cnt++;
+    }
+    return cnt > 0 ? loss / (double)cnt : 0.0;
+}
+
+// Rebuild the 2-bit packed codes from the staged float weights after
+// Accept-Reject Search rollbacks (save_model writes w.packed verbatim,
+// so it must match floats).
+static void ars_repack(Model& model) {
+    for (auto& kv : model.ternary_weights) {
+        TernaryWeightXNOR& w = kv.second;
+        const int row_bytes = (w.cols + 3) / 4;
+        std::fill(w.packed.begin(), w.packed.end(), 0u);
+        for (int r = 0; r < w.rows; r++) {
+            const float* prow = w.floats.data() + (size_t)r * w.cols;
+            uint8_t* packed_row = w.packed.data() + (size_t)r * row_bytes;
+            for (int c = 0; c < w.cols; c++) {
+                float v = prow[c];
+                int enc;
+                if (v >= 1.5f || v <= -1.5f) enc = 3;   // ±2 outlier (code 11)
+                else if (v > 0.5f) enc = 2;             // +1
+                else if (v > -0.5f) enc = 1;            // 0
+                else enc = 0;                           // -1
+                packed_row[c >> 2] |= (uint8_t)(enc << (6 - (c & 3) * 2));
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     // Eval-only mode: --eval <model.bin> <tokens.bin> [max_positions] [--fast-lmhead]
     // Reports average next-token cross-entropy without any learning.
@@ -66,9 +124,14 @@ int main(int argc, char** argv) {
     // --compare-lmhead to measure the Top-1/Top-5 prediction divergence.
     if (argc >= 4 && strcmp(argv[1], "--eval") == 0) {
         bool fast_lmhead = false;
+        float scale_override = 0.0f;
         int pos_arg = 4;
         for (int i = 4; i < argc; i++) {
             if (strcmp(argv[i], "--fast-lmhead") == 0) fast_lmhead = true;
+            else if (strcmp(argv[i], "--sl-logit-scale") == 0 && i + 1 < argc) {
+                scale_override = (float)atof(argv[i + 1]);
+                i++;
+            }
             else if (pos_arg == 4) pos_arg = i;
         }
         Model model = load_model(argv[2]);
@@ -87,7 +150,7 @@ int main(int argc, char** argv) {
 
         const int H = model.header.hidden_dim;
         const int V = model.header.vocab_size;
-        const float scale = model.sl_logit_scale;
+        const float scale = scale_override > 0.0f ? scale_override : model.sl_logit_scale;
         KVCache cache;
         cache.init(model.header.num_layers, model.header.max_seq_len, H,
                    model.is_mla, model.kv_latent_dim, model.rope_dim);
@@ -220,13 +283,17 @@ int main(int argc, char** argv) {
             "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every] [toggle] [--toggle-window N] [--thr-anneal RATE] [--energy] [--adaptive-thr K]\n",
             argv[0]);
         fprintf(stderr,
-            "  thr/decay/flip_every/toggle override the v6 metadata (0 = keep metadata value; -1 for toggle = keep metadata)\n");
+            "  thr/decay/flip_every/toggle override the v6 metadata (0 = keep metadata value; -1 for toggle = keep metadata)\n"
+            "  --sl-logit-scale F: override the metadata logit scale (>0; 0 = keep metadata)\n");
         fprintf(stderr,
             "  --toggle-window N: only toggle for the first N blocks, then no-op flips (annealing, finding #12)\n"
             "  --thr-anneal RATE: raise the flip threshold by RATE per pass (finding #12 refinement)\n"
             "  --energy: feed -grad magnitude into accumulators (Exp 3, needed with --adaptive-thr)\n"
             "  --adaptive-thr K: per-channel flip threshold tau = K * RMS(acc) (Exp 3, scale-invariant)\n"
-            "  --sparsity S: top-k feed — keep only the top fraction S of per-row |grad| (Exp 3, heavy tail)\n");
+            "  --sparsity S: top-k feed — keep only the top fraction S of per-row |grad| (Exp 3, heavy tail)\n"
+            "  --ars (Accept-Reject Search): trial proposed flips chunk-by-chunk on a probe window,\n"
+            "         roll back chunks that do not improve probe CE (--ars-chunk, --ars-trials,\n"
+            "         --ars-probe, --ars-margin; default 64 / 16 / 32 / 0.02)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -295,6 +362,24 @@ int main(int argc, char** argv) {
             thr_anneal = (float)atof(argv[i + 1]);
         }
     }
+    // Accept-Reject Search (--ars): the flip pass proposes candidates, then
+    // re-trials them chunk-by-chunk on a probe window replayed from the live
+    // cache; chunks whose probe CE beats the running best (within the margin)
+    // are kept, the rest are rolled back.
+    bool ars = false;
+    int ars_chunk = 64;
+    int ars_trials = 16;
+    int ars_probe = 32;
+    float ars_margin = 0.02f;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ars") == 0) ars = true;
+    }
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--ars-chunk") == 0) ars_chunk = atoi(argv[i + 1]);
+        if (strcmp(argv[i], "--ars-trials") == 0) ars_trials = atoi(argv[i + 1]);
+        if (strcmp(argv[i], "--ars-probe") == 0) ars_probe = atoi(argv[i + 1]);
+        if (strcmp(argv[i], "--ars-margin") == 0) ars_margin = (float)atof(argv[i + 1]);
+    }
     // Exp 3 flip mechanics: "--energy" switches the accumulator feed from
     // -sign(grad) votes to -grad magnitude; "--adaptive-thr K" sets the
     // per-channel flip threshold tau = K * RMS(acc); "--sparsity S" keeps only
@@ -303,6 +388,7 @@ int main(int argc, char** argv) {
     bool energy_override = false;
     float adaptive_override = -1.0f;
     float sparsity_override = -1.0f;
+    float scale_override = 0.0f;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--energy") == 0) energy_override = true;
     }
@@ -312,6 +398,9 @@ int main(int argc, char** argv) {
         }
         if (strcmp(argv[i], "--sparsity") == 0) {
             sparsity_override = (float)atof(argv[i + 1]);
+        }
+        if (strcmp(argv[i], "--sl-logit-scale") == 0) {
+            scale_override = (float)atof(argv[i + 1]);
         }
     }
 
@@ -342,7 +431,7 @@ int main(int argc, char** argv) {
     const float decay = decay_override > 0.0f ? decay_override : model.sl_acc_decay;
     const int flip_every = every_override > 0 ? every_override : model.sl_flip_every_n;
     const bool toggle = toggle_override >= 0 ? (toggle_override != 0) : (model.sl_toggle != 0);
-    const float scale = model.sl_logit_scale;
+    const float scale = scale_override > 0.0f ? scale_override : model.sl_logit_scale;
     const float lr_emb = model.sl_lr_embedding;
     const float wd_emb = model.sl_wd_embedding;
     const bool energy = energy_override ? true : (model.sl_energy != 0);
@@ -376,7 +465,7 @@ int main(int argc, char** argv) {
             (toggle_window > 0 ? " (anneal off after block " + std::to_string(toggle_window) + ")" : "").c_str(),
             scale, lr_emb, wd_emb,
             (thr_anneal > 0.0f ? " | thr-anneal +" + std::to_string(thr_anneal) + "/pass" : "").c_str(),
-            no_ternary ? " | embedding-only" : (flip_only ? " | flip-only" : ""),
+            no_ternary ? " | embedding-only" : (flip_only ? " | flip-only" : (ars ? " | ARS" : "")),
             energy ? 1 : 0, adaptive_thr, sparsity);
 
     double ms_total = 0.0;
@@ -492,6 +581,7 @@ int main(int argc, char** argv) {
 
         // Bit flips every N steps.
         long long total_flips = 0;
+        long long n_changed = 0;
         long long real_changes = 0;
         if (!no_ternary && flip_every > 0 && (step + 1) % flip_every == 0) {
             long long acc_over20 = 0, acc_over15 = 0;
@@ -512,17 +602,76 @@ int main(int argc, char** argv) {
                     ? thr + thr_anneal * ((float)((step + 1) / flip_every) - 1.0f)
                     : thr;
             const bool eff_toggle = toggle && (toggle_window <= 0 || (int)step + 1 <= toggle_window);
+            std::vector<std::vector<float>> all_before(wlist.size());
+            std::vector<std::vector<float>> all_after(wlist.size());
+            std::vector<std::vector<size_t>> changed(wlist.size());
             for (size_t wi = 0; wi < wlist.size(); wi++) {
                 TernaryWeightXNOR& w = *wlist[wi];
-                auto& hist = hists[wi];
                 const size_t n = w.floats.size();
-                std::vector<float> before(n);
-                memcpy(before.data(), w.floats.data(), n * sizeof(float));
+                all_before[wi].resize(n);
+                memcpy(all_before[wi].data(), w.floats.data(), n * sizeof(float));
                 total_flips += apply_bit_flips(w, eff_thr, eff_toggle, model.sl_outlier_mult,
                                                adaptive_thr);
-                const float* f = w.floats.data();
+                all_after[wi].resize(n);
+                memcpy(all_after[wi].data(), w.floats.data(), n * sizeof(float));
                 for (size_t i = 0; i < n; i++)
-                    if (f[i] != before[i]) { hist[i]++; real_changes++; }
+                    if (all_after[wi][i] != all_before[wi][i]) { changed[wi].push_back(i); n_changed++; }
+            }
+            if (ars && n_changed > 0
+                    && (size_t)cache.pos >= (size_t)ars_probe
+                    && (size_t)cache.pos + (size_t)ars_probe <= (size_t)model.header.max_seq_len) {
+                // Roll every proposal back, then re-trial chunk by chunk on a
+                // probe window replayed from the live cache.
+                for (size_t wi = 0; wi < wlist.size(); wi++)
+                    for (size_t i : changed[wi]) wlist[wi]->floats[i] = all_before[wi][i];
+                ars_repack(model);
+                double L_cur = ars_probe_ce(model, tokens, end, (size_t)ars_probe, scale,
+                                            softmax_buf, cache, V);
+                std::vector<std::pair<size_t, size_t>> flat;
+                for (size_t wi = 0; wi < wlist.size(); wi++)
+                    for (size_t i : changed[wi]) flat.emplace_back(wi, i);
+                size_t tried = 0, ok_chunks = 0;
+                real_changes = 0;
+                for (size_t p = 0; p < flat.size(); p += (size_t)ars_chunk) {
+                    size_t nc = (std::min)((size_t)ars_chunk, flat.size() - p);
+                    if (tried >= (size_t)ars_trials) {
+                        for (size_t k = 0; k < nc; k++)
+                            wlist[flat[p + k].first]->floats[flat[p + k].second] =
+                                all_before[flat[p + k].first][flat[p + k].second];
+                    } else {
+                        for (size_t k = 0; k < nc; k++)
+                            wlist[flat[p + k].first]->floats[flat[p + k].second] =
+                                all_after[flat[p + k].first][flat[p + k].second];
+                        double L_new = ars_probe_ce(model, tokens, end, (size_t)ars_probe, scale,
+                                                    softmax_buf, cache, V);
+                        if (L_new <= L_cur + ars_margin) {
+                            L_cur = L_new;
+                            ok_chunks++;
+                            for (size_t k = 0; k < nc; k++) {
+                                hists[flat[p + k].first][flat[p + k].second]++;
+                                real_changes++;
+                            }
+                        } else {
+                            for (size_t k = 0; k < nc; k++)
+                                wlist[flat[p + k].first]->floats[flat[p + k].second] =
+                                    all_before[flat[p + k].first][flat[p + k].second];
+                        }
+                    }
+                    tried++;
+                }
+                // One final replay with the accepted floats leaves the window
+                // K/V consistent with the post-search weights.
+                if (!flat.empty())
+                    ars_probe_ce(model, tokens, end, (size_t)ars_probe, scale, softmax_buf, cache, V);
+                ars_repack(model);
+                fprintf(stderr, "  ARS: trials=%zu accepted_chunks=%zu accepted_weights=%lld "
+                                "probeCE=%.4f (margin=%.4f)\n",
+                        tried, ok_chunks, real_changes, L_cur, (double)ars_margin);
+            } else {
+                for (size_t wi = 0; wi < wlist.size(); wi++) {
+                    auto& hist = hists[wi];
+                    for (size_t i : changed[wi]) { hist[i]++; real_changes++; }
+                }
             }
             // Churn buckets: fraction of weights flipped at least 1/2/4/8 times cumulatively.
             long long ever = 0, m2 = 0, m4 = 0, m8 = 0;

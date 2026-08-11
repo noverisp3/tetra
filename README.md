@@ -709,6 +709,55 @@ Unit tests: `tests/test_erc.py` (9 tests — commit math, forward parity,
 gradient flow to both paths, level-unit commit, output neutrality, full
 carry == state-dict carry, fp16 residual).
 
+### Accept-Reject Search (`--ars`, on-device flip gating)
+
+The flip pass is a heuristic: it votes on single-block gradient evidence,
+so its proposals are noisy — ungated flips measurably degrade a trained
+model over time (a 20-block run on `exp7_cpp_k3_v6.bin` moved eval CE
+8.1038 → 8.1254). Accept-Reject Search closes the loop by *evaluating
+each proposed chunk on the model itself* before committing:
+
+1. `apply_bit_flips` proposes candidates as usual (all rolled back).
+2. The window `[end−probe, end)` is replayed from the live KV cache
+   (cache is rewound, K/V recomputed under the current weights) to get
+   the baseline probe CE.
+3. Proposals are re-trialled chunk-by-chunk (`--ars-chunk`, default 64);
+   each chunk restarts the window replay and is kept only if its probe CE
+   beats the running best within `--ars-margin` (default 0.02), otherwise
+   it is rolled back and its accumulator suggestion is discarded.
+4. A final replay leaves the window K/V consistent with the accepted
+   weights. The replay is exact in the cache's linear region
+   (`pos + probe ≤ max_seq_len`), which always holds on-device since the
+   training cache is rebuilt per block.
+
+A/B results (thr=1.0 decay=0.99 flipEvery=4 toggle=1, same seed/params,
+identical eval conditions):
+
+*Slice 20-block smoke (`exp7_cpp_k3_v6.bin`, sliceEval100k, eval @2000):*
+
+| Run | flips applied | eval CE |
+|---|---|---|
+| pre-training | — | 8.1038 |
+| baseline (ungated) | 798 | 8.1254 |
+| **Accept-Reject Search** | 619 | **8.1074** |
+
+The gate rejected 179 proposals across 5 flip passes (65% of one pass)
+and held the model within +0.004 of its pre-training eval (vs +0.022 for
+ungated).
+
+*FineWeb 200-block run (finewebEval100k, eval @2000):*
+
+| Run | flips applied | eval CE |
+|---|---|---|
+| pre-training | — | 9.4029 |
+| baseline (ungated) | 798 | 9.4310 |
+| **Accept-Reject Search** | 792 | **9.4267** |
+
+On a *new* domain most proposals are genuinely adaptive, so the gate
+confirms them (792/798, 2 rejections incl. one 100%-rejected pass) and
+still lands +0.004 nats better than ungated. Cost: ~10–12% wall-clock
+(~65 ms/block at this scale).
+
 ## Project Structure
 
 ```
