@@ -120,6 +120,10 @@ static double ars_probe_block(Model& model, const std::vector<uint16_t>& tokens,
         tot += ce * (double)wl;
         wsum += wl;
     }
+    // Replay is position-neutral per window, but the loop leaves pos at the
+    // last window's end; restore the block end so consecutive probes (and
+    // anything reading cache.pos after) always see the same state.
+    cache.pos = (int)blk;
     return wsum > 0 ? tot / (double)wsum : 0.0;
 }
 
@@ -335,7 +339,10 @@ int main(int argc, char** argv) {
             "         --ars-margin-rel; defaults 64 / 16 / 128 / 4 / 0.02 / 0.005)\n"
             "  --ars-emb: also gate embedding row updates through the block probe\n"
             "         (top --ars-emb-max rows by |grad| per block; default 4)\n"
-            "  --sl-lr-embedding F: override the exported embedding LR (>0; 0 = keep)\n");
+            "  --sl-lr-embedding F: override the exported embedding LR (>0; 0 = keep)\n"
+            "  --ars-block: whole-block gate — probe CE before/after each step's\n"
+            "         updates and roll back flips+embedding if CE degrades past\n"
+            "         the standard ARS margin (full undo, incl. weight decay)\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -442,6 +449,12 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--sl-lr-embedding") == 0) lr_emb_override = (float)atof(argv[i + 1]);
     }
     if (ars_emb_max < 1) ars_emb_max = 1;
+    // --ars-block gates the whole step: probe CE before/after the updates and
+    // roll back every parameter change if it degrades past the ARS margin.
+    bool ars_block = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ars-block") == 0) ars_block = true;
+    }
     // Exp 3 flip mechanics: "--energy" switches the accumulator feed from
     // -sign(grad) votes to -grad magnitude; "--adaptive-thr K" sets the
     // per-channel flip threshold tau = K * RMS(acc); "--sparsity S" keeps only
@@ -623,6 +636,22 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Whole-block ARS (--ars-block): baseline probe right after the block
+        // forward, before any embedding/flip updates. The rollback snapshots
+        // for this step live here (per-tensor staged floats + embedding copy).
+        std::vector<std::vector<float>> all_before;
+        std::vector<float> emb_old;
+        std::vector<std::pair<size_t, size_t>> ars_accepted;
+        double pre_ce = -1.0;
+        bool have_flip_final = false;
+        double L_flip_final = -1.0;
+        if (ars_block) {
+            const size_t blk = (size_t)cache.pos;
+            if (blk >= (size_t)ars_probe && blk + (size_t)ars_probe <= (size_t)model.header.max_seq_len)
+                pre_ce = ars_probe_block(model, tokens, start, blk, ars_probe, ars_windows,
+                                         scale, softmax_buf, cache, V);
+        }
+
         // Embedding local SGD: per-row clip (norm<1 -> normalize) + decoupled WD.
         // With --ars-emb, the top --ars-emb-max rows by |grad| are trialled
         // through the block probe like flip chunks: apply the full LR step,
@@ -642,7 +671,7 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < emb_order.size(); i++) emb_order[i] = (int)i;
             std::sort(emb_order.begin(), emb_order.end(),
                       [&](int a, int b) { return emb_norm[(size_t)a] > emb_norm[(size_t)b]; });
-            std::vector<float> emb_old((size_t)V * H);
+            emb_old.resize((size_t)V * H);
             memcpy(emb_old.data(), emb, (size_t)V * H * sizeof(float));
             long long emb_tried = 0, emb_accepted = 0;
             double L_emb = 0.0;
@@ -701,7 +730,7 @@ int main(int argc, char** argv) {
                     ? thr + thr_anneal * ((float)((step + 1) / flip_every) - 1.0f)
                     : thr;
             const bool eff_toggle = toggle && (toggle_window <= 0 || (int)step + 1 <= toggle_window);
-            std::vector<std::vector<float>> all_before(wlist.size());
+            all_before.resize(wlist.size());
             std::vector<std::vector<float>> all_after(wlist.size());
             std::vector<std::vector<size_t>> changed(wlist.size());
             for (size_t wi = 0; wi < wlist.size(); wi++) {
@@ -751,6 +780,7 @@ const size_t blk = (size_t)cache.pos;
                             for (size_t k = 0; k < nc; k++) {
                                 hists[flat[p + k].first][flat[p + k].second]++;
                                 real_changes++;
+                                ars_accepted.emplace_back(flat[p + k].first, flat[p + k].second);
                             }
                         } else {
                             for (size_t k = 0; k < nc; k++)
@@ -765,6 +795,8 @@ const size_t blk = (size_t)cache.pos;
                 // anyway so nothing depends on where the probe ended.
                 cache.pos = (int)blk;
                 ars_repack(model);
+                have_flip_final = true;
+                L_flip_final = L_cur;
                 fprintf(stderr, "  ARS: trials=%zu accepted_chunks=%zu accepted_weights=%lld "
                                 "probeCE=%.4f win=%d/%d (margin=%.4f)\n",
                         tried, ok_chunks, real_changes, L_cur, ars_windows,
@@ -772,26 +804,12 @@ const size_t blk = (size_t)cache.pos;
             } else {
                 for (size_t wi = 0; wi < wlist.size(); wi++) {
                     auto& hist = hists[wi];
-                    for (size_t i : changed[wi]) { hist[i]++; real_changes++; }
+                    for (size_t i : changed[wi]) {
+                        hist[i]++; real_changes++;
+                        ars_accepted.emplace_back(wi, i);
+                    }
                 }
             }
-            // Churn buckets: fraction of weights flipped at least 1/2/4/8 times cumulatively.
-            long long ever = 0, m2 = 0, m4 = 0, m8 = 0;
-            for (auto& h : hists)
-                for (auto c : h) {
-                    if (c) ever++;
-                    if (c >= 2) m2++;
-                    if (c >= 4) m4++;
-                    if (c >= 8) m8++;
-                }
-            double tot = (double)total_w;
-            fprintf(stderr, "  flips=%lld (real changes=%lld, %.1f%% no-op, eff_thr=%.1f) | "
-                            "churn: ever=%.2f%% >=2=%.2f%% >=4=%.2f%% >=8=%.2f%%\n",
-                    total_flips, real_changes,
-                    total_flips > 0 ? 100.0 * (1.0 - (double)real_changes / total_flips) : 0.0,
-                    eff_thr,
-                    ever / tot * 100.0, m2 / tot * 100.0, m4 / tot * 100.0, m8 / tot * 100.0);
-
             // Rescue-then-freeze (finding #12): at the toggle-window boundary,
             // zero every accumulator so the mass-kick residual does not keep
             // driving real flips for hundreds of blocks after toggle turns off.
@@ -807,6 +825,62 @@ const size_t blk = (size_t)cache.pos;
                         toggle_window, nacc);
             }
         }
+
+        // Whole-block ARS gate (--ars-block): keep this step's changes only if
+        // the post-update probe CE stays within the margin of the pre-update
+        // baseline; otherwise restore the staged float weights and the
+        // embedding copy (full undo — even this step's weight decay reverts).
+        if (ars_block && pre_ce >= 0.0) {
+            const size_t blk = (size_t)cache.pos;
+            double post_ce = L_flip_final;
+            if (!have_flip_final) {
+                if (blk >= (size_t)ars_probe && blk + (size_t)ars_probe <= (size_t)model.header.max_seq_len)
+                    post_ce = ars_probe_block(model, tokens, start, blk, ars_probe, ars_windows,
+                                              scale, softmax_buf, cache, V);
+                else
+                    post_ce = -1.0;
+            }
+            if (post_ce >= 0.0) {
+                const double margin = ars_margin_eff(ars_margin, ars_margin_rel, pre_ce);
+                if (post_ce > pre_ce + margin) {
+                    for (size_t wi = 0; wi < wlist.size() && wi < all_before.size(); wi++)
+                        if (!all_before[wi].empty())
+                            memcpy(wlist[wi]->floats.data(), all_before[wi].data(),
+                                   all_before[wi].size() * sizeof(float));
+                    if (!all_before.empty()) ars_repack(model);
+                    if (!flip_only && emb_old.size() == (size_t)V * H)
+                        memcpy(emb, emb_old.data(), (size_t)V * H * sizeof(float));
+                    real_changes = 0;
+                    for (auto& p : ars_accepted)
+                        if (hists[p.first][p.second] > 0) hists[p.first][p.second]--;
+                    fprintf(stderr, "  ARS-block: pre=%.4f post=%.4f margin=%.4f -> REVERTED flips+emb\n",
+                            pre_ce, post_ce, margin);
+                } else {
+                    fprintf(stderr, "  ARS-block: pre=%.4f post=%.4f margin=%.4f -> kept\n",
+                            pre_ce, post_ce, margin);
+                }
+            }
+        }
+
+        // Churn buckets: fraction of weights flipped at least 1/2/4/8 times cumulatively.
+        long long ever = 0, m2 = 0, m4 = 0, m8 = 0;
+        for (auto& h : hists)
+            for (auto c : h) {
+                if (c) ever++;
+                if (c >= 2) m2++;
+                if (c >= 4) m4++;
+                if (c >= 8) m8++;
+            }
+        double tot = (double)total_w;
+        const float eff_thr = thr_anneal > 0.0f
+                ? thr + thr_anneal * ((float)((step + 1) / flip_every) - 1.0f)
+                : thr;
+        fprintf(stderr, "  flips=%lld (real changes=%lld, %.1f%% no-op, eff_thr=%.1f) | "
+                        "churn: ever=%.2f%% >=2=%.2f%% >=4=%.2f%% >=8=%.2f%%\n",
+                total_flips, real_changes,
+                total_flips > 0 ? 100.0 * (1.0 - (double)real_changes / total_flips) : 0.0,
+                eff_thr,
+                ever / tot * 100.0, m2 / tot * 100.0, m4 / tot * 100.0, m8 / tot * 100.0);
 
         auto te = std::chrono::high_resolution_clock::now();
         ms_total += std::chrono::duration<double, std::milli>(te - ts).count();

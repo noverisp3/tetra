@@ -946,12 +946,48 @@ lrEmb 1e-4, probe 64/2 windows):
   reproduces the pre-change block CEs (6.8898 / 6.7274 / 6.8387) and saves
   a distinct file when gating is on (updates applied / skipped correctly).
 
-**Verdict: WIP — gate mechanics validated, adaptive benefit not yet
+**Verdict: gate mechanics validated, adaptive benefit not yet
 measured.** The gate strictly rejects harmful rows and preserves the exact
 non-ARS trajectory, but a 10-block smoke cannot show whether gated
 embeddings train *better* than ungated. Next step: 200-block A/B
 (`--ars-emb` on/off) on finewebEval100k, same protocol as the flip-gate A/B
 in README, to see if gate-confirmed rows wash the embedding-noise floor.
+
+**A/B (200 blocks, fineweb, 2026-08-11): NULL RESULT — gating is free at
+working LRs, so `--ars-emb` stays OFF by default.** Three arms on
+`exp7_v6_lr5.bin` (natural scale, metadata `energy/adaptiveThr=3/sparsity=0.01`
+active), `data/fineweb_10bt/fineweb_0000.bin`, thr=1.0 decay=0.99
+flipEvery=4 toggle=1, 200 blocks:
+
+| Arm | probes/block | wall/block | slice @10K | fineweb @10K |
+|---|---|---|---|---|
+| baseline eval | — | — | 8.2026 | 9.3451 |
+| `--ars` (flip gate) | 0 + flip trials | 2.68 s | 8.2107 | 9.2599 |
+| `--ars --ars-emb` | +5 | 4.55 s (+70%) | 8.2107 | 9.2599 |
+| `--ars --ars-emb --ars-block` | +6 | 5.15 s (+92%) | 8.2107 | 9.2599 |
+
+All three trained models are **byte-identical (same SHA256)**: with
+`lr_emb=1e-5` (the natural-scale-correct LR baked into the metadata) every
+proposal is accepted — the ARS-emb gate rejects 0/4 rows on every block,
+the block gate sees pre==post CE and never fires — while the probe traffic
+costs +70–92% wall. The gate only exercises at higher LRs (the compressed-
+scale smoke at `lr_emb=1e-4` rejected 0–3 rows/block); it is a tool for
+that regime, not a default. The runs themselves did show the continual-
+learning signal (fineweb eval −0.085 nats, slice +0.008).
+
+**Bug fixed along the way:** `ars_probe_block` now restores `cache.pos` to
+the block end. Before, each call left pos at the *last probe window's* end,
+so consecutive probes (ARS-emb baselines/trials, the block gate) drifted to
+progressively smaller windows (128→96→32 tokens) and under-measured the
+block; flip-ARS was unaffected (it probes from a fixed captured `blk`).
+
+**Open issue (pre-existing, not from this work):** `--eval` on
+`fineweb_eval100k.bin @10000` positions crashes nondeterministically with
+`0xC0000409` (fast-fail) ~1 in 3 runs (hit on arm_a once, arm_b twice;
+retries succeed, @9000 never crashes, slice @10000 never crashes). The eval
+code path is untouched by the ARS work; suspect a latent heap/race issue in
+long evals. Needs its own investigation (reproduce under
+`/MTd`/sanitizer build).
 
 Reproduce:
 
@@ -960,6 +996,8 @@ Reproduce:
 inference\build.bat avx2
 # gated embedding smoke (10 blocks, probe 64/2, 4 rows/block trialled)
 inference\selflearn_avx2.exe checkpoints_discrete_c3\exp_tog_s0_zacc.bin examples\discrete\slice100k.bin tmp_arsemb.bin 10 1 10 20 0.99 5 0 --ars --ars-emb --ars-probe 64 --ars-windows 2 --ars-emb-max 4
+# whole-block gate (--ars-block): pre/post probe each step, full rollback on breach
+inference\selflearn_avx2.exe checkpoints_discrete_c3\exp_tog_s0_zacc.bin examples\discrete\slice100k.bin tmp_blk.bin 6 1 6 20 0.99 5 0 --ars --ars-emb --ars-block --ars-probe 64 --ars-windows 2 --ars-emb-max 4
 # parity: identical block CEs to the pre-Exp-16 build, no ARS-emb lines
 inference\selflearn_avx2.exe checkpoints_discrete_c3\exp_tog_s0_zacc.bin examples\discrete\slice100k.bin tmp_noars.bin 3 1 3 20 0.99 5 0
 ```

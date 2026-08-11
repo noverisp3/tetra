@@ -782,6 +782,18 @@ exported embedding LR (>0; 0 keeps the metadata value). Weight decay
 still applies to every row (reverted ones included), and non-ARS runs
 keep the exact previous arithmetic (bit-identical — Exp 16).
 
+`--ars-block` gates the whole step: it probes CE before and after each
+block's updates and rolls back **all** parameter changes (flips +
+embedding + that step's weight decay) if the post-update probe CE
+degrades beyond the ARS margin.
+
+Exp 16 A/B (200 fineweb blocks, natural-scale checkpoint): the gated arms
+trained **byte-identical** models to the ungated arm — at the working
+embedding LR (1e-5) every proposal is accepted, so `--ars-emb` /
+`--ars-block` add +70–92% probe wall-time with zero behavioral delta.
+**Both flags stay off by default**; they are tools for the high-embedding-LR
+/ compressed-scale regime where the gate demonstrably rejects harmful rows.
+
 ## Project Structure
 
 ```
