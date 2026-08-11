@@ -552,6 +552,7 @@ def export_self_learning(
     logit_scale=1.0 / 16.0, lr_embedding=1e-4, wd_embedding=0.1,
     block_size=128, toggle=False, reset_accs=False, metadata=None, verbose=True,
     v7=False, energy=False, adaptive_thr=0.0, sparsity=0.0,
+    scale_mode="ste",
 ):
     """Export a stochastic model to binary format v6/v7 for the C++ self-learning runtime.
 
@@ -717,6 +718,7 @@ def export_self_learning(
             "sl_flip_every_n": int(flip_every_n),
             "sl_toggle": int(toggle),
             "sl_logit_scale": float(logit_scale),
+            "sl_logit_scale_mode": scale_mode,
             "sl_lr_embedding": float(lr_embedding),
             "sl_wd_embedding": float(wd_embedding),
             "sl_block_size": int(block_size),
@@ -801,7 +803,7 @@ def export_model(model, output_path, mode="ste", quantize_int8=False,
             rope_per_head=info.get("rope_per_head", 0),
             group_size=info.get("group_size", 0),
             int8_embeddings=bool(quantize_int8),
-            version=8 if v8 else (7 if v7 else 5),
+            version=8 if v8 else (7 if v7 else (6 if mode == "stochastic" else 5)),
             v8_k=v8_k if v8 else 0,
         )
 
@@ -814,7 +816,7 @@ def export_model(model, output_path, mode="ste", quantize_int8=False,
         # Write metadata section
         if metadata:
             meta = dict(metadata)
-            meta["_export_version"] = 8 if v8 else (7 if v7 else 5)
+            meta["_export_version"] = 8 if v8 else (7 if v7 else (6 if mode == "stochastic" else 5))
             meta["_export_time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             meta["_info"] = {
                 k: v for k, v in info.items()
@@ -958,8 +960,10 @@ Examples:
         #   here silently inflates every CE ~+1.8 nats (softmax near-uniform)
         #   and weakens the embedding gradient the runtime feeds on (Exp 7).
         logit_scale = args.sl_logit_scale
+        scale_mode = "manual" if args.sl_logit_scale is not None else ""
         if logit_scale is None:
             logit_scale = 1.0 / (config["hidden_dim"] ** 0.5) if is_discrete else 1.0
+            scale_mode = "discrete" if is_discrete else "ste"
         metadata = dict(config) if not args.no_metadata else {}
         for k in list(metadata.keys()):
             v = metadata[k]
@@ -986,6 +990,7 @@ Examples:
             energy=args.sl_energy,
             adaptive_thr=args.sl_adaptive_thr,
             sparsity=args.sl_sparsity,
+            scale_mode=scale_mode,
         )
         return
 

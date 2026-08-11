@@ -343,6 +343,14 @@ def main():
                      "(isolate the quantizer variable)")
     if args.sr and args.erc:
         parser.error("--sr and --erc are mutually exclusive (ERCLinear has no SR path yet)")
+    if args.mla and args.mode != "stochastic":
+        parser.error("--mla requires --mode stochastic (MLA projections are "
+                     "StochasticTernaryLinear only; --mla with STE silently "
+                     "built a plain transformer before this guard)")
+    if args.mla and (args.v8_forward or args.lq or args.sr or args.soft_quant_gamma):
+        parser.error("--mla is exclusive with STE-only flags "
+                     "(--v8-forward / --lq / --sr / --soft-quant-gamma); "
+                     "MLA is stochastic bit-flip only, there is no v8 variant")
     config.ortho_reg = args.ortho_reg
     config.rank_monitor_interval = args.rank_monitor_interval
     config.rank_halt = args.rank_halt

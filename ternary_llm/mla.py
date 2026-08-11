@@ -19,8 +19,13 @@ def precompute_freqs_cis(
     max_seq_len: int,
     base: float = 10000.0,
     device: str = "cpu",
-) -> torch.Tensor:
-    """Precompute complex-valued RoPE frequency tensor.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute real-valued RoPE frequencies (cos/sin).
+
+    DML-safe: DirectML has no complex dtype (torch.view_as_complex crashes
+    with 'Invalid or unsupported data type ComplexFloat'), so frequencies are
+    kept as separate cos/sin tensors and applied with real arithmetic —
+    mathematically identical to complex multiplication.
 
     Args:
         dim: number of frequency pairs (rope_per_head, NOT the full rope_dim).
@@ -29,29 +34,35 @@ def precompute_freqs_cis(
         device: target device for the tensor.
 
     Returns:
-        Complex tensor of shape (max_seq_len, dim) for rotary embedding.
+        Tuple of (cos, sin), each of shape (max_seq_len, dim / 2).
     """
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
     t = torch.arange(max_seq_len, device=device).float()
-    freqs = torch.outer(t, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)
+    theta = torch.outer(t, freqs)
+    return torch.cos(theta), torch.sin(theta)
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Apply Rotary Position Embedding to input tensor.
+def apply_rotary_emb(
+    x: torch.Tensor, freqs_cis: tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor:
+    """Apply Rotary Position Embedding to input tensor (real arithmetic).
 
     Args:
         x: input tensor of shape (..., seq_len, rope_per_head).
-        freqs_cis: precomputed complex frequencies of shape (seq_len, rope_per_head/2).
+        freqs_cis: tuple of (cos, sin), each (seq_len, rope_per_head / 2).
 
     Returns:
         Rotated tensor of same shape as input.
     """
+    cos, sin = freqs_cis
+    cos = cos[None, None, : x.shape[-2], :]
+    sin = sin[None, None, : x.shape[-2], :]
     x_float = x.float()
-    x_complex = torch.view_as_complex(x_float.reshape(*x_float.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[None, None, : x.shape[-2], :]
-    x_rotated = torch.view_as_real(x_complex * freqs_cis).reshape(*x.shape)
-    return x_rotated.to(x.dtype)
+    xr = x_float.reshape(*x_float.shape[:-1], -1, 2)
+    x_even, x_odd = xr[..., 0], xr[..., 1]
+    out_even = x_even * cos - x_odd * sin
+    out_odd = x_even * sin + x_odd * cos
+    return torch.stack([out_even, out_odd], dim=-1).reshape(*x.shape).to(x.dtype)
 
 
 class StochasticMLAAttention(nn.Module):
@@ -146,23 +157,28 @@ class StochasticMLAAttention(nn.Module):
             int8=int8, per_channel=per_channel, group_size=group_size, outlier_thr_mult=outlier_thr_mult,
         )
         self.attn_dropout = nn.Dropout(dropout)
-        self.register_buffer("freqs_cis", None, persistent=False)
+        # RoPE frequency cache (plain attrs — lazy (cos, sin), not buffers)
+        self._freqs_cos = None
+        self._freqs_sin = None
 
-    def _get_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Get or lazily compute RoPE frequencies for the given sequence length.
+    def _get_freqs(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get or lazily compute RoPE (cos, sin) for the given sequence length.
 
         Args:
             seq_len: required sequence length.
             device: target device.
 
         Returns:
-            Complex frequency tensor of shape (seq_len, rope_per_head).
+            Tuple of (cos, sin) tensors of shape (seq_len, rope_per_head / 2).
         """
-        if self.freqs_cis is None or self.freqs_cis.size(-2) < seq_len:
-            self.freqs_cis = precompute_freqs_cis(
+        if self._freqs_cos is None or self._freqs_cos.size(-2) < seq_len:
+            self._freqs_cos, self._freqs_sin = precompute_freqs_cis(
                 self.rope_per_head, max(seq_len * 2, 512), device=device
             )
-        return self.freqs_cis[:seq_len, :].to(device)
+        return (
+            self._freqs_cos[:seq_len].to(device),
+            self._freqs_sin[:seq_len].to(device),
+        )
 
     def forward(
         self,

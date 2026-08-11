@@ -577,6 +577,8 @@ struct Model {
     float sl_acc_decay = 0.99f;
     int sl_flip_every_n = 5;
     float sl_logit_scale = 0.0625f;
+    std::string sl_scale_mode;    // "ste"|"discrete"|"manual" (written by the
+                                  // fixed exporter; empty = pre-8/9 stale export)
     float sl_lr_embedding = 1e-4f;
     float sl_wd_embedding = 0.1f;
     int sl_block_size = 128;
@@ -847,6 +849,7 @@ static Model load_model(const char* path) {
         model.sl_acc_decay   = (float)json_get_num(meta, "sl_acc_decay",   0.99);
         model.sl_flip_every_n = (int)json_get_num(meta, "sl_flip_every_n", 5);
         model.sl_logit_scale = (float)json_get_num(meta, "sl_logit_scale", 0.0625);
+        model.sl_scale_mode = json_get_str(meta, "sl_logit_scale_mode");
         model.sl_lr_embedding = (float)json_get_num(meta, "sl_lr_embedding", 1e-4);
         model.sl_wd_embedding = (float)json_get_num(meta, "sl_wd_embedding", 0.1);
         model.sl_block_size  = (int)json_get_num(meta, "sl_block_size",    128);
@@ -856,6 +859,16 @@ static Model load_model(const char* path) {
         model.sl_adaptive_thr = (float)json_get_num(meta, "sl_adaptive_thr", 0.0);
         model.sl_sparsity = (float)json_get_num(meta, "sl_sparsity", 0.0);
         model.sl_enabled = true;
+        if (model.sl_scale_mode.empty()) {
+            float natural = 1.0f / sqrtf((float)model.header.hidden_dim);
+            if (fabsf(model.sl_logit_scale - natural) < 1e-4f)
+                fprintf(stderr,
+                    "WARNING: sl_logit_scale=%.4f equals the discrete-regime 1/sqrt(H) calibration and the "
+                    "file has no sl_logit_scale_mode marker. If this is a natural-regime (STE) checkpoint it "
+                    "was exported with the pre-8/9 buggy exporter - re-export with the current export_model.py "
+                    "or override the scale with --sl-logit-scale.\n",
+                    model.sl_logit_scale);
+        }
         fprintf(stderr, "Self-learning: rule=%s thr=%.1f decay=%.3f flipEvery=%d toggle=%d scale=%.6f embLR=%.1e embWD=%.2f block=%d outlierMult=%.2f energy=%d adaptiveThr=%.3f sparsity=%.3f\n",
                 rule.c_str(), model.sl_threshold, model.sl_acc_decay, model.sl_flip_every_n,
                 model.sl_toggle, model.sl_logit_scale, model.sl_lr_embedding, model.sl_wd_embedding, model.sl_block_size, model.sl_outlier_mult,
@@ -1692,17 +1705,21 @@ static std::string build_sl_metadata(const Model& m) {
     else if (m.sl_rule == 3) rule = "h";
     else if (m.sl_rule == 4) rule = "e";
     char buf[612];
+    std::string extra;
+    if (!m.sl_scale_mode.empty()) {
+        extra = ",\"sl_logit_scale_mode\":\"" + m.sl_scale_mode + "\"";
+    }
     snprintf(buf, sizeof(buf),
         "{\"_export_version\":%u,\"sl_rule\":\"%s\",\"sl_threshold\":%.4f,"
         "\"sl_acc_decay\":%.4f,\"sl_flip_every_n\":%d,\"sl_toggle\":%d,"
         "\"sl_logit_scale\":%.8f,"
         "\"sl_lr_embedding\":%.8f,\"sl_wd_embedding\":%.4f,\"sl_block_size\":%d,"
         "\"sl_outlier_mult\":%.4f,\"sl_energy\":%d,\"sl_adaptive_thr\":%.4f,"
-        "\"sl_sparsity\":%.4f}",
+        "\"sl_sparsity\":%.4f%s}",
         m.header.version, rule, m.sl_threshold, m.sl_acc_decay, m.sl_flip_every_n, m.sl_toggle,
         m.sl_logit_scale,
         m.sl_lr_embedding, m.sl_wd_embedding, m.sl_block_size, m.sl_outlier_mult,
-        m.sl_energy, m.sl_adaptive_thr, m.sl_sparsity);
+        m.sl_energy, m.sl_adaptive_thr, m.sl_sparsity, extra.c_str());
     return std::string(buf);
 }
 

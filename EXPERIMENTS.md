@@ -449,18 +449,27 @@ tokens). Control = embedding-only (`--no-ternary`, no flips).
 > **under-reported the mechanism**: the qualitative Exp 7 result survives at the correct scale
 > with larger deltas. Fixed in `export_model.py` (STE → scale 1.0; discrete → 1/sqrt(H);
 > `--sl-logit-scale` override).
+>
+> **Correction 2 (eval build):** the numbers in this section were originally measured with the
+> 8/8 C++ build, which still clamped attention scores to ±80. The clamp was removed in commit
+> 56ce183 ("Fix C++/Python eval gap", 8/8 20:30) to match the Python runtime (which never
+> clamps) — this shifts the absolute CEs (old-build baseline slice 7.6135 → 8.1814). The table
+> below has been re-run with the current build (`selflearn_avx2.exe --eval … 10000`, scale 1.0);
+> the qualitative result is unchanged. The 8/8 15:51 v6 exports also carried a stale
+> `sl_logit_scale=0.0625`; the `checkpoints/exp7_*.bin` files have been re-patched to scale 1.0
+> (originals kept as `.bak`).
 
 **Embedding LR at the natural scale:** at `sl_lr_embedding=1e-4` (the value tuned for the
 compressed scale) the natural-regime gradient concentrates full magnitude on the target row, so
 300 blocks of embedding SGD **catastrophically destroy** the model (held-out CE ~12.2, worse
 than the 9.01 random floor, on both axes). With `--sl-lr-embedding 1e-5` the run is stable.
-Baseline CE (10000 pos, scale 1.0): slice **7.6135**, fineweb **9.2062**.
+Baseline CE (10000 pos, scale 1.0): slice **8.1814**, fineweb **9.3376**.
 
 | Run (lr_emb 1e-5) | Slice CE Δ (retention) | Fineweb CE Δ (adapt) |
 |---|---|---|
-| Control (embedding-only, 500 blk) | 7.7890 (+0.18) | 9.0530 (−0.15) |
-| Energy k=3 + sparsity 0.01 (300 blk) | 7.2135 (−0.40) | 8.8900 (−0.32) |
-| **Energy k=3 + sparsity 0.01 (500 blk)** | **7.2094 (−0.40)** | **8.8003 (−0.41)** |
+| Control (embedding-only, 500 blk) | 8.2533 (+0.07) | 9.2038 (−0.13) |
+| Energy k=3 + sparsity 0.01 (300 blk) | 7.8767 (−0.31) | 9.0853 (−0.25) |
+| **Energy k=3 + sparsity 0.01 (500 blk)** | **7.8244 (−0.36)** | **8.9774 (−0.36)** |
 
 Readings (honest):
 
@@ -470,11 +479,12 @@ Readings (honest):
   now seen on magnitude accumulators too. **Top-k sparsification fixes it**: concentrating energy
   on the top-1% per-row gradient gives the accumulator the heavy tail the adaptive τ selects.
 - **Both axes again, now on-device — and the win grows with budget.** Energy k=3 + sparsity
-  adapts to fineweb **2.7× more than the embedding-only control** (−0.41 vs −0.15) **and
-  protects the old domain where control loses it** (−0.40 vs +0.18 slice: the ternary core holds
+  adapts to fineweb **2.7× more than the embedding-only control** (−0.36 vs −0.13) **and
+  protects the old domain where control loses it** (−0.36 vs +0.07 slice: the ternary core holds
   TinyStories retention while embedding-only SGD forgets). Going 300 → 500 blocks keeps slice
-  retention flat (−0.40 → −0.40, no tradeoff) while fineweb adaptation deepens (−0.32 → −0.41).
-  Same qualitative win as Exp 6's STE run, now with bigger deltas than the buggy-scale readings.
+  retention protected (−0.31 → −0.36, slightly deeper, no tradeoff) while fineweb adaptation
+  deepens (−0.25 → −0.36).
+  Same qualitative win as Exp 6's STE run, with larger deltas than the buggy-scale readings.
 - **Scope honesty**: 500 blocks is still a much smaller budget than Exp 6's 1000 steps over
   12.3B tokens, and both runs also benefit from the embedding SGD channel. The absolute deltas
   are small; the *relative* mechanism-vs-control win on both axes is the result. Gradient-free is
@@ -859,3 +869,38 @@ python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
     --acc-energy --acc-decay 0.99 --adaptive-thr 3.0 --soft-flip-temp 0.25 \
     --save-dir checkpoints_exp14_sft_fw
 ```
+---
+
+## Experiment: MLA / Hybrid Attn (Exp 15) � status note
+
+Status: **paused / shelved**. Core ternary (dense) pipeline is healthy; MLA is an
+experimental branch and is not the focus.
+
+Findings (2026-08-11):
+
+- **exp15_mla.bin (checkpoints/exp15_mla.bin) is degenerate**: trained with
+  --steps 300 --warmup-steps 200, per_channel=False, no alphas on any of the
+  54 ternary tensors. Even a correct torch/numpy forward gives CE ~4.7e8
+  (activations explode to ~1e7, logits ~1e8). Weights in the binary were
+  verified 68/68 tensors exact (verify_export/verify_mla).
+- **MLA trains fine with a sane config**: --per-channel (alphas_init=0.02):
+  eval_CE_100k ~4.9 at step 300, stable through ~step 900; eval diverges to
+  100+ from ~step 1500 onward (train loss stays ~5.75) - open question about
+  the torch eval path at longer context, not investigated further.
+- **C++ MLA decode path shows undefined behavior on the degenerate model**
+  (same address, same run: vup_d[10240]=0 vs floats[10240]=-1; values vary
+  between runs). Never reproduced on a healthy MLA model - no healthy MLA
+  checkpoint exists yet (the sane-config 6000-step run was killed by timeout
+  before saving; default save dir did not receive checkpoints).
+
+Next time an MLA checkpoint is trained to a sane loss:
+1. export it with inference/export_model.py, then run
+   selflearn_avx2.exe --eval <model>.bin examples/discrete/sliceEval100k.bin 3.
+2. Finite CE -> C++ MLA path is fine (NaN was garbage-in). NaN -> investigate
+   the MLA expand-loop / weights path in tetra.h (expand loop reads
+   model.tw(kun/vun).floats.data(); suspect an OOB write or stale pointer
+   near the k_full/v_full cache, or heap corruption from the degenerate
+   magnitudes).
+
+Relevant code: MLA decode branch in inference/tetra.h (guarded by
+model.is_mla), 	ernary_llm/mla.py (torch side).

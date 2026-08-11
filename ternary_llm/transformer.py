@@ -816,3 +816,16 @@ class StochasticMLAModel(nn.Module):
         """Apply bit flips for all layers."""
         for layer in self.layers:
             layer.apply_bit_flips()
+
+    @torch.no_grad()
+    def set_flip_config(self, *, acc_decay: float | None = None,
+                        energy: bool | None = None,
+                        adaptive_thr: float | None = None,
+                        soft_temp: float | None = None) -> None:
+        """Propagate Exp 3/14 flip mechanics config to all ternary layers."""
+        from .layers import StochasticTernaryLinear
+        for m in self.modules():
+            if isinstance(m, StochasticTernaryLinear):
+                m.set_flip_config(acc_decay=acc_decay, energy=energy,
+                                  adaptive_thr=adaptive_thr,
+                                  soft_temp=soft_temp)
