@@ -936,6 +936,70 @@ Examples:
     # Detect discrete (gradient-free) checkpoints: DiscreteConfig has a "rule".
     is_discrete = "rule" in config and "acc_decay" in config
 
+    if args.self_learning and mode == "ste":
+        # STE checkpoints carry latent_weights only (no packed_weights): the
+        # stochastic loader below would leave every packed buffer at random
+        # init and silently export garbage (strict=False swallows the missing
+        # keys). Quantize the latents exactly like the plain STE export and
+        # attach the sl_* metadata so the C++ runtime treats it as a
+        # self-learning file. v6 is rejected: code-11 needs the v7 sign blob
+        # (or the v8 true-value blob) or every outlier zeroes out on load.
+        if not args.v7 and not args.v8:
+            parser.error("--self-learning on an STE checkpoint requires --v7 or --v8 "
+                         "(v6 has no outlier representation)")
+        model = TernaryTransformerModel(
+            vocab_size=config["vocab_size"],
+            hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"],
+            num_heads=config["num_heads"],
+            ffn_dim=config["ffn_dim"],
+            max_seq_len=config["max_seq_len"],
+        )
+        model.load_state_dict(sd)
+        logit_scale = args.sl_logit_scale if args.sl_logit_scale is not None else 1.0
+        scale_mode = "manual" if args.sl_logit_scale is not None else "ste"
+        metadata = dict(config) if not args.no_metadata else {}
+        for k in list(metadata.keys()):
+            v = metadata[k]
+            if isinstance(v, torch.Tensor):
+                metadata[k] = v.tolist()
+            elif not isinstance(v, (str, int, float, bool, list, dict, type(None))):
+                del metadata[k]
+        if args.metadata_step is not None:
+            metadata["training_step"] = args.metadata_step
+        if args.metadata_loss is not None:
+            metadata["training_loss"] = args.metadata_loss
+        if args.metadata_dataset is not None:
+            metadata["dataset"] = args.metadata_dataset
+        if args.v8:
+            metadata["v8_k"] = args.v8_k
+        metadata.update({
+            "sl_rule": args.sl_rule,
+            "sl_threshold": float(args.sl_threshold),
+            "sl_acc_decay": float(args.sl_acc_decay),
+            "sl_flip_every_n": int(args.sl_flip_every_n),
+            "sl_toggle": int(args.sl_toggle),
+            "sl_logit_scale": float(logit_scale),
+            "sl_logit_scale_mode": scale_mode,
+            "sl_lr_embedding": float(args.sl_lr_embedding),
+            "sl_wd_embedding": float(args.sl_wd_embedding),
+            "sl_block_size": int(args.sl_block_size),
+            "sl_outlier_mult": 3.0,
+            "sl_energy": int(args.sl_energy),
+            "sl_adaptive_thr": float(args.sl_adaptive_thr),
+            "sl_sparsity": float(args.sl_sparsity),
+        })
+        export_model(model, args.output, mode=mode,
+                     quantize_int8=args.quantize_int8,
+                     metadata=metadata,
+                     verbose=not args.quiet,
+                     v7=args.v7, v8=args.v8, v8_k=args.v8_k)
+        if args.verify:
+            print("--- Running verification ---")
+            from inference.verify_export import verify_export
+            verify_export(args.checkpoint, args.output, mode=mode)
+        return
+
     if args.self_learning or is_discrete:
         model = StochasticTransformerModel(
             vocab_size=config["vocab_size"],

@@ -1005,7 +1005,7 @@ inference\selflearn_avx2.exe checkpoints_discrete_c3\exp_tog_s0_zacc.bin example
 ---
 
 
-## Experiment: KV-Cache Quantization (Exp 17) � FP32 baseline 2026-08-11
+## Experiment: KV-Cache Quantization (Exp 17) � FP32 baseline 2026-08-11
 
 Goal: cut the FP32 KV cache 4x. Baseline measured BEFORE any change (selflearn_prof.exe, /DTETRA_PROFILE AVX2, exp7_v6_lr5.bin tiny 6L/256H/8hd/32, sliceEval100k.bin, FP32 lm_head):
 
@@ -1016,7 +1016,7 @@ Goal: cut the FP32 KV cache 4x. Baseline measured BEFORE any change (selflearn_p
 
 Stage breakdown (82.2 s / 20480 positions): attn_scores 43.2% | gate_up 27.2% | down_proj 9.8% | qkv_matmul 9.1% | lm_head 7.2% | o_proj 3.2% | norm 0.4%.
 
-KV cache footprint (FP32): 6 x 2 x 2048 x 256 x 4 B = 25.2 MB; decode reads ~24 MB of K/V per token (4 MB/layer), i.e. ~6 GB/s of the ~4 ms token budget is KV traffic alone � attn_scores (43%) is the KV-bound stage to attack. Reference at 500m preset: 251 MB FP32 (6L x 2560).
+KV cache footprint (FP32): 6 x 2 x 2048 x 256 x 4 B = 25.2 MB; decode reads ~24 MB of K/V per token (4 MB/layer), i.e. ~6 GB/s of the ~4 ms token budget is KV traffic alone � attn_scores (43%) is the KV-bound stage to attack. Reference at 500m preset: 251 MB FP32 (6L x 2560).
 
 
 ## Exp 17, Round 2: int8/int16 KV cache implemented + SIMD (2026-08-11)
@@ -1025,3 +1025,31 @@ KV cache footprint (FP32): 6 x 2 x 2048 x 256 x 4 B = 25.2 MB; decode reads ~24 
 - --kv-int8 flag (selflearn eval/train, tetra.cpp arg 9). Drift vs FP32 (tetra_model.bin, 6L/256/8H, decode 4000 pos): CE 8.5275 -> 8.5278; prefill logits mean 2.9e-4 (max 6.6e-4), MLA 2.4e-4 (max 1.2e-3).
 - Speed (selflearn_avx2.exe, --eval 4000): scalar int8 v1 333.6 tok/s (-14% vs FP32 364.7; earlier FP32 389.7 at session start). int16-SIMD v2: 384.9 / 387.4 tok/s -> +6% vs same-session FP32; RAM for K+V: 4 B -> ~2.5 B/elem + per-row scale.
 - NOTE: intermittent 0xC0000409 / 0xC0000005 crashes on 4000-8000 pos eval this session reproduce on the PRE-CHANGE (7b6b371) binary too; unaffected kv-int8 runs 6/6 clean. Not caused by Exp 17 changes; left for follow-up.
+
+
+## Exp 17, Round 3: int16 score overflow on v8 models — FIXED (2026-08-12)
+
+- **Found via baseline upgrade**: exported the best STE checkpoint (exp10_v8f, Exp 10 v8-forward) to a new canonical baseline `inference/exp10_v8.bin` (v8, verified 51/51 exact vs torch). C++ FP32 eval: CE 5.7404 (vs 8.53 for the old Phase-1 v4 `tetra_model.bin`).
+- **Bug**: `--kv-int8` on the v8 baseline drifted **+1.037 nats** (5.7404 -> 6.7776, PPL 311 -> 878) and was 11% SLOWER. Root cause: `kvq16_row` scaled to max/32767, so K/Q int16 values reach full magnitude; `_mm256_madd_epi16` sums int16 PAIRS into int32 and a single pair at 2*32767^2 = 2.147e9 already overflows int32 (before the 8-lane horizontal add). v4 (Phase-1) activations are tightly bounded so products stayed ~1e6; v8 true-value outliers make fat-tailed activations hit the max regularly -> overflow -> garbage scores.
+- **Fix** (`tetra.h` `kvq16_row`): scale = max/**4096** (12-bit range) — provably overflow-free: worst pair-sum 2*4096^2 = 3.36e7, AVX2 8-lane horizontal <= 1.07e9, AVX-512 16-lane <= 5.4e8, all < 2^31. Score math is scale-invariant (dot*scale_q*scale_k), precision 12 bits > fp16 mantissa.
+- **Results** (same session, selflearn_avx2.exe, sliceEval100k @40K):
+  - v8: FP32 5.7404 | kv-int8 5.7405 -> drift **+0.0001** (was +1.037)
+  - v4: FP32 8.5309 | kv-int8 8.5309 -> drift **0.0000**
+  - avx512 v8 kv-int8: 5.7405 @ 292.5 tok/s (avx2 268.5; avx2 FP32 279.7) — on v8 the eval loop is prefill-dominated (v8 outlier blobs), the decode-only win from Round 2 (v4: +6%) still applies to generation.
+- All exes rebuilt (scalar/avx2/avx10/avx512, tetra + selflearn). `exp10_v8.bin` is the new canonical baseline (CE 5.74, full v8 true-value outliers), `tetra_model.bin` untouched.
+
+
+## Exp 18: UTF churn-ramp pipeline — CLOSED, negative result (2026-08-12)
+
+Goal (Tier-1 item 4): raise the per-block churn safely above the fixed-k rate — the ARS gate (Exp 16/17) caps real changes at 1024/pass (16 trials x 64 chunk) even with 100% chunk acceptance. Design: `--churn-ramp RATE` lowers the adaptive-thr multiplier k_eff each flip pass and scales the probe capacity with the proposal budget (k0/k_eff); a safety reflex walks k back + halves the rate on chunk-acceptance violation or --ars-block revert.
+
+Setup: new self-learning baselines `checkpoints/exp10_v7_sl.bin` / `exp10_v8_sl.bin` — v7/v8 exports of the best STE checkpoint with `--sl-energy --sl-adaptive-thr 3.0 --sl-sparsity 0.01 --sl-lr-embedding 1e-5`. Untrained v8sl: fineweb_eval100k @10K CE 12.7169, sliceEval100k @10K CE 5.7848.
+
+- **Export fix (prerequisite)**: `export_self_learning` on STE checkpoints was broken — `StochasticTransformerModel.load_state_dict(strict=False)` left `packed_weights` at random init (STE checkpoints store only `latent_weights`) → first export gave CE 27.57 garbage. Fixed in `inference/export_model.py`: STE + `--self-learning` now routes through `TernaryTransformerModel` + `export_model()` (requires `--v7` or `--v8`; v6 has no outlier channel). Parity verified exact vs Exp 10: v7 CE 5.8556, v8 CE 5.7404 @40K sliceEval.
+- **Bug found via reload crash**: saved self-learning binaries crashed 0xC0000005 on load at ALL eval lengths (deterministic; file 50,044 B smaller than source). ASAN build (`cl /fsanitize=address`, vcvarsall from VS18 Insiders) → heap-buffer-overflow READ of size 1 = `dequantize_row` reading past the outlier blob. Root cause: outlier boundary INCONSISTENCY — `ars_repack` used `|v| >= 1.5` while apply_bit_flips' repack and save_model's blob recount used strict `> 1.5`. The exporter rounds any genuine |x_n| > 1.5 to level byte 48 = exactly 1.5 (1/32Δ resolution), so the two rules diverged: packed code-11 count 61,690 vs blob recount 59,763 in the trained file → OOB.
+- **Fix** (now uniform INCLUSIVE `|v| >= 1.5` in ars_repack, apply_bit_flips repack, v8/v7 blob recounts, and `is_std` boundary `< 1.5`): bit-invariant with the Python exporter (byte 48 only ever written for genuine outliers). Strict `> 1.5` additionally silently demoted ~0.7% of true-outlier weights (|x_n| in (47/32, 48/32]) to ±1 on the first full-matrix repack — roughly +0.2 nats of hidden regression.
+- **Honest re-runs** (40 blocks, fineweb_0000.bin, fixed arm k=3.0 vs ramp arm `--churn-ramp 0.25`):
+  - Churn: both arms ever ≈ 0.07–0.09% (~4,400–5,600 distinct weights of 6.29M); most flip passes deliver **0 accepted changes** (the ARS chunk probes reject ~100% of the 70–80K proposals); the rare passing pass hits exactly the 1024 chunk cap.
+  - Ramp: k_eff never descended below ≈ 2.98. Pre/post probe noise (±0.06–0.07 CE) exceeds the 0.5% block margin on 30–50% of flip passes; each spurious revert punches k back and halves ramp_rate (0.25 → 0.001 within 40 blocks). Capacity scaling never engaged.
+  - Eval @10K vs untrained baseline: fixed +0.150 fineweb / +0.137 slice; ramp +0.207 / +0.187. **Both arms net-regress despite ARS gating.**
+- **Conclusion**: negative. The churn frontier at the Exp 10 tile is QUALITY-bound, not capacity-bound — lowering k only adds junk proposals (ARS rightly rejects >99%), and the ~1% of flips that pass still regress long-horizon CE; the block gate's probe noise makes the reflex fire at random and crushes the ramp. UTF machinery retained (flags `--churn-ramp --churn-min-k --churn-min-accept --churn-max-trials --churn-max-chunk --churn-warmup`) but not recommended for this regime; revisit only with a higher-quality acceptance signal (multi-window probes, held-out gate) and after the layer-wise churn question is separated from embedding updates.

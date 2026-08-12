@@ -147,6 +147,15 @@ static void ars_repack(Model& model) {
             for (int c = 0; c < w.cols; c++) {
                 float v = prow[c];
                 int enc;
+                // NOTE: INCLUSIVE |v| >= 1.5 boundary — MUST match the Python
+                // exporter semantics AND apply_bit_flips' repack AND
+                // save_model's blob recount. Values whose |x_n| > 1.5 get
+                // rounded to level 48/32 = 1.5 exactly by the exporter, so a
+                // strict > would demote them to ±1 on every full-matrix repack
+                // (~0.7% of weights, ~+0.2 nats of silent regression). The
+                // inclusive rule is bit-invariant with the Python blob: a
+                // float lands AT +/-1.5 only via byte 48, which Python only
+                // writes for genuine outliers.
                 if (v >= 1.5f || v <= -1.5f) enc = 3;   // ±2 outlier (code 11)
                 else if (v > 0.5f) enc = 2;             // +1
                 else if (v > -0.5f) enc = 1;            // 0
@@ -493,6 +502,30 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kv-int8") == 0) kv_int8 = true;
     }
+    // Churn ramp (Exp 18): --churn-ramp RATE lowers the adaptive-thr
+    // multiplier k by RATE per flip pass and grows the ARS probe capacity
+    // (trials x chunk) with the proposal budget, so sustained churn is not
+    // capped by the gate. The safety reflex walks k back (and halves the
+    // rate) when a flip pass violates --churn-min-accept chunk acceptance
+    // or the --ars-block gate reverts the step. Requires --ars.
+    float churn_ramp = 0.0f;
+    float churn_min_k = 1.0f;
+    float churn_min_accept = 0.5f;
+    int churn_max_trials = 64;
+    int churn_max_chunk = 1024;
+    int churn_warmup = 0;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--churn-ramp") == 0) churn_ramp = (float)atof(argv[i + 1]);
+        if (strcmp(argv[i], "--churn-min-k") == 0) churn_min_k = (float)atof(argv[i + 1]);
+        if (strcmp(argv[i], "--churn-min-accept") == 0) churn_min_accept = (float)atof(argv[i + 1]);
+        if (strcmp(argv[i], "--churn-max-trials") == 0) churn_max_trials = atoi(argv[i + 1]);
+        if (strcmp(argv[i], "--churn-max-chunk") == 0) churn_max_chunk = atoi(argv[i + 1]);
+        if (strcmp(argv[i], "--churn-warmup") == 0) churn_warmup = atoi(argv[i + 1]);
+    }
+    if (churn_ramp > 0.0f && !ars) {
+        fprintf(stderr, "ERROR: --churn-ramp requires --ars (no safety signal without probes)\n");
+        return 1;
+    }
 
     auto t0 = std::chrono::high_resolution_clock::now();
     Model model = load_model(model_path);
@@ -557,8 +590,16 @@ int main(int argc, char** argv) {
             (thr_anneal > 0.0f ? " | thr-anneal +" + std::to_string(thr_anneal) + "/pass" : "").c_str(),
             no_ternary ? " | embedding-only" : (flip_only ? " | flip-only" : (ars ? " | ARS" : "")),
             energy ? 1 : 0, adaptive_thr, sparsity);
+    if (churn_ramp > 0.0f)
+        fprintf(stderr, "  [churn ramp] rate=%.3f minK=%.2f minAccept=%.2f maxTrials=%d maxChunk=%d warmup=%d\n",
+                churn_ramp, churn_min_k, churn_min_accept, churn_max_trials, churn_max_chunk, churn_warmup);
 
     double ms_total = 0.0;
+    // Exp 18 churn-ramp state: effective adaptive-thr multiplier + probe
+    // capacity, ramped per flip pass and walked back on gate violations.
+    float k_eff = adaptive_thr;
+    float ramp_rate = churn_ramp;
+    int flip_passes = 0;
     for (int step = 0; step < steps; step++) {
         auto ts = std::chrono::high_resolution_clock::now();
         KVCache cache;
@@ -727,7 +768,23 @@ int main(int argc, char** argv) {
         long long total_flips = 0;
         long long n_changed = 0;
         long long real_changes = 0;
+        bool flip_ran = false;
+        long long ars_tried = 0, ars_ok = 0;
         if (!no_ternary && flip_every > 0 && (step + 1) % flip_every == 0) {
+            flip_ran = true;
+            // Exp 18: probe capacity scales with the proposal budget (k0/k_eff)
+            // so the ARS gate is not the binding constraint on sustained churn.
+            int trials_eff = ars_trials, chunk_eff = ars_chunk;
+            if (churn_ramp > 0.0f) {
+                double ratio = (double)adaptive_thr / (k_eff > 1e-6f ? k_eff : 1e-6f);
+                trials_eff = (int)std::lround((double)ars_trials * ratio);
+                if (trials_eff > churn_max_trials) trials_eff = churn_max_trials;
+                if (trials_eff < 1) trials_eff = 1;
+                chunk_eff = (int)std::lround((double)ars_chunk * ratio);
+                if (chunk_eff > churn_max_chunk) chunk_eff = churn_max_chunk;
+                if (chunk_eff < 1) chunk_eff = 1;
+                flip_passes++;
+            }
             long long acc_over20 = 0, acc_over15 = 0;
             double acc_max = 0;
             for (size_t wi = 0; wi < wlist.size(); wi++) {
@@ -755,7 +812,7 @@ int main(int argc, char** argv) {
                 all_before[wi].resize(n);
                 memcpy(all_before[wi].data(), w.floats.data(), n * sizeof(float));
                 total_flips += apply_bit_flips(w, eff_thr, eff_toggle, model.sl_outlier_mult,
-                                               adaptive_thr);
+                                               k_eff);
                 all_after[wi].resize(n);
                 memcpy(all_after[wi].data(), w.floats.data(), n * sizeof(float));
                 for (size_t i = 0; i < n; i++)
@@ -777,9 +834,9 @@ const size_t blk = (size_t)cache.pos;
                     for (size_t i : changed[wi]) flat.emplace_back(wi, i);
                 size_t tried = 0, ok_chunks = 0;
                 real_changes = 0;
-                for (size_t p = 0; p < flat.size(); p += (size_t)ars_chunk) {
-                    size_t nc = (std::min)((size_t)ars_chunk, flat.size() - p);
-                    if (tried >= (size_t)ars_trials) {
+                for (size_t p = 0; p < flat.size(); p += (size_t)chunk_eff) {
+                    size_t nc = (std::min)((size_t)chunk_eff, flat.size() - p);
+                    if (tried >= (size_t)trials_eff) {
                         for (size_t k = 0; k < nc; k++)
                             wlist[flat[p + k].first]->floats[flat[p + k].second] =
                                 all_before[flat[p + k].first][flat[p + k].second];
@@ -817,6 +874,8 @@ const size_t blk = (size_t)cache.pos;
                                 "probeCE=%.4f win=%d/%d (margin=%.4f)\n",
                         tried, ok_chunks, real_changes, L_cur, ars_windows,
                         ars_probe, (double)ars_margin_eff(ars_margin, ars_margin_rel, L_cur));
+                ars_tried = (long long)((std::min)(tried, (size_t)trials_eff));
+                ars_ok = (long long)ok_chunks;
             } else {
                 for (size_t wi = 0; wi < wlist.size(); wi++) {
                     auto& hist = hists[wi];
@@ -846,6 +905,7 @@ const size_t blk = (size_t)cache.pos;
         // the post-update probe CE stays within the margin of the pre-update
         // baseline; otherwise restore the staged float weights and the
         // embedding copy (full undo — even this step's weight decay reverts).
+        bool block_reverted = false;
         if (ars_block && pre_ce >= 0.0) {
             const size_t blk = (size_t)cache.pos;
             double post_ce = L_flip_final;
@@ -871,10 +931,42 @@ const size_t blk = (size_t)cache.pos;
                         if (hists[p.first][p.second] > 0) hists[p.first][p.second]--;
                     fprintf(stderr, "  ARS-block: pre=%.4f post=%.4f margin=%.4f -> REVERTED flips+emb\n",
                             pre_ce, post_ce, margin);
+                    block_reverted = true;
                 } else {
                     fprintf(stderr, "  ARS-block: pre=%.4f post=%.4f margin=%.4f -> kept\n",
                             pre_ce, post_ce, margin);
                 }
+            }
+        }
+
+        // Exp 18 churn-ramp reflex: after every flip pass, descend k (and the
+        // probe capacity with it) while the gates keep accepting; on a
+        // violation (chunk acceptance below --churn-min-accept, or the block
+        // gate reverting the step) walk k back and halve the ramp rate so the
+        // pipeline settles at the sustainable churn frontier.
+        if (flip_ran && churn_ramp > 0.0f && ars && flip_passes >= churn_warmup) {
+            const double accept = (ars_tried > 0) ? (double)ars_ok / (double)ars_tried : 1.0;
+            bool violation = false;
+            if (n_changed > 0 && ars_tried > 0 && accept < (double)churn_min_accept)
+                violation = true;
+            if (block_reverted) violation = true;
+            if (n_changed == 0) {
+                // No proposals at all: no signal to trade on, hold k.
+                fprintf(stderr, "  [churn] k=%.3f no proposals — hold\n", k_eff);
+            } else if (violation) {
+                k_eff += 2.0f * ramp_rate;
+                if (k_eff > adaptive_thr) k_eff = adaptive_thr;
+                ramp_rate *= 0.5f;
+                fprintf(stderr, "  [churn] k=%.3f accept=%.2f blockRevert=%d -> walk back, rate=%.3f\n",
+                        k_eff, accept, block_reverted ? 1 : 0, ramp_rate);
+            } else if (k_eff > churn_min_k) {
+                k_eff -= ramp_rate;
+                if (k_eff < churn_min_k) k_eff = churn_min_k;
+                fprintf(stderr, "  [churn] k=%.3f accept=%.2f -> ramp down (%.3f/pass)\n",
+                        k_eff, accept, ramp_rate);
+            } else {
+                fprintf(stderr,  "  [churn] k=%.3f accept=%.2f at floor — hold\n",
+                        k_eff, accept);
             }
         }
 
@@ -891,11 +983,13 @@ const size_t blk = (size_t)cache.pos;
         const float eff_thr = thr_anneal > 0.0f
                 ? thr + thr_anneal * ((float)((step + 1) / flip_every) - 1.0f)
                 : thr;
-        fprintf(stderr, "  flips=%lld (real changes=%lld, %.1f%% no-op, eff_thr=%.1f) | "
+        const std::string k_suffix = (churn_ramp > 0.0f)
+                ? " k=" + std::to_string(k_eff) : "";
+        fprintf(stderr, "  flips=%lld (real changes=%lld, %.1f%% no-op, eff_thr=%.1f%s) | "
                         "churn: ever=%.2f%% >=2=%.2f%% >=4=%.2f%% >=8=%.2f%%\n",
                 total_flips, real_changes,
                 total_flips > 0 ? 100.0 * (1.0 - (double)real_changes / total_flips) : 0.0,
-                eff_thr,
+                eff_thr, k_suffix.c_str(),
                 ever / tot * 100.0, m2 / tot * 100.0, m4 / tot * 100.0, m8 / tot * 100.0);
 
         auto te = std::chrono::high_resolution_clock::now();

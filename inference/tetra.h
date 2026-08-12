@@ -227,21 +227,24 @@ static inline void kvq_row(const float* src, int8_t* dst, float* sc, int n) {
     }
 }
 
-// int16 variant (scale = max/32767). Combined with a per-head int16 query it
-// lets the score loop run as a pure integer SIMD madd, faster than fp32 fma.
+// int16 variant (scale = max/4096, 12-bit range). Headroom below the int16
+// max is deliberate: _mm256_madd_epi16 sums pairs into int32 and a pair of
+// full-magnitude values (2 * 32767^2 = 2.147e9) already overflows int32;
+// fat-tailed v8 activations (true-value outliers) hit the max regularly.
+// 12 bits still beats fp16 mantissa and is far cheaper than fp32 fma.
 static inline void kvq16_row(const float* src, int16_t* dst, float* sc, int n) {
     float mx = 0.0f;
     for (int i = 0; i < n; i++) {
         float a = fabsf(src[i]);
         if (a > mx) mx = a;
     }
-    const float s = mx > 1e-9f ? mx / 32767.0f : 1.0f;
+    const float s = mx > 1e-9f ? mx / 4096.0f : 1.0f;
     *sc = s;
     for (int i = 0; i < n; i++) {
         float v = src[i] / s;
         int q = v >= 0.0f ? (int)(v + 0.5f) : (int)(v - 0.5f);
-        if (q > 32767) q = 32767;
-        else if (q < -32767) q = -32767;
+        if (q > 4096) q = 4096;
+        else if (q < -4096) q = -4096;
         dst[i] = (int16_t)q;
     }
 }
@@ -1831,7 +1834,7 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = 
             int8_t f = act[i];
             if (!f) continue;
             float wv = prow[c];
-            bool is_std = (fabsf(wv) <= 1.5f);
+            bool is_std = (fabsf(wv) < 1.5f);
             if (w.is_v8 && !is_std) {
                 // v8: top-k outliers hold true values in the blob — frozen.
                 acc_row[c] = 0.0f;
@@ -1894,8 +1897,8 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = 
         for (int c = 0; c < cols; c++) {
             float v = prow[c];
             int enc;  // {-2,-1,0,1,2} -> codes {3,0,1,2,3}; -2's sign lives in the blob
-            if (v > 1.5f) enc = 3;
-            else if (v < -1.5f) enc = 3;
+            if (v >= 1.5f) enc = 3;
+            else if (v <= -1.5f) enc = 3;
             else if (v > 0.5f) enc = 2;
             else if (v < -0.5f) enc = 0;
             else enc = 1;
@@ -2053,12 +2056,12 @@ static void save_model(Model& model, const char* path) {
             const size_t total = (size_t)w.rows * w.cols;
             size_t count = 0;
             for (size_t i = 0; i < total; i++)
-                if (fabsf(w.floats[i]) > 1.5f) count++;
+                if (fabsf(w.floats[i]) >= 1.5f) count++;
             std::vector<uint8_t> blob(count);
             size_t k = 0;
             for (size_t i = 0; i < total; i++) {
                 float v = w.floats[i];
-                if (fabsf(v) > 1.5f) {
+                if (fabsf(v) >= 1.5f) {
                     blob[k++] = (uint8_t)(int8_t)llroundf(v * 32.0f);
                 }
             }
@@ -2072,12 +2075,12 @@ static void save_model(Model& model, const char* path) {
             const size_t total = (size_t)w.rows * w.cols;
             size_t count = 0;
             for (size_t i = 0; i < total; i++)
-                if (fabsf(w.floats[i]) > 1.5f) count++;
+                if (fabsf(w.floats[i]) >= 1.5f) count++;
             std::vector<uint8_t> blob((count + 7) / 8, 0);
             size_t k = 0;
             for (size_t i = 0; i < total; i++) {
                 float v = w.floats[i];
-                if (fabsf(v) > 1.5f) {
+                if (fabsf(v) >= 1.5f) {
                     if (v > 0) blob[k >> 3] |= (uint8_t)(0x80 >> (k & 7));
                     k++;
                 }
