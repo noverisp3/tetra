@@ -482,8 +482,8 @@ static void matmul_int8_decode(const float* x, const int8_t* w, float* out,
 #if defined(__AVX2__)
         __m256 vsum = _mm256_setzero_ps();
         for (; c + 8 <= cols; c += 8) {
-            __m256i vi8 = _mm256_loadu_si256((const __m256i*)(w + r * cols + c));
-            __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_castsi256_si128(vi8)));
+            __m128i b8 = _mm_loadl_epi64((const __m128i*)(w + r * cols + c));
+            __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b8));
             __m256 vx = _mm256_loadu_ps(x + c);
             vsum = _mm256_fmadd_ps(vx, vf, vsum);
         }
@@ -880,7 +880,17 @@ static Model load_model(const char* path) {
             model.is_mla = true;
     }
 
-    // Extract MLA dimensions: prefer header, fallback to tensor shapes
+    // Extract MLA dimensions: prefer header, fallback to tensor shapes.
+    // is_mla is only trusted when the MLA weight signature is actually present;
+    // the header flag / name heuristic alone can misfire (header read happens
+    // after Model construction, so member-init defaults are garbage).
+    bool has_kvd = model.ternary_weights.count("layers.0.attn.kv_down_proj.latent_weights") > 0;
+    if (!has_kvd) {
+        model.is_mla = false;
+        model.kv_latent_dim = 0;
+        model.rope_per_head = 0;
+        model.rope_dim = 0;
+    }
     if (model.is_mla) {
         if (model.rope_per_head == 0 || model.kv_latent_dim == 0) {
             // Fallback: infer from tensor dimensions
