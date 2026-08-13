@@ -97,7 +97,15 @@ Export and run inference:
 ```bash
 # Export to a 2-bit C++ binary
 python inference/export_model.py checkpoints/checkpoint_015000.pt inference/tetra_model.bin
-cd inference && build.bat avx2 && cd ..
+
+# Build the C++ runtime (Windows: `build.bat`, Linux/macOS: `build.sh`)
+cd inference && bash build.sh avx2 && cd ..    # Linux/macOS
+# cd inference && build.bat avx2 && cd ..      # Windows
+
+# Run generation through C++ (binaries are named without a .exe on Linux/macOS)
+./inference/tetra_avx2 inference/tetra_model.bin "Once upon a time" 100 0.8 50 0.9 1.0
+
+# Or via Python with tokenizer (cross-platform, no build needed)
 python inference/run_inference.py inference/tetra_model.bin "Once upon a time" --max-tokens 100 --repeat-penalty 1.1
 ```
 
@@ -109,7 +117,8 @@ python inference/export_model.py checkpoints/checkpoint_015000.pt checkpoints/ex
     --sl-energy --sl-adaptive-thr 3.0 --sl-sparsity 0.01
 
 # Self-learn on a raw token stream (out.bin is the adapted model)
-selflearn_avx2.exe checkpoints\exp7.bin data\fineweb_10bt\fineweb_0000.bin checkpoints\adapted.bin 200 50 100
+# Windows:  selflearn_avx2.exe checkpoints\exp7.bin data\fineweb_10bt\fineweb_0000.bin checkpoints\adapted.bin 200 50 100
+./inference/selflearn_avx2 checkpoints/exp7.bin data/fineweb_10bt/fineweb_0000.bin checkpoints/adapted.bin 200 50 100
 ```
 
 ## Mixed Precision
@@ -212,6 +221,8 @@ Torch reference confirms the same direction (tinydata window, logit scale 1.0): 
 ## Vulkan Compute Engine (`inference/vulkan/`)
 
 A Vulkan compute port of the same forward pass for **on-device/GPU inference and self-learning** on the v6 binary format. Runs on Intel Iris Xe (DirectML-style iGPU) with host-visible coherent buffers (UMA). Zero Vulkan dependencies beyond the SDK loader — no Vulkan-Hpp, no glslang at runtime (SPIR-V precompiled via `glslc`).
+
+> **Build is currently Windows-only** (`inference/vulkan/build_vulkan.bat`, MSVC + VULKAN_SDK). The C++ `build.sh` path above does not cover the Vulkan engine yet; on Linux, use the C++ CPU binaries (`tetra_avx2` / `selflearn_avx2`) or the Python runtime instead.
 
 | Feature | Detail |
 |---------|--------|
@@ -408,12 +419,16 @@ Backward-compatible: existing v6/v7 exports (no `sl_energy`/`sl_adaptive_thr`) r
 to before the port.
 
 ```bash
+# Build once, then run any of the below. Windows uses `selflearn_avx2.exe` and
+# backslash paths; Linux/macOS use `./inference/selflearn_avx2` and forward slashes.
+# (Built by `cd inference && build.bat avx2` / `bash build.sh avx2`.)
+
 # Fixed threshold (v6 behavior, unchanged)
-selflearn.exe model.bin tokens.bin out.bin 200 50 100
+./inference/selflearn_avx2 model.bin tokens.bin out.bin 200 50 100
 # Exp 3 mechanism: magnitude accumulator + adaptive threshold
-selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0
+./inference/selflearn_avx2 model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0
 # Exp 7: + top-k feed (heavy tail for the adaptive tau — required on gradient-free rule 'c')
-selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0 --sparsity 0.01
+./inference/selflearn_avx2 model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0 --sparsity 0.01
 ```
 
 ### Eval tooling: profiling, fast lm_head, precision comparison
@@ -421,7 +436,8 @@ selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptiv
 `selflearn.cpp --eval` doubles as a benchmark/profiler for the forward pass:
 
 - **Throughput + per-stage profile**: `--eval` prints avg CE, wall seconds, and tokens/s. Building with
-  `build.bat profile` (`/DTETRA_PROFILE`) adds a per-stage breakdown (emb / attn_norm / qkv_matmul /
+  `build.bat profile` (Windows, `/DTETRA_PROFILE`) or `bash build.sh profile` (Linux/macOS,
+  `-DTETRA_PROFILE`) adds a per-stage breakdown (emb / attn_norm / qkv_matmul /
   attn_scores / o_proj / ffn_norm / gate_up / down_proj / lm_head) accumulated over the whole run.
 - **`--fast-lmhead`**: quantizes the tied embedding to INT8 in memory (per-tensor scale `max|w|/127`,
   matching `export_model.py --quantize-int8`) so the LM head uses `matmul_int8_decode` (4× less memory
@@ -449,9 +465,10 @@ selflearn.exe model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptiv
   weak near-uniform model, not quantization; CE drift mean +0.011, worst −0.44).
 
 ```bash
-selflearn_avx2.exe --eval ..\checkpoints\exp7_v6_lr5_fp32emb.bin ..\examples\discrete\sliceEval100k.bin 2000 --fast-lmhead
-build.bat profile && selflearn_prof.exe --eval ..\checkpoints\exp7_v6_lr5_fp32emb.bin ..\examples\discrete\sliceEval100k.bin 2000
-selflearn_avx2.exe --compare-lmhead ..\checkpoints\exp7_v6_lr5_fp32emb.bin ..\examples\discrete\sliceEval100k.bin 1000
+# Linux/macOS (Windows: same commands with selflearn_avx2.exe and backslash paths)
+./inference/selflearn_avx2 --eval ../checkpoints/exp7_v6_lr5_fp32emb.bin ../examples/discrete/sliceEval100k.bin 2000 --fast-lmhead
+./inference/selflearn_prof --eval ../checkpoints/exp7_v6_lr5_fp32emb.bin ../examples/discrete/sliceEval100k.bin 2000
+./inference/selflearn_avx2 --compare-lmhead ../checkpoints/exp7_v6_lr5_fp32emb.bin ../examples/discrete/sliceEval100k.bin 1000
 ```
 
 ### Binary format v6
