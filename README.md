@@ -823,6 +823,7 @@ ternary_llm/
   trainer.py                # TernaryTrainer + DMLAdamW
   int8.py                   # INT8 fake-quantization
   erc.py                    # Echo Residual Committer: ERCLinear, enable_erc, commit/decay, full-carry export
+  arg_utils.py              # DEPRECATED_FLAGS registry + warn_deprecated for closed experiments
   csrc/
     ternary_ops_avx2.cpp    # C++ SIMD pack/unpack (AVX2)
     ternary_ops_avx512.cpp  # C++ SIMD pack/unpack (AVX-512)

@@ -35,6 +35,12 @@ checkpoints_*/
 *.o
 *.so
 *.dylib
+*/tetra
+*/tetra_avx2
+*/tetra_avx512
+*/selflearn
+*/selflearn_avx2
+*/selflearn_avx512
 
 # Exported models (large)
 *.bin
