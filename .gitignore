@@ -41,6 +41,7 @@ checkpoints_*/
 */selflearn
 */selflearn_avx2
 */selflearn_avx512
+apply_flip_driver
 
 # Exported models (large)
 *.bin
