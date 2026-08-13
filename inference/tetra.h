@@ -1910,12 +1910,12 @@ static int apply_bit_flips(TernaryWeightXNOR& w, float threshold, bool toggle = 
     }
     if (v7) {
         size_t count = 0;
-        for (size_t i = 0; i < n; i++) if (fabsf(w.floats[i]) > 1.5f) count++;
+        for (size_t i = 0; i < n; i++) if (fabsf(w.floats[i]) >= 1.5f) count++;
         w.outlier_blob.assign((count + 7) / 8, 0);
         size_t k = 0;
         for (size_t i = 0; i < n; i++) {
             float v = w.floats[i];
-            if (fabsf(v) > 1.5f) {
+            if (fabsf(v) >= 1.5f) {
                 if (v > 0) w.outlier_blob[k >> 3] |= (uint8_t)(0x80 >> (k & 7));
                 k++;
             }
