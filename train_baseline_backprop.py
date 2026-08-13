@@ -23,6 +23,15 @@ import torch
 
 from ternary_llm.data import create_dataloaders, create_multi_source_dataloaders
 from ternary_llm.transformer import StochasticTransformerModel
+from ternary_llm.arg_utils import DeprecatedFlag, warn_deprecated
+
+# Flags from closed experiments, retained verbatim for reproducing the numbers
+# in EXPERIMENTS.md. Setting one prints a warning but still works.
+DEPRECATED_FLAGS = [
+    DeprecatedFlag("--soft-flip-temp", "soft_flip_temp", "rejected (Exp 14)",
+                   "smoothing the flip decision adds no transferable gain; the flip "
+                   "budget (set by --adaptive-thr) is what the mechanism trades in."),
+]
 
 
 def load_eval_tokens(path: str, n: int) -> np.ndarray:
@@ -101,6 +110,8 @@ def main():
                         help="Raw uint16 .bin slice of the NEW domain; reports "
                              "its CE alongside the TinyStories slice (adaptation metric)")
     args = parser.parse_args()
+
+    warn_deprecated(parser, args, DEPRECATED_FLAGS)
 
     data_cache = Path(args.data_cache)
     meta_path = data_cache / "metadata.json"

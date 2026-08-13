@@ -74,8 +74,8 @@ def _load_cpp_extension() -> bool:
         avx512_flag = "/arch:AVX512"
         avx2_flag = "/arch:AVX2"
     else:
-        avx512_flag = "-mavx512f -mavx512bw"
-        avx2_flag = "-mavx2"
+        avx512_flag = "-mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma"
+        avx2_flag = "-mavx2 -mfma"
 
     def _has_avx512():
         try:

@@ -23,6 +23,33 @@ from ternary_llm.data import (
     create_multi_source_dataloaders, get_tokenizer_compat,
 )
 from ternary_llm.trainer import TernaryTrainer, TrainingConfig
+from ternary_llm.arg_utils import DeprecatedFlag, warn_deprecated
+
+# Flags whose experiment was closed (rejected / null result / dead end). They
+# are retained verbatim for reproducing the published numbers in EXPERIMENTS.md;
+# setting one prints a DEPRECATED warning but the flag still works.
+DEPRECATED_FLAGS = [
+    DeprecatedFlag("--soft-quant-gamma", "soft_quant_gamma", "null result (Exp 8)",
+                   "soft-to-hard quantization warmup changed nothing; "
+                   "hard round + STE is not improved by the smooth surrogate."),
+    DeprecatedFlag("--soft-quant-steps", "soft_quant_steps", "null result (Exp 8)",
+                   "warmup length for the falsified soft-surrogate quantizer."),
+    DeprecatedFlag("--soft-quant-gamma-init", "soft_quant_gamma_init", "null result (Exp 8)",
+                   "starting temperature of the falsified soft-surrogate quantizer."),
+    DeprecatedFlag("--soft-quant-gamma-max", "soft_quant_gamma_max", "null result (Exp 8)",
+                   "final temperature of the falsified soft-surrogate quantizer."),
+    DeprecatedFlag("--v8-reg", "v8_reg", "rejected (Exp 11)",
+                   "forcing outlier magnitudes toward target >=2.0 regresses the model "
+                   "monotonically in lambda; the 1.5-2.0 band is the learned optimum."),
+    DeprecatedFlag("--v8-reg-target", "v8_reg_target", "rejected (Exp 11)",
+                   "magnitude target of the falsified v8 outlier-band regularization."),
+    DeprecatedFlag("--lq", "lq", "null result (Exp 12)",
+                   "learned 5-level codebook values stay at the fixed {-2,-1,0,1,2} optimum "
+                   "after training; the levels were already optimal."),
+    DeprecatedFlag("--sr", "sr", "rejected (Exp 13)",
+                   "unbiased stochastic rounding: at 2-bit resolution the variance (up to "
+                   "0.25 of a level) outweighs the bias it removes."),
+]
 
 PRESETS = {
     "tiny":   dict(hidden_dim=256, num_layers=6,  num_heads=8,  ffn_dim=1024),
@@ -229,6 +256,8 @@ def main():
     parser.add_argument("--erc-freeze-core", action="store_true",
                         help="Freeze latent cores entirely (residual-only learning)")
     args = parser.parse_args()
+
+    warn_deprecated(parser, args, DEPRECATED_FLAGS)
 
     if args.seed is not None:
         import random

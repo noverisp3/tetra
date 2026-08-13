@@ -1,0 +1,28 @@
+# Normalize line endings for cross-platform development.
+# Text files are stored as LF in the repo; on Windows, git checks them out
+# with CRLF automatically for tooling that expects it.
+* text=auto
+
+# Force LF for files that break when checked out as CRLF.
+*.sh   text eol=lf
+*.bat  text eol=crlf
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+
+# Binary files (never convert).
+*.bin  binary
+*.pt   binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.exe  binary
+*.so   binary
+*.dll  binary
+*.o    binary
+*.obj  binary
+*.spv  binary

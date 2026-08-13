@@ -1,51 +1,56 @@
 """Build C++ ternary_ops extensions for AVX2 and AVX-512.
 
-Requirements: Visual Studio 2022 with MSVC, PyTorch
+Requirements:
+  Windows: Visual Studio 2022/2019 (MSVC) + PyTorch
+  Linux/macOS: a C++ compiler (g++ by default) + PyTorch
 Usage: python build_cpp.py
 """
 import subprocess, sys, os
 
-# Activate VS dev environment (search multiple locations)
-_vcvars_paths = [
-    os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-                 "Microsoft Visual Studio", "2022", "Community", "VC",
-                 "Auxiliary", "Build", "vcvars64.bat"),
-    os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"),
-                 "Microsoft Visual Studio", "2022", "Community", "VC",
-                 "Auxiliary", "Build", "vcvars64.bat"),
-    os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-                 "Microsoft Visual Studio", "2022", "Professional", "VC",
-                 "Auxiliary", "Build", "vcvars64.bat"),
-    os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"),
-                 "Microsoft Visual Studio", "2022", "Professional", "VC",
-                 "Auxiliary", "Build", "vcvars64.bat"),
-]
-_vcvars = next((p for p in _vcvars_paths if os.path.exists(p)), None)
-if _vcvars is None:
-    # Try vswhere as fallback
-    try:
-        vswhere = subprocess.run(["vswhere", "-latest", "-property", "installationPath"],
-                                 capture_output=True, text=True)
-        if vswhere.returncode == 0:
-            vs_path = vswhere.stdout.strip()
-            candidate = os.path.join(vs_path, "VC", "Auxiliary", "Build", "vcvars64.bat")
-            if os.path.exists(candidate):
-                _vcvars = candidate
-    except FileNotFoundError:
-        pass
+# Activate the VS dev environment on Windows only. On Linux/macOS the
+# default compiler (g++) is used directly; no vcvars step is needed.
+if sys.platform == "win32":
+    # Activate VS dev environment (search multiple locations)
+    _vcvars_paths = [
+        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+                     "Microsoft Visual Studio", "2022", "Community", "VC",
+                     "Auxiliary", "Build", "vcvars64.bat"),
+        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"),
+                     "Microsoft Visual Studio", "2022", "Community", "VC",
+                     "Auxiliary", "Build", "vcvars64.bat"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+                     "Microsoft Visual Studio", "2022", "Professional", "VC",
+                     "Auxiliary", "Build", "vcvars64.bat"),
+        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"),
+                     "Microsoft Visual Studio", "2022", "Professional", "VC",
+                     "Auxiliary", "Build", "vcvars64.bat"),
+    ]
+    _vcvars = next((p for p in _vcvars_paths if os.path.exists(p)), None)
+    if _vcvars is None:
+        # Try vswhere as fallback
+        try:
+            vswhere = subprocess.run(["vswhere", "-latest", "-property", "installationPath"],
+                                     capture_output=True, text=True)
+            if vswhere.returncode == 0:
+                vs_path = vswhere.stdout.strip()
+                candidate = os.path.join(vs_path, "VC", "Auxiliary", "Build", "vcvars64.bat")
+                if os.path.exists(candidate):
+                    _vcvars = candidate
+        except FileNotFoundError:
+            pass
 
-if _vcvars is None:
-    print("ERROR: Visual Studio not found. Cannot build C++ extensions.")
-    sys.exit(1)
+    if _vcvars is None:
+        print("ERROR: Visual Studio not found. Cannot build C++ extensions.")
+        sys.exit(1)
 
-result = subprocess.run(
-    f'cmd /c "call \"{_vcvars}\" >nul 2>nul && set"',
-    capture_output=True, text=True, shell=True
-)
-for line in result.stdout.splitlines():
-    if '=' in line:
-        k, v = line.split('=', 1)
-        os.environ[k] = v
+    result = subprocess.run(
+        f'cmd /c "call \"{_vcvars}\" >nul 2>nul && set"',
+        capture_output=True, text=True, shell=True
+    )
+    for line in result.stdout.splitlines():
+        if '=' in line:
+            k, v = line.split('=', 1)
+            os.environ[k] = v
 
 import torch
 from torch.utils.cpp_extension import load
@@ -58,7 +63,7 @@ if sys.platform == "win32":
     avx512_flag = "/arch:AVX512"
 else:
     avx2_flag = "-mavx2 -mfma"
-    avx512_flag = "-mavx512f -mavx512bw"
+    avx512_flag = "-mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma"
 
 # Build AVX2 version (baseline, always available)
 print("\nBuilding ternary_ops (AVX2)...")
