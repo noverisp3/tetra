@@ -24,6 +24,7 @@ from ternary_llm.data import (
 )
 from ternary_llm.trainer import TernaryTrainer, TrainingConfig
 from ternary_llm.arg_utils import DeprecatedFlag, warn_deprecated
+from ternary_llm.cli import add_data_args, add_flip_args
 
 # Flags whose experiment was closed (rejected / null result / dead end). They
 # are retained verbatim for reproducing the published numbers in EXPERIMENTS.md;
@@ -121,13 +122,14 @@ def export_graph(trainer, save_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Train Tetra")
-    parser.add_argument("--preset", type=str, default=None, choices=["tiny", "medium", "large", "500m"],
-                        help="Model size preset (overrides hidden/layers/heads/ffn)")
-    parser.add_argument("--steps", type=int, default=None, help="Max training steps")
+    add_data_args(
+        parser, preset_choices=PRESETS,
+        steps=None, batch_size=None, block_size=None,
+        data_cache=None,
+        device=None, device_choices=["cpu", "cuda", "directml"], seed=None,
+    )
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=None, help="Batch size")
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps")
-    parser.add_argument("--block-size", type=int, default=None, help="Block size (context length)")
     parser.add_argument("--hidden-dim", type=int, default=None, help="Hidden dimension")
     parser.add_argument("--num-layers", type=int, default=None, help="Number of layers")
     parser.add_argument("--num-heads", type=int, default=None, help="Number of attention heads")
@@ -135,12 +137,9 @@ def main():
     parser.add_argument("--resume", nargs="?", const="auto", default=None,
                         help="Resume from checkpoint (no arg = auto-find latest)")
     parser.add_argument("--data-dir", type=str, default="data", help="Data directory (legacy TinyStories)")
-    parser.add_argument("--data-cache", type=str, default=None, help="Multi-source data dir (data/)")
     parser.add_argument("--tokenizer-dir", type=str, default="tokenizer", help="Tokenizer directory")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Save directory")
     parser.add_argument("--max-stories", type=int, default=None, help="Max stories to load")
-    parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda", "directml"],
-                        help="Force device (default: auto-detect)")
     parser.add_argument("--hybrid", action="store_true",
                         help="Hybrid mode: model on GPU, optimizer on CPU (avoids DML fallbacks)")
     parser.add_argument("--num-workers", type=int, default=4,
@@ -154,8 +153,6 @@ def main():
     parser.add_argument("--ternary-scale", type=float, default=1.0,
                         help="[STE] Dynamic threshold scale: delta = scale x mean(|W|) (default: 1.0, "
                              "tuned in Exp 9: lower CE + fewer +-2 outliers)")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="RNG seed for model init / data order (default: unseeded)")
     parser.add_argument("--per-channel", action="store_true",
                         help="[STE] Per-channel quantization threshold (instead of per-tensor)")
     parser.add_argument("--group-size", type=int, default=0,
@@ -198,8 +195,10 @@ def main():
                         help="Halt training when a matrix collapses (unique_rows <= rows/4)")
     parser.add_argument("--save-best", action="store_true",
                         help="Keep checkpoint_best.pt (lowest validation loss)")
-    parser.add_argument("--threshold", type=float, default=None,
-                        help="[Stochastic] Bit-flip threshold (default: 20.0 / scale, auto-computed)")
+    add_flip_args(
+        parser,
+        threshold=None, acc_decay=0.99, adaptive_thr=None, acc_energy=True,
+    )
     parser.add_argument("--threshold-decay-to", type=float, default=None,
                         help="[Stochastic] Decay threshold to this value by end of training (default: same as --threshold, no decay)")
     parser.add_argument("--int8", action="store_true",
@@ -212,13 +211,6 @@ def main():
                         help="[Stochastic] Check threshold & flip bits every N optimizer steps (default: 5)")
     parser.add_argument("--flip-ungated", action="store_true",
                         help="[Stochastic] Flip every weight whose accumulator is non-zero (no surprise gate)")
-    parser.add_argument("--acc-energy", action="store_true",
-                        help="[Stochastic] Exp 3: energy accumulator (leaky EMA of -grad) instead of ±1 sign votes")
-    parser.add_argument("--acc-decay", type=float, default=0.99,
-                        help="[Stochastic] Exp 3: leaky accumulator decay per step (energy mode; default 0.99)")
-    parser.add_argument("--adaptive-thr", type=float, default=None,
-                        help="[Stochastic] Exp 3: adaptive flip threshold k (tau = k*RMS(acc) per channel). "
-                             "None = fixed scalar threshold")
     parser.add_argument("--graph", action="store_true",
                         help="Export training loss plot to checkpoints/loss_plot.png")
     parser.add_argument("--debug", action="store_true",

@@ -24,6 +24,7 @@ import torch
 from ternary_llm.data import create_dataloaders, create_multi_source_dataloaders
 from ternary_llm.transformer import StochasticTransformerModel
 from ternary_llm.arg_utils import DeprecatedFlag, warn_deprecated
+from ternary_llm.cli import add_data_args, add_flip_args
 
 # Flags from closed experiments, retained verbatim for reproducing the numbers
 # in EXPERIMENTS.md. Setting one prints a warning but still works.
@@ -68,11 +69,12 @@ def eval_ce(model, tokens: np.ndarray, block_size: int = 128,
 
 def main():
     parser = argparse.ArgumentParser(description="Backprop baseline for discrete learning")
-    parser.add_argument("--steps", type=int, default=300)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--block-size", type=int, default=128)
-    parser.add_argument("--val-split", type=float, default=0.05)
-    parser.add_argument("--data-cache", type=str, default="tinydata")
+    add_data_args(
+        parser,
+        steps=300, batch_size=16, block_size=128,
+        val_split=0.05, data_cache="tinydata",
+        device="cpu",
+    )
     parser.add_argument("--eval-slice", type=str,
                         default="examples/discrete/sliceEval100k.bin")
     parser.add_argument("--eval-positions", type=int, default=20000)
@@ -81,17 +83,14 @@ def main():
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--threshold", type=float, default=20.0)
+    add_flip_args(
+        parser,
+        threshold=20.0, acc_decay=0.99,
+        adaptive_thr=None, acc_energy=True,
+    )
     parser.add_argument("--no-flips", action="store_true",
                         help="Freeze ternary weights (skip apply_bit_flips) — "
                              "ablation: backprop only trains embedding/lm_head")
-    parser.add_argument("--acc-energy", action="store_true",
-                        help="Exp 3: energy accumulator (leaky EMA of -grad) instead of ±1 sign votes")
-    parser.add_argument("--acc-decay", type=float, default=0.99,
-                        help="Exp 3: leaky accumulator decay per step (energy mode; default 0.99)")
-    parser.add_argument("--adaptive-thr", type=float, default=None,
-                        help="Exp 3: adaptive flip threshold k (tau = k*RMS(acc) per channel). "
-                             "None = fixed scalar threshold")
     parser.add_argument("--soft-flip-temp", type=float, default=None,
                         help="Exp 14: annealed soft flips — initial relative band "
                              "half-width s (fraction of tau). Flip probability "
@@ -99,7 +98,6 @@ def main():
                              "Cosine-annealed s -> 0.08*s over training (converges "
                              "to the deterministic rule). None = deterministic")
     parser.add_argument("--eval-every", type=int, default=50)
-    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--save-dir", type=str, default="checkpoints_bp")
     parser.add_argument("--resume", type=str, default=None,
                         help="Phase-1 checkpoint to continue from (backprop "

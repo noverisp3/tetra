@@ -23,6 +23,7 @@ from ternary_llm.data import create_dataloaders
 from ternary_llm.discrete import (
     DiscreteConfig, DiscreteTrainer, random_token_array,
 )
+from ternary_llm.cli import add_data_args, add_flip_args
 
 PRESETS = {
     "tiny":   dict(hidden_dim=256, num_layers=6,  num_heads=8,  ffn_dim=1024),
@@ -34,30 +35,26 @@ PRESETS = {
 
 def main():
     parser = argparse.ArgumentParser(description="Train Tetra with discrete local rules")
-    parser.add_argument("--preset", type=str, default=None, choices=list(PRESETS))
-    parser.add_argument("--steps", type=int, default=1000)
+    add_data_args(
+        parser, preset_choices=PRESETS,
+        steps=1000, block_size=128, batch_size=16,
+        val_split=0.05, data_cache=None,
+        device="cpu", device_choices=["cpu", "cuda"], seed=0,
+    )
     parser.add_argument("--rule", type=str, default="c",
                         choices=["c", "b", "p", "h", "e"],
                         help="c=predictive coding (default), b=forward-forward, "
                              "p=target PC (aux heads), h=hebbian (exp), e=entropy (exp)")
-    parser.add_argument("--block-size", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--val-split", type=float, default=0.05)
     parser.add_argument("--vocab-size", type=int, default=None)
-    parser.add_argument("--data-cache", type=str, default=None,
-                        help="Directory with metadata.json + tinystories.bin")
     parser.add_argument("--random-data", type=int, default=None,
                         help="Train on N synthetic random tokens (smoke test)")
-    parser.add_argument("--device", type=str, default="cpu",
-                        choices=["cpu", "cuda"])
-    parser.add_argument("--threshold", type=float, default=20.0)
+    add_flip_args(
+        parser,
+        threshold=20.0, acc_decay=0.99,
+        adaptive_thr=None, acc_energy=True,
+    )
     parser.add_argument("--threshold-decay-to", type=float, default=None)
     parser.add_argument("--flip-every-n", type=int, default=5)
-    parser.add_argument("--acc-decay", type=float, default=0.99,
-                        help="Leaky accumulator decay per step (0.99 recommended)")
-    parser.add_argument("--adaptive-thr", type=float, default=None,
-                        help="Exp 3: adaptive flip threshold k (tau = k*RMS(acc) "
-                             "per channel). None = fixed scalar threshold")
     parser.add_argument("--rule-energy", action="store_true",
                         help="Exp 4: keep gradient magnitude in local deltas "
                              "(-grad instead of -sign(grad)) so the accumulator "
@@ -65,7 +62,7 @@ def main():
                              "to select a heavy tail)")
     parser.add_argument("--init", type=str, default="default",
                         choices=["default", "balanced"],
-                        help="Ternary init: default (75%/-1) or balanced (33/33/33)")
+                        help="Ternary init: default (75%%/-1) or balanced (33/33/33)")
     parser.add_argument("--toggle", action="store_true",
                         help="Anti-stiction: kick saturated weights to opposite extreme")
     parser.add_argument("--zero-center", type=float, default=0.0, metavar="FRAC",
@@ -84,7 +81,6 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--eval-steps", type=int, default=20)
     parser.add_argument("--save-dir", type=str, default="checkpoints_discrete")
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--load-checkpoint", type=str, default=None,
                         help="Phase-1 checkpoint to continue from (local-rule "
                              "fine-tuning / continual learning). Accumulators "
