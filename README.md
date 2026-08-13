@@ -2,21 +2,47 @@
   <img src="banner/tetra_banner.jpg" alt="Tetra Model Banner" width="100%">
 </p>
 
-<h1 align="center">Tetra - Pure Ternary LLM</h1>
+<h1 align="center">Tetra - Ternary Transformer</h1>
 
-**Tetra** is a decoder-only transformer trained entirely with **ternary weights** ({-1, 0, +1}) and exported to a **3.6 MB C++ binary** that runs at **300+ tok/s** on CPU (AVX2).
+**Tetra** is a decoder-only transformer whose weights are ternary ({-1, 0, +1}).
+It is trained in two stages: a base model is trained with STE backpropagation,
+exported to a compact 2-bit C++ binary, and then *continues learning on-device*
+through gradient-free bit flips — no GPU, no backpropagation, no re-training
+pipeline required for adaptation to new data.
 
-Three training modes:
+What the codebase provides:
 
-- **STE** (Straight-Through Estimator) — FP32 latent shadow weights quantized on-the-fly via absmean, gradient flows through STE. (BitNet b1.58 approach)
-- **Stochastic Bit-Flip** — no latent weights. Weights stored as packed 2-bit ternary. Gradient sign accumulated in FP32 accumulator; weight flips when |accumulator| > threshold. Supports cosine threshold decay (`--threshold-decay-to`), per-channel scaling (`--per-channel`), and per-group block scaling (`--group-size N`).
-- **Hybrid SSM-Attention** — 80% Ternary SSM (Mamba-style) + 20% Ternary Attention layers. SSM scan via vectorized parallel prefix (O(T), no Python loop). **Experimental — training runs exhibit loss explosions (unstable); not production-ready.**
+- **STE base training** — FP32 latent shadow weights quantized on-the-fly via
+  absmean, gradient flows through straight-through estimation (the BitNet b1.58
+  approach). Produces the converged base model.
+- **On-device continual learning** — three mechanisms that let a deployed
+  2-bit model keep adapting:
+  - **SBF** (Stochastic Bit-Flip): weights stored as packed 2-bit ternary;
+    gradient sign accumulates in an FP32 accumulator and flips a weight when
+    `|accumulator| > threshold`. Gradient-free, runs in C++.
+  - **ARS** (Accept-Reject Search): gates flip proposals by replaying a probe
+    slice against the live model and keeping only proposals that lower eval CE
+    (default on-device flip gating).
+  - **ERC** (Echo Residual Committer): a two-timescale residual
+    (`W = Ternary(W_core) + R`) that absorbs new-domain gradient surprise during
+    backprop fine-tuning while protecting the ternary core from forgetting.
 
-Plus **Multi-head Latent Attention (MLA)** — DeepSeek-V2-style KV compression for attention. Compresses K,V into a small latent vector (`--kv-latent-dim`, default 64) before caching, reducing KV cache by 4×. Uses decoupled RoPE with separate per-head Q/K rope projections (`--rope-per-head`, default 8). Compatible with Stochastic Bit-Flip mode (`--mla` flag). **Untested — implemented (Python + C++ loader) but not yet validated in a training run.**
+The pipeline is deliberately composed of established techniques rather than new
+architectures: a ternary transformer trained smoothly with STE, then adapted
+continually and gradient-free inside the exported C++ runtime.
+
+Two experimental lines are implemented but **not validated for production**:
+
+- **Hybrid SSM-Attention** — 80% Ternary SSM (Mamba-style) + 20% Ternary
+  Attention layers, with a vectorized parallel-prefix SSM scan. Training runs
+  exhibit loss explosions (unstable).
+- **Multi-head Latent Attention (MLA)** — DeepSeek-V2-style KV compression
+  (K,V projected to a small latent before caching). Implemented in Python and
+  the C++ loader, but not yet validated in a training run.
 
 ## Experiments
 
-Experiments Series (Exp 1–16) — see [`EXPERIMENTS.md`](EXPERIMENTS.md).
+Experiments Series (Exp 1–18) — see [`EXPERIMENTS.md`](EXPERIMENTS.md).
 
 ## Architecture
 
@@ -50,26 +76,40 @@ Key design decisions:
 ## Quick Start
 
 ```bash
-# Train tiny on TinyStories (auto-downloads if missing)
-python train.py --preset tiny --steps 15000 --dtype float16 --graph
+# Train the tiny base model on TinyStories (auto-downloads if missing).
+# float32 is the right default on CPU — float16 has no fast matmul path on x86
+# and runs 2-3x slower than float32 for the same result.
+python train.py --preset tiny --steps 15000 --dtype float32 --graph
 
 # Resume from latest checkpoint + plot full history
-python train.py --preset tiny --steps 30000 --dtype float16 --graph --resume
-
-# Train with Multi-head Latent Attention (MLA, DeepSeek-V2 style) — untested, experimental
-python train.py --preset tiny --steps 15000 --dtype float16 --graph --mla --kv-latent-dim 64 --rope-per-head 8
-
-# Export to C++ binary and run inference
-python inference/export_model.py checkpoints/checkpoint_015000.pt inference/tetra_model.bin
-cd inference && build.bat avx2 && cd ..
-python inference/run_inference.py inference/tetra_model.bin "Once upon a time" --max-tokens 100 --repeat-penalty 1.1
+python train.py --preset tiny --steps 30000 --dtype float32 --graph --resume
 
 # Use GPT-2 tokenizer instead of custom BPE
-python train.py --preset tiny --steps 15000 --dtype float16 --tokenizer-dir gpt2
+python train.py --preset tiny --steps 15000 --dtype float32 --tokenizer-dir gpt2
 
 # Multi-source data (1B tokens from FineWeb/Cosmopedia/Orca)
 python scripts/prepare_data.py --target-tokens 1e9
-python train.py --preset 500m --steps 15000 --dtype float16 --data-cache data --batch-size 4 --grad-accum 8
+python train.py --preset 500m --steps 15000 --dtype float32 --data-cache data --batch-size 4 --grad-accum 8
+```
+
+Export and run inference:
+
+```bash
+# Export to a 2-bit C++ binary
+python inference/export_model.py checkpoints/checkpoint_015000.pt inference/tetra_model.bin
+cd inference && build.bat avx2 && cd ..
+python inference/run_inference.py inference/tetra_model.bin "Once upon a time" --max-tokens 100 --repeat-penalty 1.1
+```
+
+On-device continual learning (gradient-free, in C++):
+
+```bash
+# Energy accumulator + adaptive threshold + top-k feed (Exp 7 mechanism)
+python inference/export_model.py checkpoints/checkpoint_015000.pt checkpoints/exp7.bin \
+    --sl-energy --sl-adaptive-thr 3.0 --sl-sparsity 0.01
+
+# Self-learn on a raw token stream (out.bin is the adapted model)
+selflearn_avx2.exe checkpoints\exp7.bin data\fineweb_10bt\fineweb_0000.bin checkpoints\adapted.bin 200 50 100
 ```
 
 ## Mixed Precision

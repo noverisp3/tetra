@@ -1,8 +1,8 @@
-# Tetra — Experimental Log (Exp 1–16)
+# Tetra — Experimental Log (Exp 1–18)
 
 Chronological record of the experiment series, one section per experiment
 (hypothesis → setup → results → verdict → reproduce). Sections are ordered
-Exp 1 → Exp 16 (Exp 15 is a paused-status note); the README "Experiments"
+Exp 1 → Exp 18 (Exp 15 is a paused-status note); the README "Experiments"
 section links back here.
 
 1. **Exp 1** — Surprise-Gated Bit Flips
@@ -21,6 +21,8 @@ section links back here.
 14. **Exp 14** — Annealed Soft Flips (Gumbel-flip, rejected)
 15. **Exp 15** — MLA / Hybrid Attn (status note)
 16. **Exp 16** — ARS-Gated Embedding Updates
+17. **Exp 17** — KV-Cache Quantization (int8/int16 SIMD)
+18. **Exp 18** — UTF Churn-Ramp Pipeline (closed, negative result)
 
 ---
 
@@ -874,7 +876,7 @@ python train_baseline_backprop.py --resume checkpoints_bp/checkpoint_000200.pt \
 ```
 ---
 
-## Experiment: MLA / Hybrid Attn (Exp 15) � status note
+## Experiment: MLA / Hybrid Attn (Exp 15) — status note
 
 Status: **paused / shelved**. Core ternary (dense) pipeline is healthy; MLA is an
 experimental branch and is not the focus.
@@ -1005,7 +1007,7 @@ inference\selflearn_avx2.exe checkpoints_discrete_c3\exp_tog_s0_zacc.bin example
 ---
 
 
-## Experiment: KV-Cache Quantization (Exp 17) � FP32 baseline 2026-08-11
+## Experiment: KV-Cache Quantization (Exp 17) — FP32 baseline 2026-08-11
 
 Goal: cut the FP32 KV cache 4x. Baseline measured BEFORE any change (selflearn_prof.exe, /DTETRA_PROFILE AVX2, exp7_v6_lr5.bin tiny 6L/256H/8hd/32, sliceEval100k.bin, FP32 lm_head):
 
@@ -1016,7 +1018,7 @@ Goal: cut the FP32 KV cache 4x. Baseline measured BEFORE any change (selflearn_p
 
 Stage breakdown (82.2 s / 20480 positions): attn_scores 43.2% | gate_up 27.2% | down_proj 9.8% | qkv_matmul 9.1% | lm_head 7.2% | o_proj 3.2% | norm 0.4%.
 
-KV cache footprint (FP32): 6 x 2 x 2048 x 256 x 4 B = 25.2 MB; decode reads ~24 MB of K/V per token (4 MB/layer), i.e. ~6 GB/s of the ~4 ms token budget is KV traffic alone � attn_scores (43%) is the KV-bound stage to attack. Reference at 500m preset: 251 MB FP32 (6L x 2560).
+KV cache footprint (FP32): 6 x 2 x 2048 x 256 x 4 B = 25.2 MB; decode reads ~24 MB of K/V per token (4 MB/layer), i.e. ~6 GB/s of the ~4 ms token budget is KV traffic alone — attn_scores (43%) is the KV-bound stage to attack. Reference at 500m preset: 251 MB FP32 (6L x 2560).
 
 
 ## Exp 17, Round 2: int8/int16 KV cache implemented + SIMD (2026-08-11)
