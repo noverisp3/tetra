@@ -24,7 +24,7 @@ from ternary_llm.data import (
 )
 from ternary_llm.trainer import TernaryTrainer, TrainingConfig
 from ternary_llm.arg_utils import DeprecatedFlag, warn_deprecated
-from ternary_llm.cli import add_data_args, add_flip_args
+from ternary_llm.cli import add_data_args, add_flip_args, configure_cpu_runtime
 
 # Flags whose experiment was closed (rejected / null result / dead end). They
 # are retained verbatim for reproducing the published numbers in EXPERIMENTS.md;
@@ -384,6 +384,9 @@ def main():
         config.debug = True
     if args.dtype:
         config.dtype = args.dtype
+    if config.device != "cuda" or not torch.cuda.is_available():
+        n_threads = configure_cpu_runtime(config.device, dtype=config.dtype)
+        print(f"CPU runtime: {n_threads} intra-op threads")
     if args.warmup_steps is not None:
         config.warmup_steps = args.warmup_steps
     if args.min_lr is not None:

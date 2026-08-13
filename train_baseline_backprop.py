@@ -24,7 +24,7 @@ import torch
 from ternary_llm.data import create_dataloaders, create_multi_source_dataloaders
 from ternary_llm.transformer import StochasticTransformerModel
 from ternary_llm.arg_utils import DeprecatedFlag, warn_deprecated
-from ternary_llm.cli import add_data_args, add_flip_args
+from ternary_llm.cli import add_data_args, add_flip_args, configure_cpu_runtime
 
 # Flags from closed experiments, retained verbatim for reproducing the numbers
 # in EXPERIMENTS.md. Setting one prints a warning but still works.
@@ -110,6 +110,10 @@ def main():
     args = parser.parse_args()
 
     warn_deprecated(parser, args, DEPRECATED_FLAGS)
+
+    if args.device != "cuda" or not torch.cuda.is_available():
+        n_threads = configure_cpu_runtime(args.device)
+        print(f"CPU runtime: {n_threads} intra-op threads")
 
     data_cache = Path(args.data_cache)
     meta_path = data_cache / "metadata.json"

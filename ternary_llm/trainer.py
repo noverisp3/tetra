@@ -273,6 +273,12 @@ class TernaryTrainer:
                     self.device = torch.device("cpu")
         print(f"Device: {self.device}")
 
+        # CPU runtime tuning (no quality trade-off): PyTorch defaults often
+        # under-use the cores, and fp16 matmul is slow on x86.
+        if self.device.type == "cpu":
+            from .cli import configure_cpu_runtime
+            configure_cpu_runtime("cpu", dtype=config.dtype)
+
         # C++ extension status
         from .quantization import _has_cpp
         if _has_cpp:

@@ -23,7 +23,7 @@ from ternary_llm.data import create_dataloaders
 from ternary_llm.discrete import (
     DiscreteConfig, DiscreteTrainer, random_token_array,
 )
-from ternary_llm.cli import add_data_args, add_flip_args
+from ternary_llm.cli import add_data_args, add_flip_args, configure_cpu_runtime
 
 PRESETS = {
     "tiny":   dict(hidden_dim=256, num_layers=6,  num_heads=8,  ffn_dim=1024),
@@ -131,6 +131,10 @@ def main():
         for k, v in PRESETS[args.preset].items():
             setattr(config, k, v)
         print(f"Using preset: {args.preset}")
+
+    if config.device != "cuda" or not torch.cuda.is_available():
+        n_threads = configure_cpu_runtime(config.device)
+        print(f"CPU runtime: {n_threads} intra-op threads")
 
     # Data
     if args.random_data is not None:

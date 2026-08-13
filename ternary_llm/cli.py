@@ -15,9 +15,55 @@ usual sentinel for 'no default') still adds the flag, which is what train.py
 needs for flags whose CLI default is literally ``None``.
 """
 
-import argparse
+import os
+
+import torch
 
 _UNSET = object()
+
+_cpu_configured = False  # module-level: avoid double warnings on re-entry
+
+
+def _is_cpu(device) -> bool:
+    """True when the resolved device is CPU (or unset / invalid)."""
+    if not device:
+        return True
+    dev = str(device).lower()
+    return dev in ("cpu", "cpu:0")
+
+
+def configure_cpu_runtime(device, *, dtype: str | None = None) -> int:
+    """Tune the torch runtime for CPU training with no quality trade-off.
+
+    PyTorch's default intra-op thread count often under-uses the machine (it
+    may default to a fraction of the cores, e.g. 4 on an 8-core box), and
+    float16 matmuls are dramatically slower than float32 on CPU. Both are pure
+    wins to correct at runtime:
+
+      * set the intra-op thread count to ``cpu_count()`` (capped at 32, where
+        OpenMP sync overhead stops paying for these small GEMMs);
+      * warn when ``--dtype float16`` was requested on CPU: fp16 on x86 runs
+        through slow scalar/emulated kernels, typically 2-3x slower than fp32
+        for the same result.
+
+    Call this as early as possible (before the model and dataloaders are
+    built) so the thread pool is sized once. Returns the thread count used.
+    """
+    if not _is_cpu(device):
+        return torch.get_num_threads()
+
+    global _cpu_configured
+    n = max(1, min(os.cpu_count() or 4, 32))
+    torch.set_num_threads(n)
+
+    if dtype == "float16" and not _cpu_configured:
+        print(
+            "WARNING: --dtype float16 on CPU is 2-3x slower than float32 "
+            "(x86 has no fast fp16 matmul path). Use --dtype float32."
+        )
+    _cpu_configured = True
+
+    return n
 
 
 def add_data_args(

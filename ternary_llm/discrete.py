@@ -320,6 +320,9 @@ class DiscreteTrainer:
     ):
         self.config = config
         self.device = torch.device(config.device)
+        if self.device.type == "cpu":
+            from .cli import configure_cpu_runtime
+            configure_cpu_runtime("cpu")
         self.model = model if model is not None else build_model_from_config(config)
         self.model.to(self.device)
         self.model.eval()
