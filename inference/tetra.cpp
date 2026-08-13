@@ -28,6 +28,8 @@ static std::vector<int> parse_tokens(const char* str) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <model.bin> <token_ids> [max_new_tokens] [temperature] [top_k] [top_p] [repeat_penalty] [--kv-int8]\n", argv[0]);
+        fprintf(stderr, "  Named flags (preferred; positional form above still works):\n");
+        fprintf(stderr, "    --max-tokens N  --temperature F  --top-k N  --top-p F  --repeat-penalty F\n");
         fprintf(stderr, "  max_new_tokens=0: dump logits (no generation)\n");
         fprintf(stderr, "  repeat_penalty: >1.0 penalizes repeated tokens (default: 1.0 = disabled)\n");
         fprintf(stderr, "  --kv-int8 (9th arg): int8 KV cache (half RAM, small accuracy cost)\n");
@@ -43,6 +45,20 @@ int main(int argc, char** argv) {
     float top_p = (argc > 6) ? atof(argv[6]) : 0.9f;
     float repeat_penalty = (argc > 7) ? atof(argv[7]) : 1.0f;
     bool kv_int8 = (argc > 8 && strcmp(argv[8], "--kv-int8") == 0);
+
+    // Named flags override the (legacy) positional values above.
+    for (int i = 3; i + 1 < argc; i++) {
+        if      (strcmp(argv[i], "--max-tokens")     == 0) max_new = atoi(argv[i + 1]);
+        else if (strcmp(argv[i], "--temperature")    == 0) temp = (float)atof(argv[i + 1]);
+        else if (strcmp(argv[i], "--top-k")          == 0) top_k = atoi(argv[i + 1]);
+        else if (strcmp(argv[i], "--top-p")          == 0) top_p = (float)atof(argv[i + 1]);
+        else if (strcmp(argv[i], "--repeat-penalty") == 0) repeat_penalty = (float)atof(argv[i + 1]);
+    }
+    bool kv_int8_named = false;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--kv-int8") == 0) kv_int8_named = true;
+    }
+    if (kv_int8_named) kv_int8 = true;
 
     auto t0 = std::chrono::high_resolution_clock::now();
     tetra::Model model = tetra::load_model(model_path);

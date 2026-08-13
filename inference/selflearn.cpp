@@ -342,6 +342,11 @@ int main(int argc, char** argv) {
             "Usage: %s <model.bin> <tokens.bin> <out.bin> [steps] [log_every] [save_every] [thr] [decay] [flip_every] [toggle] [--toggle-window N] [--thr-anneal RATE] [--energy] [--adaptive-thr K]\n",
             argv[0]);
         fprintf(stderr,
+            "  Named flags (preferred; positional form above still works). Value flags\n"
+            "  default to the v6 metadata; 0 keeps metadata (-1 for --toggle).\n"
+            "    --steps N  --log-every N  --save-every N\n"
+            "    --thr F  --decay F  --flip-every N  --toggle [0|1|-1]  --no-toggle\n");
+        fprintf(stderr,
             "  thr/decay/flip_every/toggle override the v6 metadata (0 = keep metadata value; -1 for toggle = keep metadata)\n"
             "  --sl-logit-scale F: override the metadata logit scale (>0; 0 = keep metadata)\n");
         fprintf(stderr,
@@ -525,6 +530,29 @@ int main(int argc, char** argv) {
     if (churn_ramp > 0.0f && !ars) {
         fprintf(stderr, "ERROR: --churn-ramp requires --ars (no safety signal without probes)\n");
         return 1;
+    }
+
+    // Named flags for the positional override arguments (preferred over the
+    // legacy positional form, which stays supported). All value flags accept
+    // a value <= 0 (or -1 for --toggle) to keep the exported metadata value.
+    for (int i = 1; i + 1 < argc; i++) {
+        if      (strcmp(argv[i], "--steps")      == 0) steps          = atoi(argv[i + 1]);
+        else if (strcmp(argv[i], "--log-every")  == 0) log_every      = atoi(argv[i + 1]);
+        else if (strcmp(argv[i], "--save-every") == 0) save_every     = atoi(argv[i + 1]);
+        else if (strcmp(argv[i], "--thr")        == 0) thr_override   = (float)atof(argv[i + 1]);
+        else if (strcmp(argv[i], "--decay")      == 0) decay_override = (float)atof(argv[i + 1]);
+        else if (strcmp(argv[i], "--flip-every") == 0) every_override = atoi(argv[i + 1]);
+        else if (strcmp(argv[i], "--toggle")     == 0) {
+            // "--toggle" alone enables kick; "--toggle 0"/"--toggle 1" explicit.
+            const char* v = argv[i + 1];
+            bool has_val = (v[0] == '-' || v[0] == '+' || (v[0] >= '0' && v[0] <= '9'))
+                        && (v[0] != '\0');
+            toggle_override = has_val ? atoi(v) : 1;
+            if (has_val) i++;
+        }
+    }
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-toggle") == 0) toggle_override = 0;
     }
 
     auto t0 = std::chrono::high_resolution_clock::now();
