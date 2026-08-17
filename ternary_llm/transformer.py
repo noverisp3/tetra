@@ -152,11 +152,13 @@ class TernaryTransformerModel(nn.Module):
         topk: float = 1.0,
         group_size: int = 0,
         init_mode: str = "kaiming",
+        logit_scale: Optional[float] = None,
     ):
         super().__init__()
 
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
+        self.logit_scale = logit_scale
 
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, hidden_dim)
@@ -237,8 +239,9 @@ class TernaryTransformerModel(nn.Module):
 
         loss = None
         if targets is not None:
+            ls = logits * self.logit_scale if self.logit_scale is not None else logits
             loss = nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
+                ls.reshape(-1, ls.size(-1)),
                 targets.reshape(-1),
                 ignore_index=-1,
             )

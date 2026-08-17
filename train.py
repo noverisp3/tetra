@@ -129,6 +129,11 @@ def main():
         device=None, device_choices=["cpu", "cuda", "directml"], seed=None,
     )
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--logit-scale", type=float, default=None,
+                        help="[STE] Scale logits before cross-entropy. For hidden>=512 this "
+                             "calibrates the initial loss to ~ln(vocab) and prevents fp16 "
+                             "overflow; recommended 1/sqrt(hidden_dim) (e.g. 0.02 for 500m). "
+                             "Default: no scaling (legacy behaviour).")
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps")
     parser.add_argument("--hidden-dim", type=int, default=None, help="Hidden dimension")
     parser.add_argument("--num-layers", type=int, default=None, help="Number of layers")
@@ -545,6 +550,7 @@ def main():
             topk=args.topk if args.topk is not None else 1.0,
             group_size=config.group_size,
             init_mode=config.init_mode,
+            logit_scale=args.logit_scale,
         )
 
     total_params = sum(p.numel() for p in model.parameters())

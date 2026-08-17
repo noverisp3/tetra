@@ -73,6 +73,11 @@ Key design decisions:
 | **large** | 91.3M | 90.6M | 720K | 768 | 12 | 12 | 2048 | 64 |
 | **500m** | 516M | 494M | 22M | 2560 | 6 | 40 | 6826 | 64 |
 
+> **`--logit-scale` (STE only):** scales logits before cross-entropy. Without it the
+> initial loss grows with `hidden_dim` (e.g. ~190 on the 500m preset vs `ln(8192)≈9`
+> at scale `1/sqrt(hidden_dim)`) and fp16 training overflows into NaN gradients. Set
+> it to `1/sqrt(hidden_dim)` (0.02 for 500m) when training presets above `tiny`.
+
 ## Quick Start
 
 ```bash
@@ -89,7 +94,7 @@ python train.py --preset tiny --steps 15000 --dtype float32 --tokenizer-dir gpt2
 
 # Multi-source data (1B tokens from FineWeb/Cosmopedia/Orca)
 python scripts/prepare_data.py --target-tokens 1e9
-python train.py --preset 500m --steps 15000 --dtype float32 --data-cache data --batch-size 4 --grad-accum 8
+python train.py --preset 500m --steps 15000 --dtype float32 --data-cache data --batch-size 4 --grad-accum 8 --logit-scale 0.02
 ```
 
 Export and run inference:

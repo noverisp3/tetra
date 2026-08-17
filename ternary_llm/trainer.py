@@ -437,7 +437,6 @@ class TernaryTrainer:
         if getattr(self.config, "v8_reg", 0.0) > 0:
             loss = loss + self.config.v8_reg * self._v8_reg_penalty()
         if not math.isfinite(raw_loss):
-            self.model.zero_grad(set_to_none=True)
             return raw_loss
         loss = loss / self.config.gradient_accumulation_steps
         if self.scaler is not None:
