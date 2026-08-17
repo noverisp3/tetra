@@ -369,7 +369,9 @@ int main(int argc, char** argv) {
             "  --no-mul: matmul-free learning rule — quantize the activation to\n"
             "         ternary {-1,0,+1} via absmean threshold (alpha=mean(|x|),\n"
             "         keep |x|>alpha/2) and accumulate the full-precision error e\n"
-            "         through it (e*ternary(x) = select/add, no real multiply).\n");
+            "         through it (e*ternary(x) = select/add, no real multiply).\n"
+            "  --no-mul-thr F: static |x|>F threshold for --no-mul (F>0 replaces\n"
+            "         the absmean alpha/2; default 0 = absmean). Exp 19 sweep.\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -517,9 +519,16 @@ int main(int argc, char** argv) {
     // e * ternary(x) is select/add — no real float multiply in the rule. This
     // tests whether the ternary model still learns when the last multiply in
     // the on-device updates is removed.
+    // --no-mul-thr F: static threshold override for --no-mul. If > 0, keep
+    // |x| > F (constant across layers/positions) instead of the absmean alpha/2.
+    // F <= 0 keeps the absmean behavior. Only meaningful with --no-mul.
     bool no_mul = false;
+    float no_mul_thr_override = 0.0f;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--no-mul") == 0) no_mul = true;
+    }
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--no-mul-thr") == 0) no_mul_thr_override = (float)atof(argv[i + 1]);
     }
     // Churn ramp (Exp 18): --churn-ramp RATE lowers the adaptive-thr
     // multiplier k by RATE per flip pass and grows the ARS probe capacity
@@ -694,13 +703,18 @@ int main(int argc, char** argv) {
                 // convention this repo already uses in STE training), but keep
                 // the error e in full precision. The update e * ternary(x) is a
                 // vector-times-ternary product = select/add — no real matmul.
+                // --no-mul-thr F (>0) replaces absmean with a static threshold.
                 float no_mul_alpha = 0.0f, no_mul_thr = 0.0f;
                 if (no_mul) {
-                    double sum_abs = 0.0;
-                    const float* xa = pr.x.data();
-                    for (size_t i = 0; i < cols; i++) sum_abs += std::fabs(xa[i]);
-                    no_mul_alpha = (cols > 0) ? (float)(sum_abs / cols) : 0.0f;
-                    no_mul_thr = 0.5f * no_mul_alpha;
+                    if (no_mul_thr_override > 0.0f) {
+                        no_mul_thr = no_mul_thr_override;
+                    } else {
+                        double sum_abs = 0.0;
+                        const float* xa = pr.x.data();
+                        for (size_t i = 0; i < cols; i++) sum_abs += std::fabs(xa[i]);
+                        no_mul_alpha = (cols > 0) ? (float)(sum_abs / cols) : 0.0f;
+                        no_mul_thr = 0.5f * no_mul_alpha;
+                    }
                 }
                 for (size_t o = 0; o < rows; o++) {
                     float e = cur.y[o] - pr.y[o];
@@ -739,11 +753,16 @@ int main(int argc, char** argv) {
                 // Variant-2 rule (--no-mul): keep the embedding error gv in full
                 // precision, quantize the hidden activation h to ternary with an
                 // absmean threshold (computed once per position, not per v).
+                // --no-mul-thr F (>0) replaces absmean with a static threshold.
                 float hthr = 0.0f;
                 if (no_mul) {
-                    double hsum = 0.0;
-                    for (int i = 0; i < H; i++) hsum += std::fabs(h[i]);
-                    hthr = 0.5f * (H > 0 ? (float)(hsum / H) : 0.0f);
+                    if (no_mul_thr_override > 0.0f) {
+                        hthr = no_mul_thr_override;
+                    } else {
+                        double hsum = 0.0;
+                        for (int i = 0; i < H; i++) hsum += std::fabs(h[i]);
+                        hthr = 0.5f * (H > 0 ? (float)(hsum / H) : 0.0f);
+                    }
                 }
                 for (int v = 0; v < V; v++) {
                     float gv = softmax_buf[v] - (v == target ? 1.0f : 0.0f);

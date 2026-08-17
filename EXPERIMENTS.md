@@ -1072,5 +1072,18 @@ Setup: `checkpoints/exp7_v6_lr5_fp32emb.bin` (v6, fp32 embedding, self-learning 
 
 - **Variant 2** (accepted): keep the error `e` / `gv` in full precision; quantize the **activation** to ternary {-1,0,+1} with an **absmean threshold** — `alpha = mean(|x|)`, `ternary(x) = sign(x)` if `|x| > alpha/2` else 0, the same absmean convention the STE base training uses. The update `e · ternary(x)` is select/add — no real multiply. **Learns and beats the float baseline by −0.19 nats on the same budget.** Block CE also tracks the baseline (6.85 vs 6.89 @200 steps), churn/flip counts comparable (~34.7K vs ~68K flips/pass), at ~+21% block time (absmean scan is a second pass over the activation).
 - **Variant 1** (rejected): collapsing **both** factors to sign (±1) discards the error magnitude entirely — the accumulator only ever receives ±1, flips drop to ~12K/pass and the model regresses +1.47 nats. Magnitude on the error side is load-bearing; on the activation side it is not.
-- **Implementation**: `--no-mul` flag in `selflearn.cpp`, applied in rule-'c' (`sl_feed_predictive` feed loop) and the embedding-gradient path. Threshold computed once per layer / per position (not per row/v).
-- **Verdict**: POSITIVE — the matmul-free learning rule learns on-device and slightly outperforms the float-multiply baseline. The removal is on the **activation** factor; error magnitude stays float (the accumulator remains FP32 by design). Follow-ups: sweep the ternary threshold (static |x|>0.5 vs absmean scaling), longer horizons (500–1000 blocks), and whether the same rule helps the STE-trained base path.
+- **Implementation**: `--no-mul` flag in `selflearn.cpp`, applied in rule-'c' (`sl_feed_predictive` feed loop) and the embedding-gradient path. Threshold computed once per layer / per position (not per row/v). `--no-mul-thr F` (Exp 19 sweep) replaces the absmean `alpha/2` with a static `|x| > F`; `F <= 0` keeps absmean.
+- **Verdict**: POSITIVE — the matmul-free learning rule learns on-device and slightly outperforms the float-multiply baseline. The removal is on the **activation** factor; error magnitude stays float (the accumulator remains FP32 by design).
+
+**Threshold sweep** (same model/config/budget as above, 200 blocks, `sliceEval100k` @2000, start CE 8.0847):
+
+| Threshold rule | ternary(x) = | eval CE @2000 | Δ vs 8.085 |
+|---|---|---|---|
+| absmean (default) | `|x| > mean(|x|)/2` | 7.5140 | −0.571 |
+| static `--no-mul-thr 1.0` | `|x| > 1.0` | 7.5632 | −0.522 |
+| **static `--no-mul-thr 2.0`** | `|x| > 2.0` | **7.4880** | **−0.597** |
+| (float baseline, for reference) | — | 7.7027 | −0.382 |
+
+- Monotonic trend in the sampled range: the **sparser/higher-threshold** arm wins — a higher `|x|` bar keeps only the strongest activations as ±1 and zeroes the rest, and 2.0 beats both absmean (−0.03 nats) and the float baseline (−0.22 nats). Consistent with the `--sparsity` top-k finding: the rule benefits from a heavy-tailed (sparse) activation feed.
+- `--no-mul-thr 2.0` also flips the least (~15.3K/pass vs absmean ~34.7K, float ~68K) — fewer, higher-confidence updates. Block time ~1.19 s vs ~1.04 s (the threshold scan is the extra pass; static still scans but skips the mean).
+- **Follow-ups**: continue the static sweep upward (2.0 → 3.0/4.0) to find the optimum, longer horizons (500–1000 blocks), and whether the same rule helps the STE-trained base path.
