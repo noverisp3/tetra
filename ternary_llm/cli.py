@@ -15,6 +15,7 @@ usual sentinel for 'no default') still adds the flag, which is what train.py
 needs for flags whose CLI default is literally ``None``.
 """
 
+import argparse
 import os
 
 import torch
