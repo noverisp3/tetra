@@ -417,12 +417,14 @@ natively in C++:
   the rule. On the Exp 7 model, 200 blocks on `slice100k`: eval CE **7.5140** vs the float
   baseline **7.7027** (start 8.0847) — the multiply-free rule learns and slightly beats the
   float-multiply baseline. `--no-mul-thr F` sweeps the ternary threshold with a static `|x| > F`;
-  the sweep is **inverted-U with the optimum at `--no-mul-thr 2.0`** (**CE 7.4880** — best arm):
-  a sparser activation feed (fewer, higher-confidence updates — ~15K flips/pass vs ~68K for float)
-  beats absmean and the float baseline, but 3.0+ starves the rule (0 flips at 3.0, no learning).
-  The absmean default is scale-invariant, needs no tuning, and lands within −0.03 of the optimum.
-  (Variant 1, collapsing *both* factors to sign, discards error magnitude and regresses to 9.56
-  — the error side must stay full-precision.)
+  the sweep is **inverted-U with the optimum at `--no-mul-thr 2.0`**: a sparser activation feed
+  (fewer, higher-confidence updates — ~15K flips/pass vs ~68K for float) beats absmean and the
+  float baseline at 200 blocks (**CE 7.4880**), but 3.0+ starves the rule (0 flips at 3.0, no
+  learning). Over a 5× longer run (1000 blocks) the 2.0 arm keeps improving to **CE 7.0040**
+  (@2000) / **7.1296** (@10000) — stable, no overfit. The absmean default is scale-invariant,
+  needs no tuning, and lands within −0.03 of the optimum. (Variant 1, collapsing *both* factors
+  to sign, discards error magnitude and regresses to 9.56 — the error side must stay
+  full-precision.)
 - All three are persisted in the binary metadata (`sl_energy`, `sl_adaptive_thr`, `sl_sparsity`)
   by `export_model.py --sl-energy --sl-adaptive-thr K --sl-sparsity S`, so a device run picks
   them up automatically. CLI flags override the metadata (same convention as `thr`/`decay`).

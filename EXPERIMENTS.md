@@ -1090,4 +1090,15 @@ Setup: `checkpoints/exp7_v6_lr5_fp32emb.bin` (v6, fp32 embedding, self-learning 
 - **Inverted-U, optimum at 2.0**: 1.0 → 2.0 improves monotonically, then collapses at 3.0+ (8.10, 8.39, 8.09 — back to ≈ start). At 3.0 the flip pass delivers **0 flips** (threshold too high → too few activations survive as ±1 → gradient too sparse to push any accumulator over the flip bar); 5.0 survives on ~2.6K flips but still does not learn. The usable static range is narrow (~1.0–2.5) and 2.0 is the peak, beating both absmean (−0.03 nats) and the float baseline (−0.22 nats).
 - **`--no-mul-thr 2.0` also flips the least** among the working arms (~15.3K/pass vs absmean ~34.7K, float ~68K) — fewer, higher-confidence updates. Consistent with the `--sparsity` top-k finding: the rule benefits from a heavy-tailed (sparse) activation feed, but only up to the point where enough structure survives.
 - **Default choice**: absmean (alpha/2) is scale-invariant, needs no tuning, and lands within −0.03 of the tuned optimum — keep it as the `--no-mul` default; `--no-mul-thr 2.0` is the tuned best for this tile.
-- **Follow-ups**: longer horizons (500–1000 blocks) on the 2.0 arm, and whether the same rule helps the STE-trained base path.
+
+**Long horizon (best arm, `--no-mul --no-mul-thr 2.0`, same model/config, 1000 blocks on `slice100k`)**:
+
+| blocks | eval CE @2000 | eval CE @10000 |
+|---|---|---|
+| 0 (start) | 8.0847 | — |
+| 200 | 7.4880 | — |
+| 1000 | **7.0040** | **7.1296** |
+
+- Convergence does **not** plateau at 200 blocks: 200→1000 blocks keeps improving (−0.48 nats @2000). The 10000-position eval (5× the window) reads only +0.13 higher than @2000 — the learned rule generalizes, no overfit to the training slice.
+- Block CE stays in a stable band (6.4–7.6, no runaway), flips ~12.6–15.3K/pass throughout — the sparser matmul-free rule keeps learning at constant budget over the full run.
+- **Verdict (final)**: the matmul-free learning rule (ternary activation via absmean or static 2.0, full-precision error) learns on-device, beats the float-multiply baseline, and keeps improving over a 5× longer horizon. The whole self-learning pipeline — rule-'c' gradient, accumulator feed, bit flips, embedding updates — runs without a single real float multiply in the updates.
