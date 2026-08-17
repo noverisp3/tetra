@@ -1079,11 +1079,15 @@ Setup: `checkpoints/exp7_v6_lr5_fp32emb.bin` (v6, fp32 embedding, self-learning 
 
 | Threshold rule | ternary(x) = | eval CE @2000 | Δ vs 8.085 |
 |---|---|---|---|
-| absmean (default) | `|x| > mean(|x|)/2` | 7.5140 | −0.571 |
 | static `--no-mul-thr 1.0` | `|x| > 1.0` | 7.5632 | −0.522 |
+| absmean (default) | `|x| > mean(|x|)/2` | 7.5140 | −0.571 |
 | **static `--no-mul-thr 2.0`** | `|x| > 2.0` | **7.4880** | **−0.597** |
+| static `--no-mul-thr 3.0` | `|x| > 3.0` | 8.0979 | +0.013 |
+| static `--no-mul-thr 4.0` | `|x| > 4.0` | 8.3893 | +0.304 |
+| static `--no-mul-thr 5.0` | `|x| > 5.0` | 8.0943 | +0.009 |
 | (float baseline, for reference) | — | 7.7027 | −0.382 |
 
-- Monotonic trend in the sampled range: the **sparser/higher-threshold** arm wins — a higher `|x|` bar keeps only the strongest activations as ±1 and zeroes the rest, and 2.0 beats both absmean (−0.03 nats) and the float baseline (−0.22 nats). Consistent with the `--sparsity` top-k finding: the rule benefits from a heavy-tailed (sparse) activation feed.
-- `--no-mul-thr 2.0` also flips the least (~15.3K/pass vs absmean ~34.7K, float ~68K) — fewer, higher-confidence updates. Block time ~1.19 s vs ~1.04 s (the threshold scan is the extra pass; static still scans but skips the mean).
-- **Follow-ups**: continue the static sweep upward (2.0 → 3.0/4.0) to find the optimum, longer horizons (500–1000 blocks), and whether the same rule helps the STE-trained base path.
+- **Inverted-U, optimum at 2.0**: 1.0 → 2.0 improves monotonically, then collapses at 3.0+ (8.10, 8.39, 8.09 — back to ≈ start). At 3.0 the flip pass delivers **0 flips** (threshold too high → too few activations survive as ±1 → gradient too sparse to push any accumulator over the flip bar); 5.0 survives on ~2.6K flips but still does not learn. The usable static range is narrow (~1.0–2.5) and 2.0 is the peak, beating both absmean (−0.03 nats) and the float baseline (−0.22 nats).
+- **`--no-mul-thr 2.0` also flips the least** among the working arms (~15.3K/pass vs absmean ~34.7K, float ~68K) — fewer, higher-confidence updates. Consistent with the `--sparsity` top-k finding: the rule benefits from a heavy-tailed (sparse) activation feed, but only up to the point where enough structure survives.
+- **Default choice**: absmean (alpha/2) is scale-invariant, needs no tuning, and lands within −0.03 of the tuned optimum — keep it as the `--no-mul` default; `--no-mul-thr 2.0` is the tuned best for this tile.
+- **Follow-ups**: longer horizons (500–1000 blocks) on the 2.0 arm, and whether the same rule helps the STE-trained base path.
