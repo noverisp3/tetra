@@ -121,6 +121,18 @@ python inference/export_model.py checkpoints/checkpoint_015000.pt checkpoints/ex
 ./inference/selflearn_avx2 checkpoints/exp7.bin data/fineweb_10bt/fineweb_0000.bin checkpoints/adapted.bin 200 50 100
 ```
 
+### Train a ~100M model on a free GPU (Kaggle / Colab)
+
+Don't have a GPU? The repo trains fine on CPU, but for a bigger model use the free
+T4/P100 from **Kaggle** or **Google Colab**:
+
+- Open [`notebooks/tetra_train_gpu.ipynb`](notebooks/tetra_train_gpu.ipynb) on
+  [Kaggle](https://kaggle.com/) or [Google Colab](https://colab.research.google.com/)
+  (Runtime → Change runtime type → **GPU T4**).
+- The notebook clones the repo, installs deps, auto-downloads **TinyStories**
+  (~535M tokens), trains the base model in **float16 on CUDA** (preset `500m` ≈ 100M
+  params), exports the 2-bit binary, and generates a sample story.
+
 ## Mixed Precision
 
 Manual `activation_dtype` casting (no `autocast`):
