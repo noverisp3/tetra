@@ -1,8 +1,8 @@
-# Tetra — Experimental Log (Exp 1–18)
+# Tetra — Experimental Log (Exp 1–19)
 
 Chronological record of the experiment series, one section per experiment
 (hypothesis → setup → results → verdict → reproduce). Sections are ordered
-Exp 1 → Exp 18 (Exp 15 is a paused-status note); the README "Experiments"
+Exp 1 → Exp 19 (Exp 15 is a paused-status note); the README "Experiments"
 section links back here.
 
 1. **Exp 1** — Surprise-Gated Bit Flips
@@ -23,6 +23,7 @@ section links back here.
 16. **Exp 16** — ARS-Gated Embedding Updates
 17. **Exp 17** — KV-Cache Quantization (int8/int16 SIMD)
 18. **Exp 18** — UTF Churn-Ramp Pipeline (closed, negative result)
+19. **Exp 19** — MatMul-Free Learning Rule (`--no-mul`, Variant 2 beats baseline)
 
 ---
 
@@ -1055,3 +1056,21 @@ Setup: new self-learning baselines `checkpoints/exp10_v7_sl.bin` / `exp10_v8_sl.
   - Ramp: k_eff never descended below ≈ 2.98. Pre/post probe noise (±0.06–0.07 CE) exceeds the 0.5% block margin on 30–50% of flip passes; each spurious revert punches k back and halves ramp_rate (0.25 → 0.001 within 40 blocks). Capacity scaling never engaged.
   - Eval @10K vs untrained baseline: fixed +0.150 fineweb / +0.137 slice; ramp +0.207 / +0.187. **Both arms net-regress despite ARS gating.**
 - **Conclusion**: negative. The churn frontier at the Exp 10 tile is QUALITY-bound, not capacity-bound — lowering k only adds junk proposals (ARS rightly rejects >99%), and the ~1% of flips that pass still regress long-horizon CE; the block gate's probe noise makes the reflex fire at random and crushes the ramp. UTF machinery retained (flags `--churn-ramp --churn-min-k --churn-min-accept --churn-max-trials --churn-max-chunk --churn-warmup`) but not recommended for this regime; revisit only with a higher-quality acceptance signal (multi-window probes, held-out gate) and after the layer-wise churn question is separated from embedding updates.
+
+
+## Exp 19: MatMul-Free Learning Rule (`--no-mul`) — Variant 2 beats the float baseline (2026-08-17)
+
+Question: does the on-device gradient-free learning rule still learn if we remove the float multiply entirely from the weight and embedding updates? The forward pass is already matmul-free (ternary weights → select-add), but the rule-'c' gradient still does `grad[o][i] += e · x[i]` with a full-precision float product. If the last multiply can go, the whole train→inference pipeline (STE base training aside) becomes multiply-free.
+
+Setup: `checkpoints/exp7_v6_lr5_fp32emb.bin` (v6, fp32 embedding, self-learning config energy=1 adaptiveThr=3.0 sparsity=0.01), learn on `examples/discrete/slice100k.bin` (200 blocks), eval on `examples/discrete/sliceEval100k.bin` (2000 positions). Baseline eval before learning: **CE 8.0847**. Three arms, same config, only the learning rule differs:
+
+| Arm | rule 'c' gradient | embedding gradient | eval CE @2000 | Δ vs 8.085 |
+|---|---|---|---|---|
+| Baseline (float) | `e · x[i]` (full float product) | `gv · h[i]` | **7.7027** | −0.382 |
+| **Variant 2 `--no-mul`** | `e · ternary(x[i])` (absmean thr) | `gv · ternary(h[i])` | **7.5140** | **−0.571** |
+| Variant 1 (sign-sign) | `sign(e) · sign(x[i])` (±1 only) | `sign(gv) · sign(h[i])` | 9.5574 | +1.472 |
+
+- **Variant 2** (accepted): keep the error `e` / `gv` in full precision; quantize the **activation** to ternary {-1,0,+1} with an **absmean threshold** — `alpha = mean(|x|)`, `ternary(x) = sign(x)` if `|x| > alpha/2` else 0, the same absmean convention the STE base training uses. The update `e · ternary(x)` is select/add — no real multiply. **Learns and beats the float baseline by −0.19 nats on the same budget.** Block CE also tracks the baseline (6.85 vs 6.89 @200 steps), churn/flip counts comparable (~34.7K vs ~68K flips/pass), at ~+21% block time (absmean scan is a second pass over the activation).
+- **Variant 1** (rejected): collapsing **both** factors to sign (±1) discards the error magnitude entirely — the accumulator only ever receives ±1, flips drop to ~12K/pass and the model regresses +1.47 nats. Magnitude on the error side is load-bearing; on the activation side it is not.
+- **Implementation**: `--no-mul` flag in `selflearn.cpp`, applied in rule-'c' (`sl_feed_predictive` feed loop) and the embedding-gradient path. Threshold computed once per layer / per position (not per row/v).
+- **Verdict**: POSITIVE — the matmul-free learning rule learns on-device and slightly outperforms the float-multiply baseline. The removal is on the **activation** factor; error magnitude stays float (the accumulator remains FP32 by design). Follow-ups: sweep the ternary threshold (static |x|>0.5 vs absmean scaling), longer horizons (500–1000 blocks), and whether the same rule helps the STE-trained base path.

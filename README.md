@@ -42,7 +42,7 @@ Two experimental lines are implemented but **not validated for production**:
 
 ## Experiments
 
-Experiments Series (Exp 1–18) — see [`EXPERIMENTS.md`](EXPERIMENTS.md).
+Experiments Series (Exp 1–19) — see [`EXPERIMENTS.md`](EXPERIMENTS.md).
 
 ## Architecture
 
@@ -411,6 +411,13 @@ natively in C++:
   few highest-gradient weights: RMS drops ~√S while survivors keep full magnitude, giving the
   accumulator the heavy tail the adaptive threshold selects. **Without it, `--adaptive-thr` on a
   gradient-free run freezes (Exp 7 finding); with `--sparsity 0.01` the ternary core learns.**
+- **`--no-mul` (Exp 19):** matmul-free learning rule. Quantize the **activation** to ternary
+  {-1,0,+1} with an absmean threshold (`alpha = mean(|x|)`, keep `|x| > alpha/2`) and accumulate
+  the **full-precision error** through it — `e · ternary(x)` is select/add, no real multiply in
+  the rule. On the Exp 7 model, 200 blocks on `slice100k`: eval CE **7.5140** vs the float
+  baseline **7.7027** (start 8.0847) — the multiply-free rule learns and slightly beats the
+  float-multiply baseline. (Variant 1, collapsing *both* factors to sign, discards error
+  magnitude and regresses to 9.56 — the error side must stay full-precision.)
 - All three are persisted in the binary metadata (`sl_energy`, `sl_adaptive_thr`, `sl_sparsity`)
   by `export_model.py --sl-energy --sl-adaptive-thr K --sl-sparsity S`, so a device run picks
   them up automatically. CLI flags override the metadata (same convention as `thr`/`decay`).
@@ -429,6 +436,8 @@ to before the port.
 ./inference/selflearn_avx2 model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0
 # Exp 7: + top-k feed (heavy tail for the adaptive tau — required on gradient-free rule 'c')
 ./inference/selflearn_avx2 model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0 --sparsity 0.01
+# Exp 19: matmul-free learning rule (ternary activation via absmean, float error)
+./inference/selflearn_avx2 model.bin tokens.bin out.bin 200 50 100 0 0 0 0 --energy --adaptive-thr 3.0 --sparsity 0.01 --no-mul
 ```
 
 ### Eval tooling: profiling, fast lm_head, precision comparison

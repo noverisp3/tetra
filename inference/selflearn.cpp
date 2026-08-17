@@ -365,7 +365,11 @@ int main(int argc, char** argv) {
             "  --sl-lr-embedding F: override the exported embedding LR (>0; 0 = keep)\n"
             "  --ars-block: whole-block gate — probe CE before/after each step's\n"
             "         updates and roll back flips+embedding if CE degrades past\n"
-            "         the standard ARS margin (full undo, incl. weight decay)\n");
+            "         the standard ARS margin (full undo, incl. weight decay)\n"
+            "  --no-mul: matmul-free learning rule — quantize the activation to\n"
+            "         ternary {-1,0,+1} via absmean threshold (alpha=mean(|x|),\n"
+            "         keep |x|>alpha/2) and accumulate the full-precision error e\n"
+            "         through it (e*ternary(x) = select/add, no real multiply).\n");
         return 1;
     }
     const char* model_path = argv[1];
@@ -506,6 +510,16 @@ int main(int argc, char** argv) {
     bool kv_int8 = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kv-int8") == 0) kv_int8 = true;
+    }
+    // --no-mul (Exp 19, Variant 2): matmul-free learning rule. Keep the error
+    // in full precision but quantize the activation to ternary {-1,0,+1} with
+    // an absmean threshold (alpha = mean(|x|), keep |x| > alpha/2); the update
+    // e * ternary(x) is select/add — no real float multiply in the rule. This
+    // tests whether the ternary model still learns when the last multiply in
+    // the on-device updates is removed.
+    bool no_mul = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-mul") == 0) no_mul = true;
     }
     // Churn ramp (Exp 18): --churn-ramp RATE lowers the adaptive-thr
     // multiplier k by RATE per flip pass and grows the ARS probe capacity
@@ -674,12 +688,34 @@ int main(int argc, char** argv) {
                 if (cur.rows != pr.rows || cur.cols != pr.cols) continue;
                 std::vector<float>& g = grads[l];
                 const size_t rows = (size_t)cur.rows, cols = (size_t)cur.cols;
+                // --no-mul (Variant 2): quantize the activation x to ternary
+                // {-1,0,+1} with an absmean threshold (alpha = mean(|x|),
+                // ternary = sign(x) if |x| > alpha/2 else 0, the BitNet
+                // convention this repo already uses in STE training), but keep
+                // the error e in full precision. The update e * ternary(x) is a
+                // vector-times-ternary product = select/add — no real matmul.
+                float no_mul_alpha = 0.0f, no_mul_thr = 0.0f;
+                if (no_mul) {
+                    double sum_abs = 0.0;
+                    const float* xa = pr.x.data();
+                    for (size_t i = 0; i < cols; i++) sum_abs += std::fabs(xa[i]);
+                    no_mul_alpha = (cols > 0) ? (float)(sum_abs / cols) : 0.0f;
+                    no_mul_thr = 0.5f * no_mul_alpha;
+                }
                 for (size_t o = 0; o < rows; o++) {
                     float e = cur.y[o] - pr.y[o];
                     if (e == 0.0f) continue;
                     const float* xp = pr.x.data();
                     float* gr = g.data() + o * cols;
-                    for (size_t i = 0; i < cols; i++) gr[i] += e * xp[i];
+                    if (no_mul) {
+                        for (size_t i = 0; i < cols; i++) {
+                            float a = xp[i];
+                            if (a > no_mul_thr)      gr[i] += e;
+                            else if (a < -no_mul_thr) gr[i] -= e;
+                        }
+                    } else {
+                        for (size_t i = 0; i < cols; i++) gr[i] += e * xp[i];
+                    }
                 }
             }
 
@@ -700,11 +736,27 @@ int main(int argc, char** argv) {
             // Embedding gradient: g = softmax(logits*scale) - onehot(target).
             if (target >= 0 && target < V) {
                 const float* h = cap.h.data();
+                // Variant-2 rule (--no-mul): keep the embedding error gv in full
+                // precision, quantize the hidden activation h to ternary with an
+                // absmean threshold (computed once per position, not per v).
+                float hthr = 0.0f;
+                if (no_mul) {
+                    double hsum = 0.0;
+                    for (int i = 0; i < H; i++) hsum += std::fabs(h[i]);
+                    hthr = 0.5f * (H > 0 ? (float)(hsum / H) : 0.0f);
+                }
                 for (int v = 0; v < V; v++) {
                     float gv = softmax_buf[v] - (v == target ? 1.0f : 0.0f);
                     if (gv == 0.0f) continue;
                     float* ge = gradE.data() + (size_t)v * H;
-                    for (int i = 0; i < H; i++) ge[i] += gv * h[i];
+                    if (no_mul) {
+                        for (int i = 0; i < H; i++) {
+                            if (h[i] > hthr)      ge[i] += gv;
+                            else if (h[i] < -hthr) ge[i] -= gv;
+                        }
+                    } else {
+                        for (int i = 0; i < H; i++) ge[i] += gv * h[i];
+                    }
                 }
             }
 
