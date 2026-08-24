@@ -311,7 +311,7 @@ class StochasticTernaryLinear(nn.Module):
             output = Int8StochasticBitFlipLinear.apply(
                 x, self.packed_weights, self._w_raw_cache,
                 self.scale, self.accumulator, self.threshold, self.outlier_signs,
-                self.acc_decay, self.energy,
+                self.acc_decay, self.energy, self.alphas, self.group_size,
             )
         else:
             output = StochasticBitFlipLinear.apply(

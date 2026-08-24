@@ -292,7 +292,6 @@ class FusedTernaryLinear(torch.autograd.Function):
 
         if alphas is not None and ctx.group_size > 0:
             num_groups = ctx.num_groups
-            alphas = ctx.alphas
             alphas_expanded = torch.repeat_interleave(alphas, ctx.group_size, dim=1)
             if in_features % ctx.group_size != 0:
                 alphas_expanded = alphas_expanded[:, :in_features]
@@ -744,6 +743,8 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
         outlier_signs: Optional[torch.Tensor] = None,
         acc_decay: float = 1.0,
         energy: bool = False,
+        alphas: Optional[torch.Tensor] = None,
+        group_size: int = 0,
     ) -> torch.Tensor:
         """Forward with INT8 quantized activations.
 
@@ -755,6 +756,10 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
             accumulator: gradient accumulator tensor
             threshold: bit-flip threshold
             outlier_signs: dense uint8 side-channel signs for code-11 outliers
+            acc_decay: accumulator decay factor
+            energy: retain full gradient energy instead of sign votes
+            alphas: optional per-channel or per-group output scales
+            group_size: input width of each alpha group; 0 means per-channel
 
         Returns:
             Output tensor (..., out_features)
@@ -770,13 +775,32 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
         ctx.acc_decay = acc_decay
         ctx.energy = energy
 
-        # Grad carrier: float matmul so grad flows through x
-        out = F.linear(x.float(), w_raw.float()) * scale * scale_x
+        ctx.scale_x = scale_x
+        ctx.alphas = alphas
+        ctx.group_size = group_size
 
-        # Replace values with int8 matmul result (no grad contribution)
+        # Grad carrier: use the same dequantized scale as the quantized forward,
+        # while keeping a differentiable float path for x and per-channel/group
+        # alpha parameters.
+        if alphas is not None and group_size > 0:
+            num_groups = (x.size(-1) + group_size - 1) // group_size
+            alphas_expanded = torch.repeat_interleave(alphas, group_size, dim=1)
+            alphas_expanded = alphas_expanded[:, :x.size(-1)]
+            ctx.num_groups = num_groups
+            w_effective = w_raw * alphas_expanded
+            out = F.linear(x.float(), w_effective.float()) * scale_x
+        elif alphas is not None:
+            w_effective = w_raw
+            out = F.linear(x.float(), w_effective.float()) * alphas.unsqueeze(0) * scale_x
+        else:
+            w_effective = w_raw
+            out = F.linear(x.float(), w_effective.float()) * scale * scale_x
+
+        # Replace values with the quantized-activation result (no gradient from
+        # this assignment). The native kernel returns the raw integer
+        # accumulation, so dequantize it before copying into the grad carrier.
         with torch.no_grad():
-            if x.device.type == "cpu" and _ternary_ops is not None:
-                # Real int8 matmul via C++ kernel (fast on CPU)
+            if alphas is None and x.device.type == "cpu" and _ternary_ops is not None:
                 sign_args = (outlier_signs.cpu().contiguous()
                              if outlier_signs is not None else None)
                 int_out = _ternary_ops.ternary_matmul_int8(
@@ -784,27 +808,59 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
                     w_raw.size(0), w_raw.size(1),
                     sign_args,
                 ).float()
+                int_out = int_out.reshape_as(out) * (scale * scale_x)
             else:
-                # Pure-PyTorch fallback: dequant -> float matmul
-                # Same quantization noise, no CPU copies on DML
-                int_out = F.linear(x_q.float() * scale_x, w_raw.float()) * scale
-        out.data = int_out.to(x.device)
+                # Alpha-aware path: the native kernel cannot apply per-input
+                # group scales, so use the quantized activation with a float
+                # effective weight. This preserves INT8 activation semantics.
+                int_out = F.linear(x_q.float() * scale_x, w_effective.float())
+                if alphas is not None and group_size <= 0:
+                    int_out = int_out * alphas.unsqueeze(0)
+                elif alphas is None:
+                    int_out = int_out * scale
+            out.copy_(int_out.to(x.device))
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
         x = ctx.saved_tensors[0].to(grad_output.dtype)
         scale = ctx.scale
+        scale_x = ctx.scale_x.to(grad_output.dtype)
         in_features = x.size(-1)
+        out_features = grad_output.size(-1)
 
-        grad_output_flat = grad_output.reshape(-1, grad_output.size(-1))
-        grad_y_raw = grad_output_flat * scale
-        w_raw = ctx.w_raw.to(grad_y_raw.dtype)
+        grad_output_flat = grad_output.reshape(-1, out_features)
+        x_flat = x.reshape(-1, in_features)
+        w_raw = ctx.w_raw.to(grad_output.dtype)
+        scaled_grad = grad_output_flat * scale_x
+        alphas = ctx.alphas
+        grad_alpha = None
 
-        grad_x_flat = torch.mm(grad_y_raw, w_raw)
-        grad_x = grad_x_flat.view(*x.shape[:-1], in_features)
+        if alphas is not None and ctx.group_size > 0:
+            group_size = ctx.group_size
+            num_groups = ctx.num_groups
+            alphas_expanded = torch.repeat_interleave(alphas, group_size, dim=1)
+            alphas_expanded = alphas_expanded[:, :in_features]
+            w_effective = w_raw * alphas_expanded
+            grad_x = torch.mm(scaled_grad, w_effective).view(*x.shape[:-1], in_features)
+            grad_w_scaled = torch.mm(scaled_grad.T, x_flat)
+            grad_w = grad_w_scaled * alphas_expanded
+            grad_alpha = torch.zeros(out_features, num_groups, device=x.device, dtype=grad_w.dtype)
+            for g in range(num_groups):
+                start = g * group_size
+                end = min(start + group_size, in_features)
+                grad_alpha[:, g] = (grad_w_scaled[:, start:end] * w_raw[:, start:end]).sum(dim=1)
+        elif alphas is not None:
+            grad_y_scaled = scaled_grad * alphas.unsqueeze(0)
+            base_out = F.linear(x, w_raw)
+            grad_x = torch.mm(grad_y_scaled, w_raw).view(*x.shape[:-1], in_features)
+            grad_w = torch.mm(grad_y_scaled.T, x_flat)
+            grad_alpha = (scaled_grad * base_out).sum(dim=0).detach()
+        else:
+            grad_y_raw = scaled_grad * scale
+            grad_x = torch.mm(grad_y_raw, w_raw).view(*x.shape[:-1], in_features)
+            grad_w = torch.mm(grad_y_raw.T, x_flat)
 
-        grad_w = torch.mm(grad_y_raw.T, x.reshape(-1, x.size(-1)))
         with torch.no_grad():
             if ctx.energy:
                 ctx.accumulator.mul_(ctx.acc_decay).add_(-grad_w)
@@ -814,7 +870,7 @@ class Int8StochasticBitFlipLinear(torch.autograd.Function):
 
         del grad_w
 
-        return grad_x, None, None, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None, None, grad_alpha, None
 
 
 @torch.no_grad()
